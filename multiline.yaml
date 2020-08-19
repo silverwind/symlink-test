@@ -11,9 +11,9 @@ parent:
   d: >-
     multiline folded strip
     line 2
-  c: |+
+  e: |+
     multiline literal keep
     line 2
-  d: >+
+  f: >+
     multiline folded keep
     line 2
