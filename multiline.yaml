@@ -1,0 +1,12 @@
+a: |
+  multiline literal
+b: >
+  multiline folded
+c: |-
+  multiline literal strip
+d: >-
+  multiline folded strip
+c: |+
+  multiline literal keep
+d: >+
+  multiline folded keep
