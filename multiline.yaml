@@ -1,12 +1,20 @@
-a: |
-  multiline literal
-b: >
-  multiline folded
-c: |-
-  multiline literal strip
-d: >-
-  multiline folded strip
-c: |+
-  multiline literal keep
-d: >+
-  multiline folded keep
+parent:
+  parent:
+    a: |
+      multiline literal
+      line 2
+    b: >
+      multiline folded
+      line 2
+    c: |-
+      multiline literal strip
+      line 2
+    d: >-
+      multiline folded strip
+      line 2
+    c: |+
+      multiline literal keep
+      line 2
+    d: >+
+      multiline folded keep
+      line 2
