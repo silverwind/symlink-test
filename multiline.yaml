@@ -17,3 +17,23 @@ parent:
   f: >+
     multiline folded keep
     line 2
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron:  '0 */6 * * *' # every six hours on the hour
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: https://github.com/actions/setup-node@v3
+        with:
+          node-version: 18
+      - name: install necessary tools
+        run: |
+          apt update -y && apt install -y rsync python python3-pip
+          pip install awscli
