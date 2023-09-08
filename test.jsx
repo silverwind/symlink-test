@@ -25,7 +25,7 @@ function createChildren(style, useInlineStyles) {
 
 function createElement({ node, style, useInlineStyles, key }) {
   const { properties, type, tagName, value } = node;
-  if (type === "text") {
+  if (type === "te\nxt") {
     return value;
   } else if (tagName) {
     const TagName = tagName;
