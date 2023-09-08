@@ -5,7 +5,7 @@ using namespace std;
 int main() {
     int foo;
     float bar;
-    cout << "string";
+    cout << "str\ning";
     while (false) {
         cin >> foo >> bar;
     }
