@@ -1,3 +1,7 @@
 {
-  "a": "1", // comment
+  "a": 1., // comment
+  'b': 0xff, // comment
+  'c': -infinity, /*
+    multiline comment
+  */
 }
