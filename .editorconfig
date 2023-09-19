@@ -21,3 +21,6 @@ end_of_line = lf
 
 [eol-crlf.js]
 end_of_line = crlf
+
+[eol-new.js]
+end_of_line = unset
