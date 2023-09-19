@@ -15,3 +15,9 @@ indent_size = 2
 
 [tabs.js]
 indent_style = tab
+
+[eol-lf.js]
+end_of_line = lf
+
+[eol-crlf.js]
+end_of_line = crlf
