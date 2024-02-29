@@ -43,7 +43,3 @@ function createElement({ node, style, useInlineStyles, key }) {
     return <TagName key={key} {...props}>{children}</TagName>;
   }
 }
-
-// 1
-// 2
-// 3
