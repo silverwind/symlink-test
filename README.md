@@ -1,12 +1,12 @@
-### Code Copy
+### <a name="codecopy"></a>A Heading in this SO entry!
 
 ```
-single line 
+single line
 ```
 
 ```
-multi 
-line 
+multi
+line
 ```
 
-![](./media/screenshot-x2.png)
+[link](#codecopy)
