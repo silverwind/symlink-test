@@ -86,3 +86,9 @@ text
 
 [heading-5](#heading-5)
 [heading-6](#heading-6)
+
+# 气候宜人
+# <a name="#人"></a>气候宜人abc
+
+[generated](#气候宜人)
+[pre-existing](#人)
