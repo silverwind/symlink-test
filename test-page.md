@@ -1,3 +1,5 @@
+<img src="https://upload.wikimedia.org/wikipedia/commons/b/bb/Gitea_Logo.svg" align="right" width="200" height="200">
+
 # <a name="top"></a>Markdown Test Page
 
 * [Headings](#Headings)
