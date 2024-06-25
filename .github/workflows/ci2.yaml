@@ -1,0 +1,30 @@
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'
+        required: true
+        default: 'warning'
+        type: choice
+        options:
+        - info
+        - warning
+        - debug
+      tags:
+        description: 'Test scenario tags'
+        required: false
+        type: boolean
+      boolean_default_true:
+        description: 'Test scenario tags'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  testcolor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://github.com/actions/checkout@v3
+      - run: curl -sL https://gist.github.com/lilydjwg/fdeaf79e921c2f413f44b6f613f6ad53/raw/94d8b2be62657e96488038b0e547e3009ed87d40/colors.py | python3
