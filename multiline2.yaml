@@ -21,7 +21,7 @@ parent:
 on:
   push:
     branches:
-      - main
+      - master
   schedule:
     - cron:  '0 */6 * * *' # every six hours on the hour
 
