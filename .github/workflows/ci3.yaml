@@ -28,7 +28,7 @@ jobs:
   testcolor:
     runs-on: ubuntu-latest
     steps:
-      - uses: https://github.com/actions/checkout@v3
+      - uses: actions/checkout@v3
       - run: |
-        echo hello
-        echo world
+          echo hello
+          echo world

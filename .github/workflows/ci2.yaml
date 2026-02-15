@@ -1,3 +1,5 @@
+name: ci2
+
 on:
   push:
   pull_request:
