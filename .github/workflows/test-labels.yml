@@ -1,0 +1,15 @@
+name: Test Severity Labels
+on: [push]
+jobs:
+  test-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Severity labels
+        run: |
+          echo "::error::Failed to fetch https://api.example.com/v2/resource"
+          echo "::warning::Deprecated API used, see https://docs.example.com/migration"
+          echo "::notice::Documentation at https://docs.gitea.com/usage/actions/overview"
+          echo "::debug::Resolved config from https://registry.example.com/config.json"
+      - name: Commands
+        run: |
+          echo "[command]/usr/bin/curl -sL https://storage.googleapis.com/golang/go1.23.6.linux-amd64.tar.gz"
