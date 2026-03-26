@@ -16,8 +16,12 @@ jobs:
           echo -e "\033[32mhttps://github.com/go-gitea/gitea/actions\033[0m"
           echo -e "\033[1;34mInstalling from https://objects.githubusercontent.com/github-production-release-asset\033[0m"
           echo -e "\033[33mWarning: see https://docs.gitea.com/usage/actions for docs\033[0m"
-      - name: URLs in context
+      - name: Severity labels
         run: |
+          echo "::error::Failed to fetch https://api.example.com/v2/resource"
+          echo "::warning::Deprecated API used, see https://docs.example.com/migration"
           echo "::notice::Documentation at https://docs.gitea.com/usage/actions/overview"
+          echo "::debug::Resolved config from https://registry.example.com/config.json"
+      - name: Commands
+        run: |
           echo "[command]/usr/bin/curl -sL https://storage.googleapis.com/golang/go1.23.6.linux-amd64.tar.gz"
-          echo "##[error]Failed to fetch https://api.example.com/v2/resource, retrying..."
