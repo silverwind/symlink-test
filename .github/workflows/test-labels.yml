@@ -4,12 +4,45 @@ jobs:
   test-labels:
     runs-on: ubuntu-latest
     steps:
-      - name: Severity labels
+      - name: Error variants
         run: |
           echo "::error::Failed to fetch https://api.example.com/v2/resource"
+          echo "##[error]Connection refused to https://registry.example.com:5000"
+          echo "::error file=main.go,line=42::undefined variable 'foo'"
+          echo "::error title=Build Failed::see https://docs.example.com/troubleshooting"
+      - name: Warning variants
+        run: |
           echo "::warning::Deprecated API used, see https://docs.example.com/migration"
+          echo "##[warning]Node.js 16 is deprecated, update to 20"
+          echo "::warning file=package.json,line=5::outdated dependency 'lodash@3.0.0'"
+      - name: Notice variants
+        run: |
           echo "::notice::Documentation at https://docs.gitea.com/usage/actions/overview"
+          echo "##[notice]Build completed in 42s"
+          echo "::notice title=Hint::consider using https://example.com/faster-builds"
+      - name: Debug variants
+        run: |
           echo "::debug::Resolved config from https://registry.example.com/config.json"
-      - name: Commands
+          echo "##[debug]Cache key: linux-go-abc123def456"
+      - name: Command prefix
         run: |
           echo "[command]/usr/bin/curl -sL https://storage.googleapis.com/golang/go1.23.6.linux-amd64.tar.gz"
+          echo "[command]/usr/bin/git fetch --depth=1 https://github.com/go-gitea/gitea.git"
+      - name: Groups
+        run: |
+          echo "::group::Install dependencies"
+          echo "Installing https://registry.npmjs.org/@types/node/-/node-18.19.80.tgz"
+          echo "Installing https://registry.npmjs.org/typescript/-/typescript-5.4.5.tgz"
+          echo "::endgroup::"
+          echo "::group::Run tests"
+          echo "PASS https://localhost:3000/api/v1/repos"
+          echo "FAIL https://localhost:3000/api/v1/users"
+          echo "::endgroup::"
+      - name: Mixed severity and plain
+        run: |
+          echo "Starting build..."
+          echo "::notice::Using Go 1.23.6"
+          echo "Compiling main package..."
+          echo "::warning::unused import 'fmt' in util.go"
+          echo "::error::build failed with exit code 1"
+          echo "See https://docs.example.com/build-errors for help"
