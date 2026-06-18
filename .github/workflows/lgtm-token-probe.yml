@@ -1,0 +1,32 @@
+name: lgtm-token-probe
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: write
+  issues: write
+  pull-requests: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          PR=29
+          SHA=$(gh api repos/$REPO/pulls/$PR --jq .head.sha)
+          echo "event=$EVENT pr=#$PR sha=$SHA"
+          if gh api -X POST repos/$REPO/statuses/$SHA -f state=success -f context="probe/$EVENT" -f description="write via $EVENT" >/dev/null 2>e1; then
+            echo "STATUS_WRITE=OK ($EVENT)"
+          else
+            echo "STATUS_WRITE=FAIL ($EVENT)"; cat e1
+          fi
+          if gh api -X POST repos/$REPO/issues/$PR/labels -f "labels[]=probe" >/dev/null 2>e2; then
+            echo "LABEL_WRITE=OK ($EVENT)"
+          else
+            echo "LABEL_WRITE=FAIL ($EVENT)"; cat e2
+          fi
