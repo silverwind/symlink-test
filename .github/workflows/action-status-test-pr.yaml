@@ -1,0 +1,67 @@
+name: action-status-test-pr
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-quick-success:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "pr quick success"
+
+  pr-long-running:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for i in $(seq 1 110); do
+            echo "pr tick $i / 110"
+            sleep 1
+          done
+
+  pr-needs-upstream:
+    runs-on: ubuntu-latest
+    needs: pr-long-running
+    steps:
+      - run: echo "ran after pr-long-running"
+
+  pr-always-skipped:
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: echo "this never runs"
+
+  pr-fan-in:
+    runs-on: ubuntu-latest
+    needs: [pr-quick-success, pr-will-fail-later]
+    if: always()
+    steps:
+      - run: echo "pr fan-in done"
+
+  pr-will-fail-later:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for i in $(seq 1 30); do
+            echo "pr working $i / 30"
+            sleep 1
+          done
+      - run: |
+          echo "pr about to fail"
+          exit 1
+
+  pr-matrix-jobs:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - run: |
+          for i in $(seq 1 $((20 + ${{ matrix.shard }} * 10))); do
+            echo "pr shard ${{ matrix.shard }} step $i"
+            sleep 1
+          done
