@@ -8,17 +8,18 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: emit log commands
+      - name: ado form
         run: |
-          echo "plain line before"
-          echo "::error::single line error"
-          echo "::error::multi%0Aline%0Aerror"
-          echo "::error file=test.js,line=1::annotated%0Amulti line"
-          echo "::warning::warn%0Amulti"
-          echo "::notice::notice%0Amulti"
-          echo "::debug::debug%0Amulti"
-          echo "::error::percent %25 and CR%0D%0Anext"
-          echo "::group::group%0Atitle"
-          echo "inside group"
-          echo "::endgroup::"
-          echo "plain line after"
+          echo "--- begin ---"
+          echo "##[command]cmd%0Abar"
+          echo "[command]bare%0Abar"
+          echo "##[error]err%0Abar"
+          echo "##[warning]warn%0Abar"
+          echo "##[notice]notice%0Abar"
+          echo "##[debug]debug%0Abar"
+          echo "##[group]grp%0Abar"
+          echo "in group"
+          echo "##[endgroup]"
+          echo "##[error]bracket%5Dhere semi%3Bhere pct%25here"
+          echo "##[section]section%0Abar"
+          echo "--- end ---"
