@@ -8,18 +8,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: ado form
+      - name: v2 form
         run: |
           echo "--- begin ---"
-          echo "##[command]cmd%0Abar"
-          echo "[command]bare%0Abar"
-          echo "##[error]err%0Abar"
-          echo "##[warning]warn%0Abar"
-          echo "##[notice]notice%0Abar"
-          echo "##[debug]debug%0Abar"
-          echo "##[group]grp%0Abar"
-          echo "in group"
-          echo "##[endgroup]"
-          echo "##[error]bracket%5Dhere semi%3Bhere pct%25here"
-          echo "##[section]section%0Abar"
+          echo "::error::bracket%5Dhere semi%3Bhere pct%25here"
+          echo "::group::grp%5Dhere semi%3Bhere"
+          echo "::endgroup::"
+          echo "::error::colon%3Ahere comma%2Chere"
           echo "--- end ---"
