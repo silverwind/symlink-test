@@ -1,0 +1,24 @@
+name: log-commands
+on:
+  workflow_dispatch:
+  push:
+    branches: [log-commands]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: emit log commands
+        run: |
+          echo "plain line before"
+          echo "::error::single line error"
+          echo "::error::multi%0Aline%0Aerror"
+          echo "::error file=test.js,line=1::annotated%0Amulti line"
+          echo "::warning::warn%0Amulti"
+          echo "::notice::notice%0Amulti"
+          echo "::debug::debug%0Amulti"
+          echo "::error::percent %25 and CR%0D%0Anext"
+          echo "::group::group%0Atitle"
+          echo "inside group"
+          echo "::endgroup::"
+          echo "plain line after"
