@@ -5,14 +5,24 @@ on:
     branches: [log-commands]
 
 jobs:
-  test:
+  runner-written:
     runs-on: ubuntu-latest
     steps:
-      - name: v2 form
-        run: |
-          echo "--- begin ---"
-          echo "::error::bracket%5Dhere semi%3Bhere pct%25here"
-          echo "::group::grp%5Dhere semi%3Bhere"
-          echo "::endgroup::"
-          echo "::error::colon%3Ahere comma%2Chere"
-          echo "--- end ---"
+      - name: control - step emitted
+        run: echo "::error::step-emitted pct%25here bracket%5Dhere nl%0Ahere"
+
+      - name: runner error via failed command processing
+        continue-on-error: true
+        run: echo "::add-matcher::/tmp/no%25such%5Dmatcher.json"
+
+      - name: runner error via nonzero exit
+        continue-on-error: true
+        run: exit 1
+
+  bad-action-ref:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: runner error via unresolvable action
+        continue-on-error: true
+        uses: ./no%25such%5Ddir
