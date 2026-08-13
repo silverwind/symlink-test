@@ -11,9 +11,12 @@ on:
       falsecap:
         type: boolean
         default: False
-      yval:
+      yescap:
         type: boolean
-        default: y
+        default: Yes
+      oncaps:
+        type: boolean
+        default: ON
 
 jobs:
   probe:
