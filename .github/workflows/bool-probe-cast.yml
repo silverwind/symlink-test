@@ -3,33 +3,17 @@ on:
   workflow_dispatch:
     inputs:
       noval:
-        description: boolean default no
         type: boolean
         default: no
       offval:
-        description: boolean default off
         type: boolean
         default: off
-      falseval:
-        description: boolean default false
+      falsecap:
         type: boolean
-        default: false
-      banana:
-        description: boolean default banana
+        default: False
+      yval:
         type: boolean
-        default: banana
-      zero:
-        description: boolean default 0
-        type: boolean
-        default: 0
-      one:
-        description: boolean default 1
-        type: boolean
-        default: 1
-      empty:
-        description: boolean default empty string
-        type: boolean
-        default: ""
+        default: y
 
 jobs:
   probe:
