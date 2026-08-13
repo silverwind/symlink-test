@@ -1,0 +1,35 @@
+name: bool-probe
+on:
+  workflow_dispatch:
+    inputs:
+      lower:
+        description: boolean default true
+        type: boolean
+        default: true
+      upper:
+        description: boolean default True
+        type: boolean
+        default: True
+      caps:
+        description: boolean default TRUE
+        type: boolean
+        default: TRUE
+      nodefault:
+        description: boolean without default
+        type: boolean
+      strtrue:
+        description: string default true
+        type: string
+        default: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: dump contexts
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+          EVENT_INPUTS: ${{ toJSON(github.event.inputs) }}
+        run: |
+          echo "INPUTS=$INPUTS"
+          echo "EVENT_INPUTS=$EVENT_INPUTS"
