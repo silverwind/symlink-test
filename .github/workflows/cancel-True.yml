@@ -1,0 +1,11 @@
+name: cancel-True
+on:
+  workflow_dispatch:
+concurrency:
+  group: cancel-True
+  cancel-in-progress: True
+jobs:
+  wait:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 90
