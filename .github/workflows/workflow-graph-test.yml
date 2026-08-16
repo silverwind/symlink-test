@@ -1,0 +1,82 @@
+name: workflow-graph-test
+on:
+  push:
+    branches: [workflow-graph-test]
+  workflow_dispatch:
+
+jobs:
+  job-100:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo job-100
+
+  job-101:
+    runs-on: ubuntu-latest
+    needs: [job-100]
+    steps:
+      - run: echo job-101
+
+  job-102:
+    runs-on: ubuntu-latest
+    needs: [job-101]
+    steps:
+      - run: echo job-102
+
+  job-103:
+    runs-on: ubuntu-latest
+    needs: [job-100]
+    steps:
+      - run: echo job-103
+
+  prep-jdk:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo prep-jdk
+
+  code-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo code-analysis
+
+  matrix-e2e:
+    runs-on: ubuntu-latest
+    needs: [job-100, prep-jdk, code-analysis]
+    strategy:
+      matrix:
+        include:
+          - {shard: 1, browser: chromium}
+          - {shard: 1, browser: firefox}
+          - {shard: 2, browser: chromium}
+          - {shard: 3, browser: chromium}
+          - {shard: 3, browser: firefox}
+          - {shard: 99, browser: webkit}
+    steps:
+      - run: echo "matrix-e2e (${{ matrix.shard }}, ${{ matrix.browser }})"
+
+  unit-test:
+    runs-on: ubuntu-latest
+    needs: [prep-jdk, code-analysis]
+    steps:
+      - run: echo unit-test
+
+  arch-test:
+    runs-on: ubuntu-latest
+    needs: [prep-jdk, code-analysis]
+    steps:
+      - run: echo arch-test
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [prep-jdk, code-analysis]
+    steps:
+      - run: echo integration-test
+
+  build-image:
+    runs-on: ubuntu-latest
+    needs:
+      - unit-test
+      - arch-test
+      - integration-test
+      - matrix-e2e
+    steps:
+      - run: echo build-image
