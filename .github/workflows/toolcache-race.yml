@@ -1,0 +1,30 @@
+name: toolcache-race
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/toolcache-race.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5]
+    steps:
+      - name: Before
+        run: |
+          echo "host=$(hostname) tool_cache=$RUNNER_TOOL_CACHE"
+          ls /opt/hostedtoolcache/go || true
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.23.5"
+      - name: After
+        run: |
+          go version
+          command -v go
+          go env GOROOT GOTOOLCHAIN
+          ls /opt/hostedtoolcache/go
+          ls /opt/hostedtoolcache/go/1.23.5/x64
