@@ -10,13 +10,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Before
-        run: ls /opt/hostedtoolcache/go
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - name: After
-        run: |
-          go version
-          command -v go
-          go env GOROOT
+      - run: |
+          ls /opt/hostedtoolcache
+          ls /opt/hostedtoolcache/go
+          ls -la /opt/hostedtoolcache/go/*/ | head -20
