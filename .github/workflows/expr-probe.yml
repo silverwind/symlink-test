@@ -1,8 +1,6 @@
 name: expr-probe
 
-on:
-  push:
-    branches: [expr-probe]
+on: [push, workflow_dispatch]
 
 jobs:
   probe:

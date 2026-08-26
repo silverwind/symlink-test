@@ -2,9 +2,7 @@ name: maxparallel-probe
 
 # Separate file: if `max-parallel: 0` fails workflow validation, only this workflow fails.
 
-on:
-  push:
-    branches: [expr-probe]
+on: [push, workflow_dispatch]
 
 jobs:
   zero:
