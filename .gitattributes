@@ -5,3 +5,5 @@ renamed-pure.py -linguist-generated
 bidi.js -linguist-generated
 empty-added.txt -linguist-generated
 renamed-with-changes.md -linguist-generated
+binary-added.png -linguist-generated
+submodule-added -linguist-generated
