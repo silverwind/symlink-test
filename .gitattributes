@@ -1,2 +1,12 @@
 * text=auto eol=lf
 * linguist-generated
+ws-test.txt -linguist-generated
+renamed-pure.py -linguist-generated
+bidi.js -linguist-generated
+empty-added.txt -linguist-generated
+renamed-with-changes.md -linguist-generated
+binary-added.png -linguist-generated
+submodule-added -linguist-generated
+binary-added.bin -linguist-generated
+too-many-lines.txt -linguist-generated
+too-long-line.txt -linguist-generated
