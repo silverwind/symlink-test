@@ -8,3 +8,5 @@ renamed-with-changes.md -linguist-generated
 binary-added.png -linguist-generated
 submodule-added -linguist-generated
 binary-added.bin -linguist-generated
+too-many-lines.txt -linguist-generated
+too-long-line.txt -linguist-generated
