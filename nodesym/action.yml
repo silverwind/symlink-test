@@ -1,0 +1,4 @@
+name: nodesym
+runs:
+  using: node20
+  main: main.cjs

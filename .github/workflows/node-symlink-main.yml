@@ -1,0 +1,12 @@
+name: node symlink main
+on:
+  push:
+    branches: [node-symlink-main]
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: ls -l nodesym shared
+      - uses: ./nodeesm
+      - uses: ./nodesym

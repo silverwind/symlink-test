@@ -1,0 +1,4 @@
+name: nodeesm
+runs:
+  using: node20
+  main: main.mjs
