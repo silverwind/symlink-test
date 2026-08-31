@@ -8,5 +8,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: ls -l nodesym shared
+      - name: are runner paths symlink-free
+        run: |
+          for p in "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" "$RUNNER_WORKSPACE/../_actions"; do
+            real=$(readlink -f "$p")
+            if [ "$p" = "$real" ]; then echo "SAME     $p"; else echo "DIFFERS  $p -> $real"; fi
+          done
       - uses: ./nodeesm
       - uses: ./nodesym
+      - uses: silverwind/symlink-test/nodeesm@node-symlink-main
+      - uses: silverwind/symlink-test/nodesym@node-symlink-main
