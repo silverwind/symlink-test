@@ -16,5 +16,3 @@ jobs:
           done
       - uses: ./nodeesm
       - uses: ./nodesym
-      - uses: silverwind/symlink-test/nodeesm@node-symlink-main
-      - uses: silverwind/symlink-test/nodesym@node-symlink-main
