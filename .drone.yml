@@ -1,0 +1,31 @@
+kind: pipeline
+type: docker
+name: ci
+
+steps:
+  - name: deps
+    image: node:16
+    commands:
+      - make deps
+
+  - name: test
+    image: node:16
+    commands:
+      - make test
+
+---
+kind: pipeline
+type: docker
+name: notify
+
+depends_on: [ci]
+
+trigger:
+  status: [failure]
+
+clone:
+  disable: true
+
+steps:
+  - name: notify
+    image: drillster/drone-email
