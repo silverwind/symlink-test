@@ -1,0 +1,6 @@
+{
+  "packageManager": "pnpm@12.4.1",
+  "devDependencies": {
+    "semver": "7.7.2"
+  }
+}
