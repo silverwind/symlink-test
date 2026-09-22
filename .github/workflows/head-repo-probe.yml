@@ -1,0 +1,16 @@
+name: head-repo-probe
+on: pull_request
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_JSON: ${{ toJSON(github.event.pull_request.head) }}
+          NULL_FORK: ${{ toJSON(fromJSON('{"repo":null}').repo.fork) }}
+          NOT_NULL_FORK: ${{ !fromJSON('{"repo":null}').repo.fork }}
+          NULL_FULL_NAME_NE: ${{ fromJSON('{"repo":null}').repo.full_name != github.repository }}
+        run: |
+          echo "head_ref=$HEAD_REF"
+          echo "$HEAD_JSON" | jq -c '{label, ref, sha, repo_full_name: .repo.full_name, repo_fork: .repo.fork}'
+          echo "null.fork=$NULL_FORK !null.fork=$NOT_NULL_FORK null.full_name!=repository=$NULL_FULL_NAME_NE"
