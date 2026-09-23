@@ -1,0 +1,11 @@
+on: push
+env:
+  MY_SHELL: bash
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: ${{ env.MY_SHELL }}
+    steps:
+      - run: echo defaults-shell-expr-ok
