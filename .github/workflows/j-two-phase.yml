@@ -1,0 +1,12 @@
+on: push
+jobs:
+  reader-error:
+    if: ${{ no_such_context.x }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  converter-error:
+    if: other_unknown.y
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

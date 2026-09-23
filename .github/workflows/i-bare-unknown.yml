@@ -1,0 +1,7 @@
+on: push
+jobs:
+  bare-unknown:
+    if: no_such_context.x
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

@@ -1,0 +1,27 @@
+on: push
+jobs:
+  job-if-noneeds:
+    if: ${{ fromJSON('not-json') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  step-if:
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ fromJSON('not-json') }}
+        run: echo step-x
+      - run: echo after-step
+  runs-on-err:
+    runs-on: ${{ fromJSON('not-json') }}
+    steps:
+      - run: echo x
+  concurrency-err:
+    concurrency: ${{ fromJSON('not-json') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  dependent-of-runs-on-err:
+    needs: runs-on-err
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
