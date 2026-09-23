@@ -1,0 +1,13 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    env:
+      A: True
+      B: 3.10
+      C: 1e3
+      D: 007
+      E: 0x10
+      F: 12345678901234567890
+    steps:
+      - run: echo "A=[$A] B=[$B] C=[$C] D=[$D] E=[$E] F=[$F]"
