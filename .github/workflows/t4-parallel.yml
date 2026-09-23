@@ -1,0 +1,9 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - parallel:
+          - run: echo one
+          - run: echo two
+      - run: echo parallel-accepted
