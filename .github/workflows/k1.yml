@@ -1,0 +1,9 @@
+on:
+  push:
+  schedule:
+    - cron: '? * * * *'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cron-1-accepted

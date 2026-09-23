@@ -1,0 +1,9 @@
+on:
+  push:
+  schedule:
+    - cron: '00 00 * * *'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cron-8-accepted

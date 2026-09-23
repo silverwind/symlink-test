@@ -1,0 +1,10 @@
+on:
+  push:
+  schedule:
+    - cron: 'bad cron'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    bogus: x
+    steps:
+      - run: echo x

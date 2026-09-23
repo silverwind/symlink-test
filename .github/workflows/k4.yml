@@ -1,0 +1,9 @@
+on:
+  push:
+  schedule:
+    - cron: '0-59/5 * * * *'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cron-4-accepted
