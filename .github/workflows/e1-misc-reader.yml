@@ -1,0 +1,21 @@
+on: push
+foo: bar
+run-name: ${{ secrets.X }}
+concurrency: ${{ needs.a.result }}
+env:
+  X: ${{ env.Y }}
+permissions:
+  contents: bogus
+  nonsense: read
+jobs:
+  run-and-uses:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+        uses: actions/checkout@v4
+  with-on-run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+        with:
+          a: b

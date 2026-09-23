@@ -1,0 +1,9 @@
+on:
+  push:
+  schedule:
+    - cron: '60 * * * *'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo cron-6-accepted

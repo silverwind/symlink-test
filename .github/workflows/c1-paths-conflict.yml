@@ -1,0 +1,12 @@
+on:
+  pull_request:
+    paths: [a]
+    paths-ignore: [b]
+  push:
+    tags: [v1]
+    tags-ignore: [v2]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

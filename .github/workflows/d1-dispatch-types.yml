@@ -1,0 +1,14 @@
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      a:
+        type: bogus
+      b:
+        type: boolean
+        default: notabool
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo dispatch-accepted

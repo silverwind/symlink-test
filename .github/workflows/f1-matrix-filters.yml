@@ -1,0 +1,13 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [a, b]
+        exclude:
+          - nope: x
+        include:
+          - {}
+    steps:
+      - run: echo x

@@ -1,0 +1,22 @@
+on: push
+jobs:
+  if-zero:
+    if: 0
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo if-zero-ran
+  if-one:
+    if: 1
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo if-one-ran
+  if-null:
+    if: ~
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo if-null-ran
+  if-empty:
+    if: ''
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo if-empty-ran

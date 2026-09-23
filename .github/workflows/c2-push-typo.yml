@@ -1,0 +1,8 @@
+on:
+  push:
+    branchez: [x]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo push-typo-accepted
