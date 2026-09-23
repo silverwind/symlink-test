@@ -1,0 +1,12 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    env:
+      GO: 1.20
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "ENV=[$GO]"
+      - uses: ./.github/actions/echo
+        with:
+          value: 1.20

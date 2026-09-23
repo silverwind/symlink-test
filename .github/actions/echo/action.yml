@@ -1,0 +1,9 @@
+name: echo
+inputs:
+  value:
+    required: true
+runs:
+  using: composite
+  steps:
+    - run: echo "WITH=[${{ inputs.value }}]"
+      shell: bash
