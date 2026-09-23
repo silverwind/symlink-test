@@ -1,0 +1,35 @@
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  bare-False-needs:
+    needs: setup
+    if: False
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo should-skip
+  bare-FALSE-needs:
+    needs: setup
+    if: FALSE
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo should-skip
+  bare-True-needs:
+    needs: setup
+    if: True
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo should-run
+  bare-False-no-needs:
+    if: False
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo should-skip
+  step-bare-False:
+    runs-on: ubuntu-latest
+    steps:
+      - if: False
+        run: echo step-should-skip
+      - run: echo after

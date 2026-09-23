@@ -1,0 +1,7 @@
+on: push
+jobs:
+  mixed:
+    if: ${{ false }} && true
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo mixed-ran

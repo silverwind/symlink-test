@@ -1,0 +1,26 @@
+on: push
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    outputs:
+      x: ${{ steps.s.outputs.x }}
+    steps:
+      - id: s
+        run: echo "x=not-json" >> "$GITHUB_OUTPUT"
+  consumer:
+    needs: producer
+    if: ${{ fromJSON(needs.producer.outputs.x) }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo consumer-ran
+  after-consumer:
+    needs: consumer
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo after-consumer-ran
+  always-after-consumer:
+    needs: consumer
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo always-after-consumer-ran

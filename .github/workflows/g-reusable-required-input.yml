@@ -1,0 +1,4 @@
+on: push
+jobs:
+  deploy:
+    uses: ./.github/workflows/called-required.yml

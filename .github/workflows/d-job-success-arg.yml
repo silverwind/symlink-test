@@ -1,0 +1,12 @@
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  success-arg:
+    needs: setup
+    if: ${{ success('setup') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo success-arg-ran

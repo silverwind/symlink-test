@@ -1,0 +1,67 @@
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  expr-False:
+    needs: setup
+    if: ${{ False }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  quoted-False:
+    needs: setup
+    if: "False"
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  unknown-context:
+    needs: setup
+    if: ${{ no_such_context.x }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  env-in-job-if:
+    needs: setup
+    if: ${{ env.X == 'a' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  secrets-in-job-if:
+    needs: setup
+    if: ${{ secrets.X != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  matrix-in-job-if:
+    needs: setup
+    if: ${{ matrix.os == 'a' }}
+    strategy:
+      matrix:
+        os: [a, b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  hashfiles-in-job-if:
+    needs: setup
+    if: ${{ hashFiles('x') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  step-success-arg:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ success('a') }}
+        run: echo x
+  steps-in-runs-on:
+    needs: setup
+    runs-on: ${{ steps.x.outputs.y }}
+    steps:
+      - run: echo x
+  expr-in-needs:
+    needs: ${{ 'setup' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
