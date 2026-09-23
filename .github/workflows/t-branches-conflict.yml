@@ -1,0 +1,9 @@
+on:
+  push:
+    branches: ['**']
+    branches-ignore: [nope]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo branches-conflict-accepted

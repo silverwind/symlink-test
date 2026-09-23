@@ -1,0 +1,9 @@
+on:
+  push:
+  schedule:
+    - cron: 'not a cron'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo bad-cron-accepted

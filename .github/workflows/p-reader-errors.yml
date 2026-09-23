@@ -1,0 +1,54 @@
+on: push
+jobs:
+  unknown-key:
+    runs-on: ubuntu-latest
+    foo: bar
+    steps:
+      - run: echo x
+  missing-runs-on:
+    steps:
+      - run: echo x
+  runs-on-and-uses:
+    runs-on: ubuntu-latest
+    uses: ./.github/workflows/called.yml
+  step-shell-only:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+  expr-in-needs:
+    needs: ${{ github.x }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  secrets-in-step-if:
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ secrets.X }}
+        run: echo x
+  env-in-runs-on:
+    runs-on: ${{ env.X }}
+    steps:
+      - run: echo x
+  unknown-in-run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ foo.bar }}
+  empty-expr:
+    if: ${{ }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  unclosed:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ github.sha
+  bad-timeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: abc
+    steps:
+      - run: echo x
+  bad-coe:
+    runs-on: ubuntu-latest
+    continue-on-error: maybe
+    steps:
+      - run: echo x

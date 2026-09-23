@@ -1,0 +1,11 @@
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      pick:
+        type: choice
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo choice-without-options-accepted

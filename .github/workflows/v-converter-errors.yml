@@ -1,0 +1,42 @@
+on: push
+jobs:
+  1bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  step-ids:
+    runs-on: ubuntu-latest
+    steps:
+      - id: __reserved
+        run: echo x
+      - id: s1
+        run: echo x
+      - id: S1
+        run: echo x
+  bad-uses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: foo
+      - uses: $/.github/actions/x@v1
+  empty-vector:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: []
+    steps:
+      - run: echo x
+  long-concurrency:
+    runs-on: ubuntu-latest
+    concurrency: ggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg
+    steps:
+      - run: echo x
+  bad-group:
+    runs-on:
+      group: bad/x/y
+    steps:
+      - run: echo x
+  bare-if:
+    if: foo.bar
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

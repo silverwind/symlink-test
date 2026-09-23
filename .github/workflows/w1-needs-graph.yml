@@ -1,0 +1,21 @@
+on: push
+jobs:
+  root:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  unknown-need:
+    needs: nope
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  cyc-a:
+    needs: [root, cyc-b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  cyc-b:
+    needs: cyc-a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

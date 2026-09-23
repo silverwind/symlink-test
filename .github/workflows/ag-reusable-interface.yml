@@ -1,0 +1,15 @@
+on: push
+jobs:
+  undefined-input:
+    uses: ./.github/workflows/called.yml
+    with:
+      bar: 1
+    secrets:
+      token: x
+  missing-secret:
+    uses: ./.github/workflows/called.yml
+  undefined-secret:
+    uses: ./.github/workflows/called.yml
+    secrets:
+      token: x
+      other: y

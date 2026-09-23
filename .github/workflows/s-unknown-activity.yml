@@ -1,0 +1,9 @@
+on:
+  push:
+  issues:
+    types: [bogus_type]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unknown-activity-accepted

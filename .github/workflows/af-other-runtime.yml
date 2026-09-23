@@ -1,0 +1,23 @@
+on: push
+jobs:
+  name-err:
+    name: ${{ fromJSON('not-json') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  coe-err:
+    continue-on-error: ${{ fromJSON('not-json') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  timeout-err:
+    timeout-minutes: ${{ fromJSON('not-json') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x
+  strategy-err:
+    strategy:
+      matrix: ${{ fromJSON('not-json') }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

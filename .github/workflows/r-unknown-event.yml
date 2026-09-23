@@ -1,0 +1,6 @@
+on: [push, bogus_event]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unknown-event-accepted

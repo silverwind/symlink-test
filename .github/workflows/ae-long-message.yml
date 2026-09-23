@@ -1,0 +1,7 @@
+on: push
+jobs:
+  a:
+    if: ${{ unknown_context_0.value || unknown_context_1.value || unknown_context_2.value || unknown_context_3.value || unknown_context_4.value || unknown_context_5.value || unknown_context_6.value || unknown_context_7.value || unknown_context_8.value || unknown_context_9.value || unknown_context_10.value || unknown_context_11.value || unknown_context_12.value || unknown_context_13.value || unknown_context_14.value || unknown_context_15.value || unknown_context_16.value || unknown_context_17.value || unknown_context_18.value || unknown_context_19.value || unknown_context_20.value || unknown_context_21.value || unknown_context_22.value || unknown_context_23.value || unknown_context_24.value || unknown_context_25.value || unknown_context_26.value || unknown_context_27.value || unknown_context_28.value || unknown_context_29.value }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

@@ -1,0 +1,10 @@
+on: push
+jobs:
+  a:
+    runs-on: &os ubuntu-latest
+    steps:
+      - run: echo anchors-accepted
+  b:
+    runs-on: *os
+    steps:
+      - run: echo alias-used

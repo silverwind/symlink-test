@@ -1,0 +1,11 @@
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  dependent:
+    needs: SETUP
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo needs-case-accepted
