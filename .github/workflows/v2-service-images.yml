@@ -1,0 +1,12 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    services:
+      one: ''
+      two:
+        image: ''
+      three:
+        image:
+    steps:
+      - run: echo x

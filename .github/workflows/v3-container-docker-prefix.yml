@@ -1,0 +1,8 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    container:
+      image: 'docker://'
+    steps:
+      - run: echo x
