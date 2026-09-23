@@ -1,0 +1,7 @@
+on: push
+jobs:
+  literal-False:
+    if: ${{ 'False' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x

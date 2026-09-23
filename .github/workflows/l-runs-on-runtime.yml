@@ -1,0 +1,17 @@
+on: push
+jobs:
+  bad:
+    runs-on: ${{ fromJSON('not-json') }}
+    steps:
+      - run: echo x
+  dependent:
+    needs: bad
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo dependent
+  always-dependent:
+    needs: bad
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo always-dependent

@@ -1,0 +1,12 @@
+on: push
+jobs:
+  literal-false:
+    if: ${{ 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo should-skip
+  literal-true:
+    if: ${{ 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo should-run
