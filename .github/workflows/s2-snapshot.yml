@@ -1,0 +1,7 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    snapshot: my-image
+    steps:
+      - run: echo s2-snapshot-accepted

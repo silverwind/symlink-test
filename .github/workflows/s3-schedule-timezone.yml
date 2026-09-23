@@ -1,0 +1,10 @@
+on:
+  push:
+  schedule:
+    - cron: '0 0 * * *'
+      timezone: Europe/Vienna
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo timezone-accepted

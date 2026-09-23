@@ -1,0 +1,9 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    permissions:
+      code-quality: read
+      copilot-requests: write
+    steps:
+      - run: echo s8-perm-newer-accepted

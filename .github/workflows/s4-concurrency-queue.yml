@@ -1,0 +1,9 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: g
+      queue: max
+    steps:
+      - run: echo s4-concurrency-queue-accepted

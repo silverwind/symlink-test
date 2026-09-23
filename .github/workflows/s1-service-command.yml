@@ -1,0 +1,11 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+        command: redis-server --port 6380
+        entrypoint: /bin/sh
+    steps:
+      - run: echo s1-service-command-accepted

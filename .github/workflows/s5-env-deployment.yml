@@ -1,0 +1,9 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    environment:
+      name: e
+      deployment: false
+    steps:
+      - run: echo s5-env-deployment-accepted

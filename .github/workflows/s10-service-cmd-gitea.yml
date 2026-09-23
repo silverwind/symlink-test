@@ -1,0 +1,10 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+        cmd: [redis-server]
+    steps:
+      - run: echo s10-service-cmd-gitea-accepted

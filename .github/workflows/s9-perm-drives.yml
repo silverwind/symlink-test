@@ -1,0 +1,8 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    permissions:
+      drives: read
+    steps:
+      - run: echo s9-perm-drives-accepted

@@ -1,0 +1,9 @@
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    permissions:
+      models: read
+      id-token: write
+    steps:
+      - run: echo s6-perm-models-accepted
