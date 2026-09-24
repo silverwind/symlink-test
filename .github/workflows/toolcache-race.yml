@@ -1,0 +1,16 @@
+name: toolcache-race
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/toolcache-race.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          ls /opt/hostedtoolcache
+          ls /opt/hostedtoolcache/go
+          ls -la /opt/hostedtoolcache/go/*/ | head -20

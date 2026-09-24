@@ -1,0 +1,5 @@
+on: push
+jobs:
+  j:
+    runs-on: ${{ fromJSON('[]') }}
+    steps: [{run: echo ok}]

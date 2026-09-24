@@ -1,0 +1,28 @@
+name: disk-gate
+
+on:
+  push:
+    paths:
+      - ".github/workflows/disk-gate.yml"
+      - ".github/actions/free-disk-space/**"
+      - ".github/actions/free-disk-space-forced/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cat /etc/os-release | head -2; df -h /
+      - uses: ./.github/actions/free-disk-space
+      - run: echo "step after the gate ran"
+
+  forced:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/free-disk-space-forced
+      - run: echo "step after the cleanup ran"

@@ -1,0 +1,5 @@
+on: push
+jobs:
+  j:
+    runs-on: ${{ fromJSON('{"labels":["ubuntu-latest"]}') }}
+    steps: [{run: echo ok}]
