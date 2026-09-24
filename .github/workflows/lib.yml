@@ -1,0 +1,12 @@
+on:
+  workflow_call:
+    outputs:
+      list:
+        value: ${{ fromJSON(jobs.build.outputs.missing) }}
+      ok:
+        value: fine
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build

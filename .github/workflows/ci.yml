@@ -1,0 +1,15 @@
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/lib.yml
+  deploy:
+    needs: call
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "list=[${{ needs.call.outputs.list }}] ok=[${{ needs.call.outputs.ok }}]"
+  gated:
+    needs: call
+    if: needs.call.outputs.list == ''
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gated
