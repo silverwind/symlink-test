@@ -1,6 +1,0 @@
-on: push
-jobs:
-  call:
-    uses: ./.github/workflows/called-notype.yml
-    with:
-      required: x
