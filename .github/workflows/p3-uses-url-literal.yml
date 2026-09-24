@@ -1,4 +1,0 @@
-on: push
-jobs:
-  call:
-    uses: https://github.com/silverwind/symlink-test/.github/workflows/callee.yml@validation-probe-13

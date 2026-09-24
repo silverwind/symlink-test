@@ -1,0 +1,10 @@
+on:
+  push:
+    branches: ['${{ github.ref }}', validation-probe-13]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    outputs:
+      y: ok
+    steps:
+      - run: echo probe

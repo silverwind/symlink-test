@@ -1,4 +1,0 @@
-on: push
-jobs:
-  call:
-    uses: silverwind/symlink-test/.github/workflows/callee.yml@${{ github.ref_name }}

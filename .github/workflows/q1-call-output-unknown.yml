@@ -1,0 +1,13 @@
+on:
+  push:
+  workflow_call:
+    outputs:
+      x:
+        value: ${{ nope.y }}
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    outputs:
+      y: ok
+    steps:
+      - run: echo probe
