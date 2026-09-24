@@ -1,9 +1,0 @@
-name: 'Probe ${{ github.ref'
-on: push
-jobs:
-  a:
-    runs-on: ubuntu-latest
-    outputs:
-      y: ok
-    steps:
-      - run: echo probe
