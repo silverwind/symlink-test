@@ -2,6 +2,6 @@ on: push
 jobs:
   a:
     runs-on: ubuntu-latest
-    if: null
+    if: nope.x
     steps:
-      - run: echo ran
+      - run: echo probe

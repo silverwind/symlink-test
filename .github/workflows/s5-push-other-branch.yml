@@ -1,0 +1,9 @@
+on:
+  push:
+    branches: [nonexistent-branch]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    if: nope.x
+    steps:
+      - run: echo probe

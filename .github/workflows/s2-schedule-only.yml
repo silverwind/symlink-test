@@ -1,0 +1,9 @@
+on:
+  schedule:
+    - cron: '0 0 1 1 *'
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    if: nope.x
+    steps:
+      - run: echo probe

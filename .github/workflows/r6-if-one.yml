@@ -1,7 +1,0 @@
-on: push
-jobs:
-  a:
-    runs-on: ubuntu-latest
-    if: 1
-    steps:
-      - run: echo ran
