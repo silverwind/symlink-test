@@ -1,0 +1,26 @@
+name: wfcall-caller
+on:
+  push:
+    branches: [wfcall-inputs]
+  workflow_dispatch:
+    inputs:
+      target: {type: string, default: prod}
+      debug: {type: boolean, default: false}
+      shared: {type: string, default: from-dispatch}
+      Mixed: {type: string, default: dispatch-mixed}
+jobs:
+  top:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat <<'JSON'
+          event_name=${{ github.event_name }}
+          inputs=${{ toJSON(inputs) }}
+          event.inputs=${{ toJSON(github.event.inputs) }}
+          JSON
+  call:
+    uses: ./.github/workflows/wfcall-mid.yml
+    with:
+      target: dev
+      mid_only: from-caller
+      mixed: with-lower

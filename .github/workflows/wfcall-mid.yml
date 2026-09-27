@@ -1,0 +1,32 @@
+name: wfcall-mid
+on:
+  workflow_call:
+    inputs:
+      target: {type: string}
+      mid_only: {type: string}
+      mixed: {type: string}
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat <<'JSON'
+          event_name=${{ github.event_name }}
+          inputs=${{ toJSON(inputs) }}
+          event.inputs=${{ toJSON(github.event.inputs) }}
+          debug_type=${{ inputs.debug == true && 'bool-true' || inputs.debug == 'true' && 'string-true' || 'other' }}
+          JSON
+  if-dispatch-input:
+    if: inputs.shared == 'from-dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo job-level if sees undeclared dispatch input
+  if-event-name:
+    if: github.event_name != 'workflow_call'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo job-level if sees event_name=${{ github.event_name }}
+  call-leaf:
+    uses: ./.github/workflows/wfcall-leaf.yml
+    with:
+      leaf_in: from-mid

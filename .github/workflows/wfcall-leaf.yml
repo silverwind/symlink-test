@@ -1,0 +1,17 @@
+name: wfcall-leaf
+on:
+  workflow_call:
+    inputs:
+      leaf_in: {type: string}
+      target: {type: string}
+      def_in: {type: string, default: leaf-default}
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat <<'JSON'
+          event_name=${{ github.event_name }}
+          inputs=${{ toJSON(inputs) }}
+          event.inputs=${{ toJSON(github.event.inputs) }}
+          JSON
