@@ -1,0 +1,28 @@
+{
+  "name": "probe-whitespace",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "whitespace_literal": {
+      "name": "${{ '   ' }}",
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "a"
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}
