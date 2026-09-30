@@ -1,0 +1,41 @@
+name: e3-strings
+on: push
+jobs:
+  special:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        s: ["a, b", "p(q)r", "  pad  ", "line1\nline2", "tab\there", "${{ 'x' }}", "é漢😀"]
+    steps:
+      - run: "true"
+  nestedempty:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cfg:
+          - {a: "", b: null, c: x, d: [], e: {}, f: ["", y, null]}
+    steps:
+      - run: "true"
+  dup:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [a, a]
+    steps:
+      - run: "true"
+  collide:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: ["", a]
+        w: [a, ""]
+    steps:
+      - run: "true"
+  emptyname:
+    name: ""
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [a]
+    steps:
+      - run: "true"

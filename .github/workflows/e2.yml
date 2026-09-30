@@ -1,0 +1,17 @@
+name: e2-scalars
+on: push
+jobs:
+  num:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1.0, 1e3, 0x10, 0o10, .5, -0, .inf, 007, 1000000000000000, 0.1, 100000000000000000000]
+    steps:
+      - run: "true"
+  words:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        b: [True, TRUE, yes, on, ~, Null, NULL, "true", "null", "1.0"]
+    steps:
+      - run: "true"

@@ -1,0 +1,10 @@
+name: r
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        w: [{x: 1}]
+    steps:
+      - run: "true"
