@@ -1,0 +1,91 @@
+{
+  "name": "probe-final",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "padded_expression": {
+      "name": "${{ format('  {0}  ', 'kept') }}",
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "a"
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    },
+    "padded_literal": {
+      "name": "${{ '  kept  ' }}",
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "a"
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    },
+    "array_boundary": {
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            [
+              1,
+              2
+            ]
+          ],
+          "include": [
+            {
+              "v": [
+                2
+              ],
+              "extra": "suffix"
+            },
+            {
+              "v": [
+                1,
+                2,
+                3
+              ],
+              "extra": "longer"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    },
+    "empty_marker_value": {
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": "${{ fromJSON('[\"\\u0024{{ }}\"]') }}"
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}
