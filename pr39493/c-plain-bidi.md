@@ -1,0 +1,1 @@
+plain bidi: abc‮def‬
