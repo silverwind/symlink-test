@@ -1,5 +1,5 @@
 {
-  "name": "probe-empty-marker",
+  "name": "probe-empty-axis",
   "on": {
     "push": {
       "branches": [
@@ -8,14 +8,12 @@
     }
   },
   "jobs": {
-    "empty_marker": {
-      "name": "left ${{ }} right",
+    "empty_axis": {
+      "name": "${{ format('empty_axis:{0}', toJSON(matrix)) }}",
       "runs-on": "ubuntu-latest",
       "strategy": {
         "matrix": {
-          "v": [
-            "a"
-          ]
+          "v": []
         }
       },
       "steps": [
