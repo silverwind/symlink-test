@@ -1,0 +1,28 @@
+{
+  "name": "probe-empty-marker",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "empty_marker": {
+      "name": "left ${{ }} right",
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "a"
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}

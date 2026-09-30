@@ -1,0 +1,33 @@
+{
+  "name": "probe-exclude-key-case",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "exclude_key_case": {
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "os": [
+            "a",
+            "b"
+          ],
+          "exclude": [
+            {
+              "OS": "a"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}

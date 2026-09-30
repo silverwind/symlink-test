@@ -1,0 +1,34 @@
+{
+  "name": "probe-call",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "plain": {
+      "name": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+          ]
+        }
+      },
+      "uses": "./.github/workflows/probe-reusable.yml"
+    },
+    "expression": {
+      "name": "${{ format('{0}', matrix.v) }}",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+          ]
+        }
+      },
+      "uses": "./.github/workflows/probe-reusable.yml"
+    }
+  }
+}

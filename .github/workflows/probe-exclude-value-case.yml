@@ -1,0 +1,33 @@
+{
+  "name": "probe-exclude-value-case",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "exclude_value_case": {
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "os": [
+            "a",
+            "b"
+          ],
+          "exclude": [
+            {
+              "os": "A"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}

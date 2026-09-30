@@ -1,0 +1,28 @@
+{
+  "name": "probe-unclosed",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "unclosed": {
+      "name": "left ${{ unfinished",
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "a"
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}

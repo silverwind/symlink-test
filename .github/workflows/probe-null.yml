@@ -1,0 +1,28 @@
+{
+  "name": "probe-null",
+  "on": {
+    "push": {
+      "branches": [
+        "matrix-names"
+      ]
+    }
+  },
+  "jobs": {
+    "null_computed": {
+      "name": "${{ null }}",
+      "runs-on": "ubuntu-latest",
+      "strategy": {
+        "matrix": {
+          "v": [
+            "a"
+          ]
+        }
+      },
+      "steps": [
+        {
+          "run": "true"
+        }
+      ]
+    }
+  }
+}
