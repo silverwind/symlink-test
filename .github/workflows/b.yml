@@ -1,0 +1,11 @@
+name: b
+on: push
+jobs:
+  nulls:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        val: [null, x]
+        obj: [{k: null}]
+    steps:
+      - run: "true"
