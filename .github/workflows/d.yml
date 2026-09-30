@@ -1,0 +1,76 @@
+name: d
+on: push
+jobs:
+  plain:
+    name: Plain Name
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [z, a, m]
+    steps:
+      - run: "true"
+  exprnomatrix:
+    name: Expr ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [one]
+    steps:
+      - run: "true"
+  newcombo:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [a]
+        include:
+          - {other: o, os: c}
+          - {zz: only}
+    steps:
+      - run: "true"
+  ws:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        s: [" ", "x"]
+    steps:
+      - run: "true"
+  longexplicit:
+    name: Eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+  longplusmatrix:
+    name: Nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [abcdefghij]
+    steps:
+      - run: "true"
+  includeoverride:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [a]
+        include:
+          - {os: a, x: 1}
+          - {os: a, x: 2}
+    steps:
+      - run: "true"
+  objectextra:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cfg: [{k: v}]
+        include:
+          - {cfg: {k: v}, extra: e}
+    steps:
+      - run: "true"
+  uiorder:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [zulu, alpha, mike]
+        w: [2, 1]
+    steps:
+      - run: "true"
