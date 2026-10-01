@@ -1,6 +1,7 @@
 name: review-source
 
 on:
+  workflow_dispatch:
   pull_request_review:
     types: [submitted, edited, dismissed]
 
