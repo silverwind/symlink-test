@@ -1,0 +1,23 @@
+name: approve-helper
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        required: true
+      event:
+        required: true
+        default: approve
+
+permissions:
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          EVENT: ${{ inputs.event }}
+        run: gh pr review "$PR" --"$EVENT" -R "$GITHUB_REPOSITORY" --body "approve-helper $EVENT"

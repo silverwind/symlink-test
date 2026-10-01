@@ -1,0 +1,36 @@
+name: review-bridge
+
+on:
+  workflow_run:
+    workflows: [review-source]
+    types: [requested]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-review
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - env:
+          PROBE_SECRET_SET: ${{ secrets.PROBE_SECRET != '' }}
+        run: |
+          echo "probe_secret_set=$PROBE_SECRET_SET"
+          jq -c '{action, source: (.workflow_run | {event, status, conclusion, head_sha, head_branch, created_at})}' "$GITHUB_EVENT_PATH"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: giteabot-bridge
+          path: giteabot
+          persist-credentials: false
+      - uses: ./giteabot
+        with:
+          github_token: ${{ github.token }}
+          checks: lgtm
