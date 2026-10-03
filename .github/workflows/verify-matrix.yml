@@ -1,0 +1,17 @@
+name: verify-matrix
+on:
+  push:
+    branches: [probe-verify-matrix]
+permissions:
+  contents: read
+jobs:
+  exclude_hex:
+    runs-on: ubuntu-latest
+    strategy: {matrix: {v: [16, 17], exclude: [{v: "0x10"}]}}
+    steps:
+      - env:
+          MATRIX: ${{ toJSON(matrix) }}
+          STRATEGY: ${{ toJSON(strategy) }}
+        run: |
+          printf '%s\n' "$MATRIX"
+          printf '%s\n' "$STRATEGY"
