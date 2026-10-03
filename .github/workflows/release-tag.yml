@@ -1,0 +1,35 @@
+---
+name: release-tag
+'on':
+  push:
+    tags:
+    - v[0-9]*
+    - "!v[0-9]*-*"
+permissions:
+  contents: write
+  pull-requests: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - run: git fetch --unshallow --quiet --tags --force
+    - id: range
+      env:
+        TAG: "${{ github.ref_name }}"
+      run: |
+        previous=$(git describe --tags --abbrev=0 --match "${TAG%.*}.*" --exclude "$TAG" 2> /dev/null || git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' --exclude "$TAG") # same minor line incl. its -dev tag, else nearest stable
+        echo "range=$previous..$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT" # a sha, not HEAD, so git-cliff fetches PR labels of this branch
+    - id: cliff
+      uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff
+      with:
+        args: "--github-repo ${{ github.repository }} --tag ${{ github.ref_name }}
+          ${{ steps.range.outputs.range }}"
+    - name: create github release
+      env:
+        GITHUB_TOKEN: "${{ github.token }}"
+        TAG: "${{ github.ref_name }}"
+        NOTES: "${{ steps.cliff.outputs.changelog }}"
+      run: 'gh release create "$TAG" --title "$TAG" --notes-file "$NOTES"
+
+'
