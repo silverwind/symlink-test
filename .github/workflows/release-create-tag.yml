@@ -27,11 +27,11 @@ jobs:
         run: |
           [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           previous=$(git describe --tags --abbrev=0 --match "v${VERSION%.*}.*" 2> /dev/null || git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*') # same minor line incl. its -dev tag, else nearest stable
-          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "range=$previous..$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT" # a sha, not HEAD, so git-cliff fetches PR labels of this branch
       - id: cliff
         uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
         with:
-          args: --github-repo ${{ github.repository }} --tag v${{ inputs.version }} ${{ steps.range.outputs.previous }}..HEAD
+          args: --github-repo ${{ github.repository }} --tag v${{ inputs.version }} ${{ steps.range.outputs.range }}
       - uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
         with:
           gpg_private_key: ${{ secrets.RELEASE_TAG_GPG_KEY }}
