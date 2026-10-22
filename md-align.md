@@ -75,14 +75,20 @@ P05 After tight list.
       1. O04 nested deeper
 3. O05 ordered
 
+P05b Separator.
+
 5. O06 start at five
 6. O07 six
+
+P05c Separator.
 
 1. O08 tight item with code block:
    ```js
    C01 const a = 1;
    ```
 2. O09 after code
+
+P05d Separator.
 
 1. O10 loose item with code block:
 
