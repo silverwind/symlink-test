@@ -253,3 +253,13 @@ treemap-beta
 
 P-treemap
 
+<details><summary>collapsed</summary>
+
+```mermaid
+flowchart LR
+  a-->b-->c-->d-->e["word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"]-->f-->g-->h-->i-->j
+```
+
+</details>
+
+P-details
