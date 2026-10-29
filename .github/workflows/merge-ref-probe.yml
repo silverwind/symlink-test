@@ -1,0 +1,23 @@
+name: merge-ref-probe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed, labeled]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "event=${{ github.event_name }} action=${{ github.event.action }}"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "GITHUB_REF_TYPE=$GITHUB_REF_TYPE"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "GITHUB_HEAD_REF=$GITHUB_HEAD_REF GITHUB_BASE_REF=$GITHUB_BASE_REF"
+          echo "workflow_sha=${{ github.workflow_sha }} workflow_ref=${{ github.workflow_ref }}"
+          echo "head.sha=${{ github.event.pull_request.head.sha }} base.sha=${{ github.event.pull_request.base.sha }}"
+          echo "merge_commit_sha=${{ github.event.pull_request.merge_commit_sha }} merged=${{ github.event.pull_request.merged }} mergeable=${{ github.event.pull_request.mergeable }}"
+      - uses: actions/checkout@v4
+        continue-on-error: true
+      - run: |
+          git log -1 --format='HEAD=%H parents=%P%nauthor=%an <%ae> %ad%ncommitter=%cn <%ce> %cd%nmsg=%B'
+          git ls-remote origin 'refs/pull/*' | tail -5
