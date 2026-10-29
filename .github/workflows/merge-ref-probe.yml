@@ -1,7 +1,9 @@
 name: merge-ref-probe
 on:
   pull_request:
-    types: [opened, synchronize, reopened, closed, labeled]
+    types: [opened]
+  pull_request_review:
+  pull_request_review_comment:
 jobs:
   probe:
     runs-on: ubuntu-latest
