@@ -1,0 +1,17 @@
+name: cache-scope
+on:
+  pull_request:
+    branches: [scope-release]
+  workflow_dispatch:
+jobs:
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: deps
+          key: scope1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: scope1-
+      - run: echo "RESULT event=${{ github.event_name }} ref=${{ github.ref }} restored=$(cat deps/origin.txt 2>/dev/null || echo none) matched=${{ steps.cache.outputs.cache-matched-key }}"
+      - run: mkdir -p deps && echo "${{ github.ref }}@${{ github.run_id }}" > deps/origin.txt
