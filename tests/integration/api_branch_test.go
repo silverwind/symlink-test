@@ -1,0 +1,544 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func testAPIGetBranch(t *testing.T, branchName string, exists bool) {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeReadRepository)
+	req := NewRequestf(t, "GET", "/api/v1/repos/user2/repo1/branches/%s", branchName).
+		AddTokenAuth(token)
+	resp := MakeRequest(t, req, NoExpectedStatus)
+	if !exists {
+		assert.Equal(t, http.StatusNotFound, resp.Code)
+		return
+	}
+	assert.Equal(t, http.StatusOK, resp.Code)
+	branch := DecodeJSON(t, resp, &api.Branch{})
+	assert.Equal(t, branchName, branch.Name)
+	assert.True(t, branch.UserCanPush)
+	assert.True(t, branch.UserCanMerge)
+}
+
+func testAPIGetBranchProtection(t *testing.T, branchName string, expectedHTTPStatus int) *api.BranchProtection {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeReadRepository)
+	req := NewRequestf(t, "GET", "/api/v1/repos/user2/repo1/branch_protections/%s", branchName).
+		AddTokenAuth(token)
+	resp := MakeRequest(t, req, expectedHTTPStatus)
+
+	if resp.Code == http.StatusOK {
+		branchProtection := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.Equal(t, branchName, branchProtection.RuleName)
+		return branchProtection
+	}
+	return nil
+}
+
+func testAPICreateBranchProtection(t *testing.T, branchName string, expectedPriority, expectedHTTPStatus int) {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/branch_protections", &api.BranchProtection{
+		RuleName: branchName,
+	}).AddTokenAuth(token)
+	resp := MakeRequest(t, req, expectedHTTPStatus)
+
+	if resp.Code == http.StatusCreated {
+		branchProtection := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.Equal(t, branchName, branchProtection.RuleName)
+		assert.EqualValues(t, expectedPriority, branchProtection.Priority)
+	}
+}
+
+func testAPIEditBranchProtection(t *testing.T, branchName string, body any, expectedHTTPStatus int) {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequestWithJSON(t, "PATCH", "/api/v1/repos/user2/repo1/branch_protections/"+branchName, body).
+		AddTokenAuth(token)
+	resp := MakeRequest(t, req, expectedHTTPStatus)
+
+	if resp.Code == http.StatusOK {
+		branchProtection := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.Equal(t, branchName, branchProtection.RuleName)
+	}
+}
+
+func testAPIDeleteBranchProtection(t *testing.T, branchName string, expectedHTTPStatus int) {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequestf(t, "DELETE", "/api/v1/repos/user2/repo1/branch_protections/%s", branchName).
+		AddTokenAuth(token)
+	MakeRequest(t, req, expectedHTTPStatus)
+}
+
+func testAPIDeleteBranch(t *testing.T, branchName string, expectedHTTPStatus int) {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequestf(t, "DELETE", "/api/v1/repos/user2/repo1/branches/%s", branchName).
+		AddTokenAuth(token)
+	MakeRequest(t, req, expectedHTTPStatus)
+}
+
+func TestAPICreateBranch(t *testing.T) {
+	onGiteaRun(t, testAPICreateBranches)
+}
+
+func testAPICreateBranches(t *testing.T, giteaURL *url.URL) {
+	username := "user2"
+	ctx := NewAPITestContext(t, username, "my-noo-repo", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
+	giteaURL.Path = ctx.GitPath()
+
+	t.Run("CreateRepo", doAPICreateRepository(ctx, false))
+	testCases := []struct {
+		OldBranch          string
+		NewBranch          string
+		ExpectedHTTPStatus int
+	}{
+		// Creating branch from default branch
+		{
+			OldBranch:          "",
+			NewBranch:          "new_branch_from_default_branch",
+			ExpectedHTTPStatus: http.StatusCreated,
+		},
+		// Creating branch from master
+		{
+			OldBranch:          "master",
+			NewBranch:          "new_branch_from_master_1",
+			ExpectedHTTPStatus: http.StatusCreated,
+		},
+		// Trying to create from master but already exists
+		{
+			OldBranch:          "master",
+			NewBranch:          "new_branch_from_master_1",
+			ExpectedHTTPStatus: http.StatusConflict,
+		},
+		// Trying to create from other branch (not default branch)
+		// ps: it can't test the case-sensitive behavior here: the "BRANCH_2" can't be created by git on a case-insensitive filesystem, it makes the test fail quickly before the database code.
+		// Suppose some users are running Gitea on a case-insensitive filesystem, it seems that it's unable to support case-sensitive branch names.
+		{
+			OldBranch:          "new_branch_from_master_1",
+			NewBranch:          "branch_2",
+			ExpectedHTTPStatus: http.StatusCreated,
+		},
+		// Trying to create from a branch which does not exist
+		{
+			OldBranch:          "does_not_exist",
+			NewBranch:          "new_branch_from_non_existent",
+			ExpectedHTTPStatus: http.StatusNotFound,
+		},
+		// Trying to create a branch with UTF8
+		{
+			OldBranch:          "master",
+			NewBranch:          "test-👀",
+			ExpectedHTTPStatus: http.StatusCreated,
+		},
+	}
+	for _, test := range testCases {
+		session := ctx.Session
+		t.Run(test.NewBranch, func(t *testing.T) {
+			testAPICreateBranch(t, session, "user2", "my-noo-repo", test.OldBranch, test.NewBranch, test.ExpectedHTTPStatus)
+		})
+	}
+}
+
+func testAPICreateBranch(t testing.TB, session *TestSession, user, repo, oldBranch, newBranch string, status int) bool {
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequestWithJSON(t, "POST", "/api/v1/repos/"+user+"/"+repo+"/branches", &api.CreateBranchRepoOption{
+		BranchName:    newBranch,
+		OldBranchName: oldBranch,
+	}).AddTokenAuth(token)
+	resp := MakeRequest(t, req, status)
+
+	branch := DecodeJSON(t, resp, &api.Branch{})
+
+	if resp.Result().StatusCode == http.StatusCreated {
+		assert.Equal(t, newBranch, branch.Name)
+	}
+
+	return resp.Result().StatusCode == status
+}
+
+func TestAPIRenameBranch(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, _ *url.URL) {
+		t.Run("RenameBranchWithEmptyRepo", func(t *testing.T) {
+			testAPIRenameBranch(t, "user10", "user10", "repo6", "master", "test", http.StatusNotFound)
+		})
+		t.Run("RenameBranchWithSameBranchNames", func(t *testing.T) {
+			resp := testAPIRenameBranch(t, "user2", "user2", "repo1", "master", "master", http.StatusUnprocessableEntity)
+			assert.Contains(t, resp.Body.String(), "Cannot rename a branch using the same name or rename to a branch that already exists.")
+		})
+		t.Run("RenameBranchThatAlreadyExists", func(t *testing.T) {
+			resp := testAPIRenameBranch(t, "user2", "user2", "repo1", "master", "branch2", http.StatusUnprocessableEntity)
+			assert.Contains(t, resp.Body.String(), "Cannot rename a branch using the same name or rename to a branch that already exists.")
+		})
+		t.Run("RenameBranchWithNonExistentBranch", func(t *testing.T) {
+			resp := testAPIRenameBranch(t, "user2", "user2", "repo1", "i-dont-exist", "new-branch-name", http.StatusNotFound)
+			assert.Contains(t, resp.Body.String(), "Branch doesn't exist.")
+		})
+		t.Run("RenameBranchWithNonAdminDoer", func(t *testing.T) {
+			// don't allow default branch renaming
+			resp := testAPIRenameBranch(t, "user40", "user2", "repo1", "master", "new-branch-name", http.StatusForbidden)
+			assert.Contains(t, resp.Body.String(), "User must be a repo or site admin to rename default or protected branches.")
+
+			// don't allow protected branch renaming
+			token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+			req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/branches", &api.CreateBranchRepoOption{
+				BranchName: "protected-branch",
+			}).AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusCreated)
+			testAPICreateBranchProtection(t, "protected-branch", 1, http.StatusCreated)
+			resp = testAPIRenameBranch(t, "user40", "user2", "repo1", "protected-branch", "new-branch-name", http.StatusForbidden)
+			assert.Contains(t, resp.Body.String(), "User must be a repo or site admin to rename default or protected branches.")
+		})
+		t.Run("RenameBranchWithGlobedBasedProtectionRulesAndAdminAccess", func(t *testing.T) {
+			// don't allow branch that falls under glob-based protection rules to be renamed
+			token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+			req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/branch_protections", &api.BranchProtection{
+				RuleName:   "protected/**",
+				EnablePush: true,
+			}).AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusCreated)
+
+			from := "protected/1"
+			req = NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/branches", &api.CreateBranchRepoOption{
+				BranchName: from,
+			}).AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusCreated)
+
+			resp := testAPIRenameBranch(t, "user2", "user2", "repo1", from, "new-branch-name", http.StatusForbidden)
+			assert.Contains(t, resp.Body.String(), "Failed to rename branch due to branch protection rules.")
+		})
+		t.Run("RenameBranchToMatchProtectionRulesWithAllowedUser", func(t *testing.T) {
+			// allow an admin (the owner in this case) to rename a regular branch to one that matches a branch protection rule
+			repoName := "repo1"
+			ownerName := "user2"
+			from := "regular-branch-1"
+			ctx := NewAPITestContext(t, ownerName, repoName, auth_model.AccessTokenScopeWriteRepository)
+			testAPICreateBranch(t, ctx.Session, ownerName, repoName, "", from, http.StatusCreated)
+
+			// NOTE: The protected/** branch protection rule was created in a previous test, with push enabled.
+			testAPIRenameBranch(t, ownerName, ownerName, repoName, from, "protected/2", http.StatusNoContent)
+		})
+		t.Run("RenameBranchToMatchProtectionRulesWithUnauthorizedUser", func(t *testing.T) {
+			// don't allow renaming a regular branch to a protected branch if the doer is not in the push whitelist
+			repoName := "repo1"
+			ownerName := "user2"
+			pushWhitelist := []string{ownerName}
+			token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+			req := NewRequestWithJSON(t, "POST", fmt.Sprintf("/api/v1/repos/%s/%s/branch_protections", ownerName, repoName),
+				&api.BranchProtection{
+					RuleName:               "owner-protected/**",
+					PushWhitelistUsernames: pushWhitelist,
+				}).AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusCreated)
+
+			from := "regular-branch-2"
+			ctx := NewAPITestContext(t, ownerName, repoName, auth_model.AccessTokenScopeWriteRepository)
+			testAPICreateBranch(t, ctx.Session, ownerName, repoName, "", from, http.StatusCreated)
+
+			unprivilegedUser := "user40"
+			resp := testAPIRenameBranch(t, unprivilegedUser, ownerName, repoName, from, "owner-protected/1", http.StatusForbidden)
+
+			assert.Contains(t, resp.Body.String(), "Failed to rename branch due to branch protection rules.")
+		})
+		t.Run("RenameBranchNormalScenario", func(t *testing.T) {
+			testAPIRenameBranch(t, "user2", "user2", "repo1", "branch2", "new-branch-name", http.StatusNoContent)
+		})
+	})
+}
+
+func TestAPIUpdateBranchReference(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		ctx := NewAPITestContext(t, "user2", "update-branch", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
+		giteaURL.Path = ctx.GitPath()
+
+		var defaultBranch string
+		t.Run("CreateRepo", doAPICreateRepository(ctx, false, func(t *testing.T, repo api.Repository) {
+			defaultBranch = repo.DefaultBranch
+		}))
+
+		createBranchReq := NewRequestWithJSON(t, "POST", fmt.Sprintf("/api/v1/repos/%s/%s/branches", ctx.Username, ctx.Reponame), &api.CreateBranchRepoOption{
+			BranchName: "feature",
+			OldRefName: defaultBranch,
+		}).AddTokenAuth(ctx.Token)
+		ctx.Session.MakeRequest(t, createBranchReq, http.StatusCreated)
+
+		var featureInitialCommit string
+		t.Run("LoadFeatureBranch", doAPIGetBranch(ctx, "feature", func(t *testing.T, branch api.Branch) {
+			featureInitialCommit = branch.Commit.ID
+			assert.NotEmpty(t, featureInitialCommit)
+		}))
+
+		content := base64.StdEncoding.EncodeToString([]byte("branch update test"))
+		var newCommit string
+		doAPICreateFile(ctx, "docs/update.txt", &api.CreateFileOptions{
+			FileOptions: api.FileOptions{
+				BranchName:    defaultBranch,
+				NewBranchName: defaultBranch,
+				Message:       "add docs/update.txt",
+			},
+			ContentBase64: content,
+		}, func(t *testing.T, resp api.FileResponse) {
+			newCommit = resp.Commit.SHA
+			assert.NotEmpty(t, newCommit)
+		})(t)
+
+		updateBranch := func(newCommitID, oldCommitID string, force bool, expectedStatus int) {
+			req := NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/%s/branches/%s", ctx.Username, ctx.Reponame, "feature"), &api.UpdateBranchRepoOption{
+				NewCommitID: newCommitID,
+				OldCommitID: oldCommitID,
+				Force:       force,
+			}).AddTokenAuth(ctx.Token)
+			ctx.Session.MakeRequest(t, req, expectedStatus)
+		}
+		updateBranch(newCommit, featureInitialCommit, false, http.StatusNoContent)
+
+		t.Run("FastForwardApplied", doAPIGetBranch(ctx, "feature", func(t *testing.T, branch api.Branch) {
+			assert.Equal(t, newCommit, branch.Commit.ID)
+		}))
+
+		updateBranch(newCommit, featureInitialCommit, false, http.StatusUnprocessableEntity)
+		updateBranch(featureInitialCommit, newCommit, false, http.StatusUnprocessableEntity)
+		updateBranch(featureInitialCommit, newCommit, true, http.StatusNoContent)
+
+		t.Run("ForceApplied", doAPIGetBranch(ctx, "feature", func(t *testing.T, branch api.Branch) {
+			assert.Equal(t, featureInitialCommit, branch.Commit.ID)
+		}))
+	})
+}
+
+func testAPIRenameBranch(t *testing.T, doerName, ownerName, repoName, from, to string, expectedHTTPStatus int) *httptest.ResponseRecorder {
+	token := getUserToken(t, doerName, auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequestWithJSON(t, "PATCH", "/api/v1/repos/"+ownerName+"/"+repoName+"/branches/"+from, &api.RenameBranchRepoOption{
+		Name: to,
+	}).AddTokenAuth(token)
+	return MakeRequest(t, req, expectedHTTPStatus)
+}
+
+func TestAPIBranchProtection(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	t.Run("GetBranch", func(t *testing.T) {
+		for _, test := range []struct {
+			BranchName string
+			Exists     bool
+		}{
+			{"master", true},
+			{"master/doesnotexist", false},
+			{"feature/1", true},
+			{"feature/1/doesnotexist", false},
+		} {
+			testAPIGetBranch(t, test.BranchName, test.Exists)
+		}
+	})
+	t.Run("Basic", testAPIBranchProtectionBasic)
+	t.Run("BypassAllowlistValidation", testAPIBranchProtectionBypassAllowlistValidation)
+}
+
+func testAPIBranchProtectionBasic(t *testing.T) {
+	// Can create branch protection on branch that not exist
+	testAPICreateBranchProtection(t, "non-existing/branch", 1, http.StatusCreated)
+	testAPIGetBranchProtection(t, "non-existing/branch", http.StatusOK)
+	testAPIDeleteBranchProtection(t, "non-existing/branch", http.StatusNoContent)
+
+	// Get branch protection on branch that exist but not branch protection
+	testAPIGetBranchProtection(t, "master", http.StatusNotFound)
+
+	testAPICreateBranchProtection(t, "master", 1, http.StatusCreated)
+	// Can only create once
+	testAPICreateBranchProtection(t, "master", 0, http.StatusForbidden)
+
+	testAPICreateBranchProtection(t, "other-branch", 2, http.StatusCreated)
+
+	// Can't delete a protected branch
+	testAPIDeleteBranch(t, "master", http.StatusForbidden)
+
+	testAPIGetBranchProtection(t, "master", http.StatusOK)
+	testAPIEditBranchProtection(t, "master", &api.BranchProtection{
+		EnablePush: true,
+	}, http.StatusOK)
+
+	// enable status checks, require the "test1" check to pass
+	testAPIEditBranchProtection(t, "master", &api.BranchProtection{
+		EnableStatusCheck:   true,
+		StatusCheckContexts: []string{"test1"},
+	}, http.StatusOK)
+	bp := testAPIGetBranchProtection(t, "master", http.StatusOK)
+	assert.True(t, bp.EnableStatusCheck)
+	assert.Equal(t, []string{"test1"}, bp.StatusCheckContexts)
+
+	// disable status checks, clear the list of required checks
+	testAPIEditBranchProtection(t, "master", &api.BranchProtection{
+		EnableStatusCheck:   false,
+		StatusCheckContexts: []string{},
+	}, http.StatusOK)
+	bp = testAPIGetBranchProtection(t, "master", http.StatusOK)
+	assert.False(t, bp.EnableStatusCheck)
+	assert.Equal(t, []string{}, bp.StatusCheckContexts)
+
+	testAPIDeleteBranchProtection(t, "master", http.StatusNoContent)
+
+	// Test branch deletion
+	testAPIDeleteBranch(t, "master", http.StatusForbidden)
+	testAPICreateBranchProtection(t, "branch2", 3, http.StatusCreated)
+	testAPIDeleteBranch(t, "branch2", http.StatusForbidden)
+	testAPIEditBranchProtection(t, "branch2", &api.EditBranchProtectionOption{
+		EnablePush: new(true), EnableDeletion: new(true), EnableDeletionAllowlist: new(true),
+		DeletionAllowlistUsernames: []string{"user2"},
+	}, http.StatusOK)
+	bp = testAPIGetBranchProtection(t, "branch2", http.StatusOK)
+	assert.True(t, bp.EnableDeletion)
+	assert.Equal(t, []string{"user2"}, bp.DeletionAllowlistUsernames)
+	testAPIDeleteBranch(t, "branch2", http.StatusNoContent)
+	testAPIDeleteBranch(t, "branch2", http.StatusNotFound)        // deleted branch, there is a record in DB with IsDelete=true
+	testAPIDeleteBranch(t, "no-such-branch", http.StatusNotFound) // non-existing branch, not exist in git or DB
+}
+
+func testAPIBranchProtectionBypassAllowlistValidation(t *testing.T) {
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+
+	t.Run("IgnoreInvalidBypassUsernamesWhenDisabled", func(t *testing.T) {
+		ruleName := "bypass-disabled-invalid-user"
+		req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/branch_protections", &api.CreateBranchProtectionOption{
+			RuleName:                 ruleName,
+			EnableBypassAllowlist:    false,
+			BypassAllowlistUsernames: []string{"nonexistent-user"},
+		}).AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusCreated)
+		testAPIDeleteBranchProtection(t, ruleName, http.StatusNoContent)
+	})
+
+	t.Run("IgnoreInvalidBypassTeamsWhenDisabled", func(t *testing.T) {
+		ruleName := "bypass-disabled-invalid-team"
+		req := NewRequestWithJSON(t, "POST", "/api/v1/repos/org3/repo3/branch_protections", &api.CreateBranchProtectionOption{
+			RuleName:              ruleName,
+			EnableBypassAllowlist: false,
+			BypassAllowlistTeams:  []string{"nonexistent-team"},
+		}).AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusCreated)
+
+		deleteReq := NewRequestf(t, "DELETE", "/api/v1/repos/org3/repo3/branch_protections/%s", ruleName).
+			AddTokenAuth(token)
+		MakeRequest(t, deleteReq, http.StatusNoContent)
+	})
+}
+
+func TestAPICreateBranchWithSyncBranches(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	branches, err := db.Find[git_model.Branch](t.Context(), git_model.FindBranchOptions{
+		RepoID: 1,
+	})
+	assert.NoError(t, err)
+	assert.Len(t, branches, 8)
+
+	// make a broke repository with no branch on database
+	_, err = db.DeleteByBean(t.Context(), git_model.Branch{RepoID: 1})
+	assert.NoError(t, err)
+
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		ctx := NewAPITestContext(t, "user2", "repo1", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
+		giteaURL.Path = ctx.GitPath()
+
+		testAPICreateBranch(t, ctx.Session, "user2", "repo1", "", "new_branch", http.StatusCreated)
+	})
+
+	branches, err = db.Find[git_model.Branch](t.Context(), git_model.FindBranchOptions{
+		RepoID: 1,
+	})
+	assert.NoError(t, err)
+	assert.Len(t, branches, 9)
+
+	branches, err = db.Find[git_model.Branch](t.Context(), git_model.FindBranchOptions{
+		RepoID:  1,
+		Keyword: "new_branch",
+	})
+	assert.NoError(t, err)
+	assert.Len(t, branches, 1)
+}
+
+func TestAPIBranchProtectionDeployKeyAllowlists(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	path := "/api/v1/repos/user2/repo1/branch_protections"
+	createProtection := func(t *testing.T, ruleName string, deployKeys bool) *api.BranchProtection {
+		t.Helper()
+		resp := MakeRequest(t, NewRequestWithJSON(t, "POST", path, &api.CreateBranchProtectionOption{
+			RuleName: ruleName, EnablePush: true, EnablePushWhitelist: true, PushWhitelistDeployKeys: deployKeys,
+			EnableForcePush: true, EnableForcePushAllowlist: true, ForcePushAllowlistDeployKeys: deployKeys,
+		}).AddTokenAuth(token), http.StatusCreated)
+		return DecodeJSON(t, resp, &api.BranchProtection{})
+	}
+
+	t.Run("CreateWithLegacyFlags", func(t *testing.T) {
+		bp := createProtection(t, "legacy-flags", true)
+		assert.True(t, bp.PushWhitelistDeployKeys)
+		assert.True(t, bp.ForcePushAllowlistDeployKeys)
+	})
+
+	t.Run("PreserveDeployKeysWhenUpdatingUsernames", func(t *testing.T) {
+		createProtection(t, "update-usernames", true)
+		resp := MakeRequest(t, NewRequestWithJSON(t, "PATCH", path+"/update-usernames", map[string]any{
+			"push_whitelist_usernames": []string{"user2"}, "force_push_allowlist_usernames": []string{},
+		}).AddTokenAuth(token), http.StatusOK)
+		bp := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.True(t, bp.PushWhitelistDeployKeys)
+		assert.True(t, bp.ForcePushAllowlistDeployKeys)
+		assert.Equal(t, []string{"user2", "gitea:deploy-key"}, bp.PushWhitelistUsernames)
+	})
+
+	t.Run("LegacyFlagsDisableDeployKeys", func(t *testing.T) {
+		createProtection(t, "disable-deploy-keys", true)
+		resp := MakeRequest(t, NewRequestWithJSON(t, "PATCH", path+"/disable-deploy-keys", map[string]any{
+			"enable_push": true, "enable_push_whitelist": true, "push_whitelist_deploy_keys": false,
+			"enable_force_push": true, "enable_force_push_allowlist": true, "force_push_allowlist_deploy_keys": false,
+			"push_whitelist_usernames": []string{"user2", "gitea:deploy-key"}, "force_push_allowlist_usernames": []string{"gitea:deploy-key"},
+		}).AddTokenAuth(token), http.StatusOK)
+		bp := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.False(t, bp.PushWhitelistDeployKeys)
+		assert.False(t, bp.ForcePushAllowlistDeployKeys)
+		assert.Equal(t, []string{"user2"}, bp.PushWhitelistUsernames)
+		rule, err := git_model.GetProtectedBranchRuleByName(t.Context(), 1, "disable-deploy-keys")
+		require.NoError(t, err)
+		require.NotNil(t, rule)
+		assert.Equal(t, []int64{2}, rule.WhitelistUserIDs)
+		assert.Empty(t, rule.ForcePushAllowlistUserIDs)
+	})
+
+	t.Run("AddDeployKeysByUsername", func(t *testing.T) {
+		createProtection(t, "add-deploy-keys", false)
+		resp := MakeRequest(t, NewRequestWithJSON(t, "PATCH", path+"/add-deploy-keys", map[string]any{
+			"push_whitelist_usernames": []string{"user2", "gitea:deploy-key"}, "force_push_allowlist_usernames": []string{"gitea:deploy-key"},
+		}).AddTokenAuth(token), http.StatusOK)
+		bp := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.True(t, bp.PushWhitelistDeployKeys)
+		assert.True(t, bp.ForcePushAllowlistDeployKeys)
+		assert.Equal(t, []string{"user2", "gitea:deploy-key"}, bp.PushWhitelistUsernames)
+		assert.Equal(t, []string{"gitea:deploy-key"}, bp.ForcePushAllowlistUsernames)
+	})
+
+	t.Run("CreateWithDeployKeyUsernames", func(t *testing.T) {
+		resp := MakeRequest(t, NewRequestWithJSON(t, "POST", path, &api.CreateBranchProtectionOption{
+			RuleName: "deploy-key-usernames", EnablePush: true, EnablePushWhitelist: true,
+			PushWhitelistUsernames: []string{"gitea:deploy-key"}, EnableForcePush: true, EnableForcePushAllowlist: true,
+			ForcePushAllowlistUsernames: []string{"gitea:deploy-key"},
+		}).AddTokenAuth(token), http.StatusCreated)
+		bp := DecodeJSON(t, resp, &api.BranchProtection{})
+		assert.True(t, bp.PushWhitelistDeployKeys)
+		assert.True(t, bp.ForcePushAllowlistDeployKeys)
+		assert.Equal(t, []string{"gitea:deploy-key"}, bp.PushWhitelistUsernames)
+		assert.Equal(t, []string{"gitea:deploy-key"}, bp.ForcePushAllowlistUsernames)
+	})
+}

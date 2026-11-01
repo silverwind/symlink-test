@@ -1,0 +1,253 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"io"
+	"net"
+	"net/smtp"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/services/mailer/incoming"
+	incoming_payload "gitea.dev/services/mailer/incoming/payload"
+	sender_service "gitea.dev/services/mailer/sender"
+	token_service "gitea.dev/services/mailer/token"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestIncomingEmail(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, u *url.URL) {
+		user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: 1})
+
+		t.Run("Payload", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			comment := unittest.AssertExistsAndLoadBean(t, &issues_model.Comment{ID: 1})
+
+			_, err := incoming_payload.CreateReferencePayload(user)
+			assert.Error(t, err)
+
+			issuePayload, err := incoming_payload.CreateReferencePayload(issue)
+			assert.NoError(t, err)
+			commentPayload, err := incoming_payload.CreateReferencePayload(comment)
+			assert.NoError(t, err)
+
+			_, err = incoming_payload.GetReferenceFromPayload(t.Context(), []byte{1, 2, 3})
+			assert.Error(t, err)
+
+			ref, err := incoming_payload.GetReferenceFromPayload(t.Context(), issuePayload)
+			assert.NoError(t, err)
+			refIssue, ok := ref.(*issues_model.Issue)
+			require.True(t, ok)
+			assert.Equal(t, issue.ID, refIssue.ID)
+
+			ref, err = incoming_payload.GetReferenceFromPayload(t.Context(), commentPayload)
+			assert.NoError(t, err)
+			refComment, ok := ref.(*issues_model.Comment)
+			require.True(t, ok)
+			assert.Equal(t, comment.ID, refComment.ID)
+		})
+
+		t.Run("Token", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			payload := []byte{1, 2, 3, 4, 5}
+
+			token, err := token_service.CreateToken(token_service.ReplyHandlerType, user, payload)
+			assert.NoError(t, err)
+			assert.NotEmpty(t, token)
+
+			// MTAs may lowercase the local-part of the reply-to address (RFC 5321 §2.4).
+			for _, token := range []string{token, strings.ToLower(token)} {
+				ht, u, p, err := token_service.DecodeToken(t.Context(), token)
+				assert.NoError(t, err)
+				assert.Equal(t, token_service.ReplyHandlerType, ht)
+				assert.Equal(t, user.ID, u.ID)
+				assert.Equal(t, payload, p)
+			}
+		})
+
+		t.Run("Handler", func(t *testing.T) {
+			t.Run("Reply", func(t *testing.T) {
+				assertReplyComment := func(t *testing.T, issueID int64, commentType issues_model.CommentType, content *incoming.MailContent) {
+					comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
+						IssueID: issueID,
+						Type:    commentType,
+					})
+					assert.NoError(t, err)
+					assert.NotEmpty(t, comments)
+					comment := comments[len(comments)-1]
+					assert.Equal(t, user.ID, comment.PosterID)
+					assert.Equal(t, content.Content, comment.Content)
+					assert.NoError(t, comment.LoadAttachments(t.Context()))
+					assert.Len(t, comment.Attachments, 1)
+					attachment := comment.Attachments[0]
+					assert.Equal(t, content.Attachments[0].Name, attachment.Name)
+					assert.EqualValues(t, 4, attachment.Size)
+				}
+
+				t.Run("Comment", func(t *testing.T) {
+					defer tests.PrintCurrentTest(t)()
+
+					handler := &incoming.ReplyHandler{}
+
+					payload, err := incoming_payload.CreateReferencePayload(issue)
+					assert.NoError(t, err)
+
+					assert.Error(t, handler.Handle(t.Context(), &incoming.MailContent{}, nil, payload))
+					assert.NoError(t, handler.Handle(t.Context(), &incoming.MailContent{}, user, payload))
+
+					content := &incoming.MailContent{
+						Content: "reply by mail",
+						Attachments: []*incoming.Attachment{
+							{
+								Name:    "attachment.txt",
+								Content: []byte("test"),
+							},
+						},
+					}
+
+					assert.NoError(t, handler.Handle(t.Context(), content, user, payload))
+
+					assertReplyComment(t, issue.ID, issues_model.CommentTypeComment, content)
+				})
+
+				t.Run("CodeComment", func(t *testing.T) {
+					defer tests.PrintCurrentTest(t)()
+
+					comment := unittest.AssertExistsAndLoadBean(t, &issues_model.Comment{ID: 6})
+					issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: comment.IssueID})
+
+					handler := &incoming.ReplyHandler{}
+					content := &incoming.MailContent{
+						Content: "code reply by mail",
+						Attachments: []*incoming.Attachment{
+							{
+								Name:    "attachment.txt",
+								Content: []byte("test"),
+							},
+						},
+					}
+
+					payload, err := incoming_payload.CreateReferencePayload(comment)
+					assert.NoError(t, err)
+
+					assert.NoError(t, handler.Handle(t.Context(), content, user, payload))
+
+					assertReplyComment(t, issue.ID, issues_model.CommentTypeCode, content)
+				})
+			})
+
+			t.Run("Unsubscribe", func(t *testing.T) {
+				defer tests.PrintCurrentTest(t)()
+
+				watching, err := issues_model.CheckIssueWatch(t.Context(), user, issue)
+				assert.NoError(t, err)
+				assert.True(t, watching)
+
+				handler := &incoming.UnsubscribeHandler{}
+
+				content := &incoming.MailContent{
+					Content: "unsub me",
+				}
+
+				payload, err := incoming_payload.CreateReferencePayload(issue)
+				assert.NoError(t, err)
+
+				assert.NoError(t, handler.Handle(t.Context(), content, user, payload))
+
+				watching, err = issues_model.CheckIssueWatch(t.Context(), user, issue)
+				assert.NoError(t, err)
+				assert.False(t, watching)
+			})
+		})
+
+		if setting.IncomingEmail.Enabled {
+			// This test connects to the configured email server and is currently only enabled for MySql integration tests.
+			// It sends a reply to create a comment. If the comment is not detected after 10 seconds the test fails.
+			t.Run("IMAP", func(t *testing.T) {
+				defer tests.PrintCurrentTest(t)()
+
+				payload, err := incoming_payload.CreateReferencePayload(issue)
+				assert.NoError(t, err)
+				token, err := token_service.CreateToken(token_service.ReplyHandlerType, user, payload)
+				assert.NoError(t, err)
+
+				msg := sender_service.NewMessageFrom(
+					strings.Replace(setting.IncomingEmail.ReplyToAddress, setting.IncomingEmailTokenPlaceholder, token, 1),
+					"",
+					user.Email,
+					"",
+					token,
+				)
+
+				err = sender_service.Send(&smtpTestSender{}, msg)
+				assert.NoError(t, err)
+
+				assert.Eventually(t, func() bool {
+					comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
+						IssueID: issue.ID,
+						Type:    issues_model.CommentTypeComment,
+					})
+					assert.NoError(t, err)
+					assert.NotEmpty(t, comments)
+
+					comment := comments[len(comments)-1]
+
+					return comment.PosterID == user.ID && comment.Content == token
+				}, 10*time.Second, 1*time.Second)
+			})
+		}
+	})
+}
+
+// A simple SMTP mail sender used for integration tests.
+type smtpTestSender struct{}
+
+func (s *smtpTestSender) Send(from string, to []string, msg io.WriterTo) error {
+	conn, err := net.Dial("tcp", net.JoinHostPort(setting.IncomingEmail.Host, "25"))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client, err := smtp.NewClient(conn, setting.IncomingEmail.Host)
+	if err != nil {
+		return err
+	}
+
+	if err = client.Mail(from); err != nil {
+		return err
+	}
+
+	for _, rec := range to {
+		if err = client.Rcpt(rec); err != nil {
+			return err
+		}
+	}
+
+	w, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := msg.WriteTo(w); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
+	return client.Quit()
+}

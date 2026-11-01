@@ -1,0 +1,146 @@
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAPIGitTags(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, _url *url.URL) {
+		t.Run("Notes", func(t *testing.T) {
+			user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+			// Login as User2.
+			session := loginUser(t, user.Name)
+			token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeReadRepository)
+
+			// check invalid requests
+			req := NewRequestf(t, "GET", "/api/v1/repos/%s/repo1/git/notes/12345", user.Name).
+				AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusNotFound)
+
+			req = NewRequestf(t, "GET", "/api/v1/repos/%s/repo1/git/notes/..", user.Name).
+				AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusUnprocessableEntity)
+
+			// check valid request
+			req = NewRequestf(t, "GET", "/api/v1/repos/%s/repo1/git/notes/65f1bf27bc3bf70f64657658635e66094edbcb4d", user.Name).
+				AddTokenAuth(token)
+			resp := MakeRequest(t, req, http.StatusOK)
+
+			apiData := DecodeJSON(t, resp, &api.Note{})
+			assert.Equal(t, "This is a test note\n", apiData.Message)
+			assert.NotEmpty(t, apiData.Commit.Files)
+			assert.NotNil(t, apiData.Commit.RepoCommit.Verification)
+		})
+
+		t.Run("Refs", func(t *testing.T) {
+			user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+			// Login as User2.
+			session := loginUser(t, user.Name)
+			token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeReadRepository)
+
+			for _, ref := range [...]string{
+				"refs/heads/master", // Branch
+				"refs/tags/v1.1",    // Tag
+			} {
+				req := NewRequestf(t, "GET", "/api/v1/repos/%s/repo1/git/%s", user.Name, ref).
+					AddTokenAuth(token)
+				MakeRequest(t, req, http.StatusOK)
+			}
+			// Test getting all refs
+			req := NewRequestf(t, "GET", "/api/v1/repos/%s/repo1/git/refs", user.Name).
+				AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusOK)
+			// Test getting non-existent refs
+			req = NewRequestf(t, "GET", "/api/v1/repos/%s/repo1/git/refs/heads/unknown", user.Name).
+				AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusNotFound)
+		})
+
+		t.Run("Tags", func(t *testing.T) {
+			user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+			repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+			// Login as User2.
+			session := loginUser(t, user.Name)
+			token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeReadRepository)
+
+			// Set up git config for the tagger
+			_ = git.ManagedConfigSet(t.Context(), repo, "user.name", user.Name)
+			_ = git.ManagedConfigSet(t.Context(), repo, "user.email", user.Email)
+
+			gitRepo, _ := git.OpenRepository(t.Context(), repo)
+			defer gitRepo.Close()
+
+			commit, _ := gitRepo.GetBranchCommit(t.Context(), "master")
+			lTagName := "lightweightTag"
+			_ = gitRepo.CreateTag(t.Context(), lTagName, commit.ID.String())
+
+			aTagName := "annotatedTag"
+			aTagMessage := strings.Repeat("very long " /*10bytes*/, 20*1024) + "annotated message"
+			_ = gitRepo.CreateAnnotatedTag(t.Context(), aTagName, aTagMessage, commit.ID.String())
+			aTag, _ := gitRepo.GetTag(t.Context(), aTagName)
+
+			// SHOULD work for annotated tags
+			req := NewRequestf(t, "GET", "/api/v1/repos/%s/%s/git/tags/%s", user.Name, repo.Name, aTag.ID.String()).AddTokenAuth(token)
+			resp := MakeRequest(t, req, http.StatusOK)
+			tag := DecodeJSON(t, resp, &api.AnnotatedTag{})
+			assert.Equal(t, aTagName, tag.Tag)
+			assert.Equal(t, aTag.ID.String(), tag.SHA)
+			assert.Equal(t, commit.ID.String(), tag.Object.SHA)
+			assert.Equal(t, aTagMessage+"\n", tag.Message)
+			assert.Equal(t, user.Name, tag.Tagger.Name)
+			assert.Equal(t, user.Email, tag.Tagger.Email)
+			assert.Equal(t, repo.APIURL()+"/git/tags/"+aTag.ID.String(), tag.URL)
+
+			defer test.MockVariableValue(&git.MaxGitObjectSize, 1024)()
+			req = NewRequestf(t, "GET", "/api/v1/repos/%s/%s/git/tags/%s", user.Name, repo.Name, aTag.ID.String()).AddTokenAuth(token)
+			resp = MakeRequest(t, req, http.StatusOK)
+			tag = DecodeJSON(t, resp, &api.AnnotatedTag{})
+			assert.True(t, strings.HasPrefix(aTagMessage, tag.Message))
+			assert.Less(t, len(tag.Message), len(aTagMessage))
+			assert.Less(t, len(tag.Message), 1024)
+
+			// Should NOT work for lightweight tags
+			badReq := NewRequestf(t, "GET", "/api/v1/repos/%s/%s/git/tags/%s", user.Name, repo.Name, commit.ID.String()).
+				AddTokenAuth(token)
+			MakeRequest(t, badReq, http.StatusBadRequest)
+		})
+	})
+}
+
+func TestAPIDeleteTagByName(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+	session := loginUser(t, owner.LowerName)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+
+	req := NewRequest(t, http.MethodDelete, fmt.Sprintf("/api/v1/repos/%s/%s/tags/delete-tag", owner.Name, repo.Name)).
+		AddTokenAuth(token)
+	_ = MakeRequest(t, req, http.StatusNoContent)
+
+	// Make sure that actual releases can't be deleted outright
+	createNewReleaseUsingAPI(t, token, owner, repo, "release-tag", "", "Release Tag", "test")
+
+	req = NewRequest(t, http.MethodDelete, fmt.Sprintf("/api/v1/repos/%s/%s/tags/release-tag", owner.Name, repo.Name)).
+		AddTokenAuth(token)
+	_ = MakeRequest(t, req, http.StatusConflict)
+}

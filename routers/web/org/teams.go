@@ -1,0 +1,650 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package org
+
+import (
+	"errors"
+	"maps"
+	"net/http"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+
+	"gitea.dev/models/db"
+	org_model "gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	"gitea.dev/services/forms"
+	org_service "gitea.dev/services/org"
+	repo_service "gitea.dev/services/repository"
+)
+
+const (
+	// tplTeams template path for teams list page
+	tplTeams templates.TplName = "org/team/teams"
+	// tplTeamNew template path for create new team page
+	tplTeamNew templates.TplName = "org/team/new"
+	// tplTeamMembers template path for showing team members page
+	tplTeamMembers templates.TplName = "org/team/members"
+	// tplTeamRepositories template path for showing team repositories page
+	tplTeamRepositories templates.TplName = "org/team/repositories"
+	// tplTeamInvite template path for team invites page
+	tplTeamInvite templates.TplName = "org/team/invite"
+)
+
+// Teams render teams list page
+func Teams(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+	org := ctx.Org.Organization
+	ctx.Data["Title"] = org.FullName
+	ctx.Data["PageIsOrgTeams"] = true
+
+	keyword := ctx.FormTrim("q")
+	page := max(ctx.FormInt("page"), 1)
+	pagingNum := setting.UI.MembersPagingNum
+
+	searchTeams := func() (teams []*org_model.Team, count int64, err error) {
+		if keyword == "" {
+			// fast path, use existing teams in context if no need to filter from database
+			count = int64(len(ctx.Org.Teams))
+			start := (page - 1) * pagingNum
+			if start > len(ctx.Org.Teams) {
+				return nil, count, nil
+			}
+			end := min(start+pagingNum, len(ctx.Org.Teams))
+			return ctx.Org.Teams[start:end], count, nil
+		}
+
+		shouldSeeAllOrgTeams, err := context.UserShouldSeeAllOrgTeams(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		opts := &org_model.SearchTeamOptions{
+			OrgID:       org.ID,
+			UserID:      util.Iif(shouldSeeAllOrgTeams, 0, ctx.Doer.ID),
+			Keyword:     keyword,
+			IncludeDesc: true,
+			IncludeVisibilities: util.Iif(shouldSeeAllOrgTeams, nil,
+				org_model.VisibleTeamVisibilitiesFor(ctx.Org.IsMember, ctx.IsSigned)),
+			ListOptions: db.ListOptions{Page: page, PageSize: pagingNum},
+		}
+		return org_model.SearchTeam(ctx, opts)
+	}
+
+	teams, count, err := searchTeams()
+	if err != nil {
+		ctx.ServerError("SearchTeam", err)
+		return
+	}
+
+	for _, t := range teams {
+		if err := t.LoadMembers(ctx); err != nil {
+			ctx.ServerError("GetMembers", err)
+			return
+		}
+	}
+
+	ctx.Data["OrgListTeams"] = teams
+	ctx.Data["Keyword"] = keyword
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(setting.UI.MembersPagingNum).CurPage(page).Build()
+	ctx.Data["Page"] = pager
+
+	ctx.HTML(http.StatusOK, tplTeams)
+}
+
+// TeamsAction response for join, leave, remove, add operations to team
+func TeamsAction(ctx *context.Context) {
+	page := ctx.FormString("page")
+	var err error
+	switch ctx.PathParam("action") {
+	case "join":
+		if !ctx.Org.IsOwner {
+			ctx.HTTPError(http.StatusNotFound)
+			return
+		}
+		err = org_service.AddTeamMember(ctx, ctx.Org.Team, ctx.Doer)
+	case "leave":
+		err = org_service.RemoveTeamMember(ctx, ctx.Org.Team, ctx.Doer)
+		if err != nil {
+			if org_model.IsErrLastOrgOwner(err) {
+				ctx.Flash.Error(ctx.Tr("form.last_org_owner"))
+			} else {
+				log.Error("Action(%s): %v", ctx.PathParam("action"), err)
+				ctx.JSON(http.StatusOK, map[string]any{
+					"ok":  false,
+					"err": err.Error(),
+				})
+				return
+			}
+		}
+		checkIsOrgMemberAndRedirect(ctx, ctx.Org.OrgLink+"/teams/")
+		return
+	case "remove":
+		if !ctx.Org.IsOwner {
+			ctx.HTTPError(http.StatusNotFound)
+			return
+		}
+
+		user, _ := user_model.GetUserByID(ctx, ctx.FormInt64("uid"))
+		if user == nil {
+			ctx.Redirect(ctx.Org.OrgLink + "/teams")
+			return
+		}
+
+		err = org_service.RemoveTeamMember(ctx, ctx.Org.Team, user)
+		if err != nil {
+			if org_model.IsErrLastOrgOwner(err) {
+				ctx.Flash.Error(ctx.Tr("form.last_org_owner"))
+			} else {
+				log.Error("Action(%s): %v", ctx.PathParam("action"), err)
+				ctx.JSON(http.StatusOK, map[string]any{
+					"ok":  false,
+					"err": err.Error(),
+				})
+				return
+			}
+		}
+		checkIsOrgMemberAndRedirect(ctx, ctx.Org.OrgLink+"/teams/"+url.PathEscape(ctx.Org.Team.LowerName))
+		return
+	case "add":
+		if !ctx.Org.IsOwner {
+			ctx.HTTPError(http.StatusNotFound)
+			return
+		}
+		uname := strings.ToLower(ctx.FormString("uname"))
+		var u *user_model.User
+		u, err = user_model.GetUserByName(ctx, uname)
+		if err != nil {
+			if user_model.IsErrUserNotExist(err) {
+				if setting.MailService != nil && user_model.ValidateEmail(uname) == nil {
+					if err := org_service.CreateTeamInvite(ctx, ctx.Doer, ctx.Org.Team, uname); err != nil {
+						if org_model.IsErrTeamInviteAlreadyExist(err) {
+							ctx.Flash.Error(ctx.Tr("form.duplicate_invite_to_team"))
+						} else if org_model.IsErrUserEmailAlreadyAdded(err) {
+							ctx.Flash.Error(ctx.Tr("org.teams.add_duplicate_users"))
+						} else {
+							ctx.ServerError("CreateTeamInvite", err)
+							return
+						}
+					}
+				} else {
+					ctx.Flash.Error(ctx.Tr("form.user_not_exist"))
+				}
+				ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName))
+			} else {
+				ctx.ServerError("GetUserByName", err)
+			}
+			return
+		}
+
+		if u.IsOrganization() {
+			ctx.Flash.Error(ctx.Tr("form.cannot_add_org_to_team"))
+			ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName))
+			return
+		}
+
+		if ctx.Org.Team.IsMember(ctx, u.ID) {
+			ctx.Flash.Error(ctx.Tr("org.teams.add_duplicate_users"))
+		} else {
+			err = org_service.AddTeamMember(ctx, ctx.Org.Team, u)
+		}
+
+		page = "team"
+	case "remove_invite":
+		if !ctx.Org.IsOwner {
+			ctx.HTTPError(http.StatusNotFound)
+			return
+		}
+
+		iid := ctx.FormInt64("iid")
+		if iid == 0 {
+			ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName))
+			return
+		}
+
+		if err := org_model.RemoveInviteByID(ctx, iid, ctx.Org.Team.ID); err != nil {
+			log.Error("Action(%s): %v", ctx.PathParam("action"), err)
+			ctx.ServerError("RemoveInviteByID", err)
+			return
+		}
+
+		page = "team"
+	}
+
+	if err != nil {
+		if org_model.IsErrLastOrgOwner(err) {
+			ctx.Flash.Error(ctx.Tr("form.last_org_owner"))
+		} else if errors.Is(err, user_model.ErrBlockedUser) {
+			ctx.Flash.Error(ctx.Tr("org.teams.members.blocked_user"))
+		} else {
+			log.Error("Action(%s): %v", ctx.PathParam("action"), err)
+			ctx.JSON(http.StatusOK, map[string]any{
+				"ok":  false,
+				"err": err.Error(),
+			})
+			return
+		}
+	}
+
+	switch page {
+	case "team":
+		ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName))
+	case "home":
+		ctx.Redirect(ctx.Org.Organization.AsUser().HomeLink())
+	default:
+		ctx.Redirect(ctx.Org.OrgLink + "/teams")
+	}
+}
+
+func checkIsOrgMemberAndRedirect(ctx *context.Context, defaultRedirect string) {
+	if isOrgMember, err := org_model.IsOrganizationMember(ctx, ctx.Org.Organization.ID, ctx.Doer.ID); err != nil {
+		ctx.ServerError("IsOrganizationMember", err)
+		return
+	} else if !isOrgMember && !ctx.Doer.IsAdmin {
+		if ctx.Org.Organization.Visibility.IsPrivate() {
+			defaultRedirect = setting.AppSubURL + "/"
+		} else {
+			defaultRedirect = ctx.Org.Organization.HomeLink()
+		}
+	}
+	ctx.JSONRedirect(defaultRedirect)
+}
+
+// TeamsRepoAction operate team's repository
+func TeamsRepoAction(ctx *context.Context) {
+	if !ctx.Org.IsOwner {
+		ctx.HTTPError(http.StatusNotFound)
+		return
+	}
+
+	var err error
+	action := ctx.PathParam("action")
+	switch action {
+	case "add":
+		repoName := path.Base(ctx.FormString("repo_name"))
+		var repo *repo_model.Repository
+		repo, err = repo_model.GetRepositoryByName(ctx, ctx.Org.Organization.ID, repoName)
+		if err != nil {
+			if repo_model.IsErrRepoNotExist(err) {
+				ctx.Flash.Error(ctx.Tr("org.teams.add_nonexistent_repo"))
+				ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName) + "/repositories")
+				return
+			}
+			ctx.ServerError("GetRepositoryByName", err)
+			return
+		}
+		err = repo_service.TeamAddRepository(ctx, ctx.Org.Team, repo)
+	case "remove":
+		err = repo_service.RemoveRepositoryFromTeam(ctx, ctx.Org.Team, ctx.FormInt64("repoid"))
+	case "addall":
+		err = repo_service.AddAllRepositoriesToTeam(ctx, ctx.Org.Team)
+	case "removeall":
+		err = repo_service.RemoveAllRepositoriesFromTeam(ctx, ctx.Org.Team)
+	}
+
+	if err != nil {
+		log.Error("Action(%s): '%s' %v", ctx.PathParam("action"), ctx.Org.Team.Name, err)
+		ctx.ServerError("TeamsRepoAction", err)
+		return
+	}
+
+	if action == "addall" || action == "removeall" {
+		ctx.JSONRedirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName) + "/repositories")
+		return
+	}
+	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(ctx.Org.Team.LowerName) + "/repositories")
+}
+
+// NewTeam render create new team page
+func NewTeam(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+	ctx.Data["Title"] = ctx.Org.Organization.FullName
+	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["PageIsOrgTeamsNew"] = true
+	ctx.Data["Team"] = &org_model.Team{}
+	ctx.Data["Units"] = unit_model.Units
+	ctx.HTML(http.StatusOK, tplTeamNew)
+}
+
+func paresFormTeamUnits(orgID int64, forms url.Values) (units []*org_model.TeamUnit) {
+	for _, ut := range unit_model.AllRepoUnitTypes {
+		v, ok := forms["unit_"+strconv.Itoa(ut.Value())]
+		if !ok {
+			continue
+		}
+		vv, _ := strconv.Atoi(v[0])
+		mode := perm.AccessMode(vv)
+		mode = min(mode, perm.AccessModeWrite, unit_model.Units[ut].MaxPerm())
+		units = append(units, &org_model.TeamUnit{OrgID: orgID, Type: ut, AccessMode: mode})
+	}
+	return units
+}
+
+// NewTeamPost response for create new team
+func NewTeamPost(ctx *context.Context) {
+	form := web.GetForm[*forms.CreateTeamForm](ctx)
+	includesAllRepositories := form.RepoAccess == "all"
+	teamPermission := perm.ParseAccessMode(form.Permission, perm.AccessModeNone, perm.AccessModeWrite, perm.AccessModeAdmin)
+
+	t := &org_model.Team{
+		OrgID:                   ctx.Org.Organization.ID,
+		Name:                    form.TeamName,
+		Description:             form.Description,
+		AccessMode:              teamPermission,
+		IncludesAllRepositories: includesAllRepositories,
+		CanCreateOrgRepo:        form.CanCreateOrgRepo,
+		Visibility:              org_model.NormalizeTeamVisibility(form.Visibility),
+	}
+
+	ctx.Data["Title"] = ctx.Org.Organization.FullName
+	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["PageIsOrgTeamsNew"] = true
+	ctx.Data["Units"] = unit_model.Units
+	ctx.Data["Team"] = t
+
+	if ctx.HasError() {
+		ctx.HTML(http.StatusOK, tplTeamNew)
+		return
+	}
+
+	if t.AccessMode == perm.AccessModeNone {
+		t.Units = paresFormTeamUnits(ctx.Org.Organization.ID, ctx.Req.Form)
+		if len(t.Units) == 0 {
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.team_no_units_error"), tplTeamNew, &form)
+			return
+		}
+	}
+
+	if err := org_service.NewTeam(ctx, t); err != nil {
+		ctx.Data["Err_TeamName"] = true
+		switch {
+		case org_model.IsErrTeamAlreadyExist(err):
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.team_name_been_taken"), tplTeamNew, &form)
+		default:
+			ctx.ServerError("NewTeam", err)
+		}
+		return
+	}
+	log.Trace("Team created: %s/%s", ctx.Org.Organization.Name, t.Name)
+	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(t.LowerName))
+}
+
+// TeamMembers render team members page
+func TeamMembers(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	ctx.Data["Title"] = ctx.Org.Team.Name
+	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["PageIsOrgTeamMembers"] = true
+
+	if err := ctx.Org.Team.LoadMembers(ctx); err != nil {
+		ctx.ServerError("GetMembers", err)
+		return
+	}
+	ctx.Data["Units"] = unit_model.Units
+
+	invites, err := org_model.GetInvitesByTeamID(ctx, ctx.Org.Team.ID)
+	if err != nil {
+		ctx.ServerError("GetInvitesByTeamID", err)
+		return
+	}
+	ctx.Data["Invites"] = invites
+	ctx.Data["IsEmailInviteEnabled"] = setting.MailService != nil
+
+	ctx.HTML(http.StatusOK, tplTeamMembers)
+}
+
+// TeamRepositories show the repositories of team
+func TeamRepositories(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	ctx.Data["Title"] = ctx.Org.Team.Name
+	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["PageIsOrgTeamRepos"] = true
+
+	repos, err := repo_model.GetTeamRepositories(ctx, &repo_model.SearchTeamRepoOptions{
+		TeamID: ctx.Org.Team.ID,
+	})
+	if err != nil {
+		ctx.ServerError("GetTeamRepositories", err)
+		return
+	}
+	ctx.Data["Units"] = unit_model.Units
+	ctx.Data["TeamRepos"] = repos
+	ctx.HTML(http.StatusOK, tplTeamRepositories)
+}
+
+// SearchTeam api for searching teams
+func SearchTeam(ctx *context.Context) {
+	listOptions := db.ListOptions{
+		Page:     ctx.FormInt("page"),
+		PageSize: convert.ToCorrectPageSize(ctx.FormInt("limit")),
+	}
+
+	shouldSeeAll, err := context.UserShouldSeeAllOrgTeams(ctx)
+	if err != nil {
+		ctx.ServerError("UserShouldSeeAllOrgTeams", err)
+		return
+	}
+
+	opts := &org_model.SearchTeamOptions{
+		Keyword:     ctx.FormTrim("q"),
+		OrgID:       ctx.Org.Organization.ID,
+		IncludeDesc: ctx.FormString("include_desc") == "" || ctx.FormBool("include_desc"),
+		ListOptions: listOptions,
+	}
+	if !shouldSeeAll {
+		opts.UserID = ctx.Doer.ID
+		opts.IncludeVisibilities = org_model.VisibleTeamVisibilitiesFor(ctx.Org.IsMember, ctx.IsSigned)
+	}
+
+	teams, maxResults, err := org_model.SearchTeam(ctx, opts)
+	if err != nil {
+		log.Error("SearchTeam failed: %v", err)
+		ctx.JSON(http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "SearchTeam internal failure",
+		})
+		return
+	}
+
+	apiTeams, err := convert.ToTeams(ctx, teams, false)
+	if err != nil {
+		log.Error("convert ToTeams failed: %v", err)
+		ctx.JSON(http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "SearchTeam failed to get units",
+		})
+		return
+	}
+
+	ctx.SetTotalCountHeader(maxResults)
+	ctx.JSON(http.StatusOK, map[string]any{
+		"ok":   true,
+		"data": apiTeams,
+	})
+}
+
+// EditTeam render team edit page
+func EditTeam(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+	ctx.Data["Title"] = ctx.Org.Organization.FullName
+	ctx.Data["PageIsOrgTeams"] = true
+	if err := ctx.Org.Team.LoadUnits(ctx); err != nil {
+		ctx.ServerError("LoadUnits", err)
+		return
+	}
+	ctx.Data["Team"] = ctx.Org.Team
+	ctx.Data["Units"] = unit_model.Units
+	ctx.HTML(http.StatusOK, tplTeamNew)
+}
+
+// EditTeamPost response for modify team information
+func EditTeamPost(ctx *context.Context) {
+	form := web.GetForm[*forms.CreateTeamForm](ctx)
+
+	t := ctx.Org.Team
+	teamPermission := perm.ParseAccessMode(form.Permission, perm.AccessModeNone, perm.AccessModeWrite, perm.AccessModeAdmin)
+	isIncludeAllChanged := false
+	includesAllRepositories := form.RepoAccess == "all"
+
+	ctx.Data["Title"] = ctx.Org.Organization.FullName
+	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["Team"] = t
+	ctx.Data["Units"] = unit_model.Units
+
+	oldTeamAccessMode := t.AccessMode
+	if !t.IsOwnerTeam() {
+		t.Name = form.TeamName
+		t.AccessMode = teamPermission
+		if t.IncludesAllRepositories != includesAllRepositories {
+			isIncludeAllChanged = true
+			t.IncludesAllRepositories = includesAllRepositories
+		}
+		t.CanCreateOrgRepo = form.CanCreateOrgRepo
+		t.Visibility = org_model.NormalizeTeamVisibility(form.Visibility)
+	} else {
+		t.CanCreateOrgRepo = true
+		// The owner team must remain listable to all org members.
+		t.Visibility = structs.VisibleTypeLimited
+	}
+
+	oldTeamUnitsMap := t.GetUnitsMap()
+	if t.AccessMode == perm.AccessModeNone {
+		t.Units = paresFormTeamUnits(ctx.Org.Organization.ID, ctx.Req.Form)
+		if len(t.Units) == 0 {
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.team_no_units_error"), tplTeamNew, &form)
+			return
+		}
+	}
+
+	if ctx.HasError() {
+		ctx.HTML(http.StatusOK, tplTeamNew)
+		return
+	}
+
+	isAuthChanged := oldTeamAccessMode != t.AccessMode || !maps.Equal(oldTeamUnitsMap, t.GetUnitsMap())
+	t.Description = form.Description
+	if err := org_service.UpdateTeam(ctx, t, isAuthChanged, isIncludeAllChanged); err != nil {
+		ctx.Data["Err_TeamName"] = true
+		switch {
+		case org_model.IsErrTeamAlreadyExist(err):
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.team_name_been_taken"), tplTeamNew, &form)
+		default:
+			ctx.ServerError("UpdateTeam", err)
+		}
+		return
+	}
+	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + url.PathEscape(t.LowerName))
+}
+
+// DeleteTeam response for the delete team request
+func DeleteTeam(ctx *context.Context) {
+	if err := org_service.DeleteTeam(ctx, ctx.Org.Team); err != nil {
+		ctx.Flash.Error("DeleteTeam: " + err.Error())
+	} else {
+		ctx.Flash.Success(ctx.Tr("org.teams.delete_team_success"))
+	}
+
+	ctx.JSONRedirect(ctx.Org.OrgLink + "/teams")
+}
+
+// TeamInvite renders the team invite page
+func TeamInvite(ctx *context.Context) {
+	invite, org, team, inviter, err := getTeamInviteFromContext(ctx)
+	// TODO: to quickly debug the UI, can uncomment this (don't worry, it won't pass CI lint)
+	// invite, org, team, inviter, err = &org_model.TeamInvite{}, &org_model.Organization{}, &org_model.Team{}, ctx.Doer, nil
+	if err != nil {
+		if org_model.IsErrTeamInviteNotFound(err) {
+			ctx.NotFound(err)
+		} else {
+			ctx.ServerError("getTeamInviteFromContext", err)
+		}
+		return
+	}
+
+	ctx.Data["Title"] = ctx.Tr("org.teams.invite_team_member", team.Name)
+	ctx.Data["Invite"] = invite
+	ctx.Data["Organization"] = org
+	ctx.Data["Team"] = team
+	ctx.Data["Inviter"] = inviter
+
+	ctx.HTML(http.StatusOK, tplTeamInvite)
+}
+
+// TeamInvitePost handles the team invitation
+func TeamInvitePost(ctx *context.Context) {
+	invite, org, team, _, err := getTeamInviteFromContext(ctx)
+	if err != nil {
+		if org_model.IsErrTeamInviteNotFound(err) {
+			ctx.NotFound(err)
+		} else {
+			ctx.ServerError("getTeamInviteFromContext", err)
+		}
+		return
+	}
+
+	if err := org_service.AddTeamMember(ctx, team, ctx.Doer); err != nil {
+		ctx.ServerError("AddTeamMember", err)
+		return
+	}
+
+	if err := org_model.RemoveInviteByID(ctx, invite.ID, team.ID); err != nil {
+		log.Error("RemoveInviteByID: %v", err)
+	}
+
+	ctx.Redirect(org.OrganisationLink() + "/teams/" + url.PathEscape(team.LowerName))
+}
+
+func getTeamInviteFromContext(ctx *context.Context) (*org_model.TeamInvite, *org_model.Organization, *org_model.Team, *user_model.User, error) {
+	invite, err := org_model.GetInviteByToken(ctx, ctx.PathParam("token"))
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	inviter, err := user_model.GetUserByID(ctx, invite.InviterID)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	team, err := org_model.GetTeamByID(ctx, invite.TeamID)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	org, err := user_model.GetUserByID(ctx, team.OrgID)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	return invite, org_model.OrgFromUser(org), team, inviter, nil
+}

@@ -1,0 +1,106 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package admin
+
+import (
+	"net/http"
+	"time"
+
+	"gitea.dev/models/db"
+	packages_model "gitea.dev/models/packages"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/services/context"
+	packages_service "gitea.dev/services/packages"
+	packages_cleanup_service "gitea.dev/services/packages/cleanup"
+)
+
+const (
+	tplPackagesList templates.TplName = "admin/packages/list"
+)
+
+// Packages shows all packages
+func Packages(ctx *context.Context) {
+	page := max(ctx.FormInt("page"), 1)
+	query := ctx.FormTrim("q")
+	packageType := ctx.FormTrim("type")
+	sort := ctx.FormTrim("sort")
+
+	pvs, total, err := packages_model.SearchVersions(ctx, &packages_model.PackageSearchOptions{
+		Type:       packages_model.Type(packageType),
+		Name:       packages_model.SearchValue{Value: query},
+		Sort:       sort,
+		IsInternal: optional.Some(false),
+		Paginator: &db.ListOptions{
+			PageSize: setting.UI.PackagesPagingNum,
+			Page:     page,
+		},
+	})
+	if err != nil {
+		ctx.ServerError("SearchVersions", err)
+		return
+	}
+
+	pds, err := packages_model.GetPackageDescriptors(ctx, pvs)
+	if err != nil {
+		ctx.ServerError("GetPackageDescriptors", err)
+		return
+	}
+
+	totalBlobSize, err := packages_model.GetTotalBlobSize(ctx)
+	if err != nil {
+		ctx.ServerError("GetTotalBlobSize", err)
+		return
+	}
+
+	totalUnreferencedBlobSize, err := packages_model.GetTotalUnreferencedBlobSize(ctx)
+	if err != nil {
+		ctx.ServerError("CalculateBlobSize", err)
+		return
+	}
+
+	ctx.Data["Title"] = ctx.Tr("packages.title")
+	ctx.Data["PageIsAdminPackages"] = true
+	ctx.Data["Query"] = query
+	ctx.Data["PackageType"] = packageType
+	ctx.Data["AvailableTypes"] = packages_model.TypeList
+	ctx.Data["SortType"] = sort
+	ctx.Data["PackageDescriptors"] = pds
+	ctx.Data["TotalCount"] = total
+	ctx.Data["TotalBlobSize"] = totalBlobSize - totalUnreferencedBlobSize
+	ctx.Data["TotalUnreferencedBlobSize"] = totalUnreferencedBlobSize
+
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(setting.UI.PackagesPagingNum).CurPage(page).Build()
+	ctx.Data["Page"] = pager
+
+	ctx.HTML(http.StatusOK, tplPackagesList)
+}
+
+// DeletePackageVersion deletes a package version
+func DeletePackageVersion(ctx *context.Context) {
+	pv, err := packages_model.GetVersionByID(ctx, ctx.FormInt64("id"))
+	if err != nil {
+		ctx.ServerError("GetRepositoryByID", err)
+		return
+	}
+
+	if err := packages_service.RemovePackageVersion(ctx, ctx.Doer, pv); err != nil {
+		ctx.ServerError("RemovePackageVersion", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("packages.settings.delete.version.success"))
+	ctx.JSONRedirect("")
+}
+
+func CleanupExpiredData(ctx *context.Context) {
+	if err := packages_cleanup_service.CleanupExpiredData(ctx, time.Duration(0)); err != nil {
+		ctx.ServerError("CleanupExpiredData", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("admin.packages.cleanup.success"))
+	ctx.Redirect(setting.AppSubURL + "/-/admin/packages")
+}

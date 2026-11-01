@@ -1,0 +1,100 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package attachment
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"uuid"
+
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context/upload"
+)
+
+// NewAttachment creates a new attachment object, but do not verify.
+func NewAttachment(ctx context.Context, attach *repo_model.Attachment, file io.Reader, size int64) (*repo_model.Attachment, error) {
+	if attach.RepoID == 0 {
+		return nil, fmt.Errorf("attachment %s should belong to a repository", attach.Name)
+	}
+
+	err := db.WithTx(ctx, func(ctx context.Context) error {
+		attach.UUID = uuid.New().String()
+		size, err := storage.Attachments.Save(attach.RelativePath(), file, size)
+		if err != nil {
+			return fmt.Errorf("Attachments.Save: %w", err)
+		}
+		attach.Size = size
+		return db.Insert(ctx, attach)
+	})
+
+	return attach, err
+}
+
+type UploaderFile struct {
+	rd         io.ReadCloser
+	size       int64
+	respWriter http.ResponseWriter
+}
+
+func NewLimitedUploaderKnownSize(r io.Reader, size int64) *UploaderFile {
+	return &UploaderFile{rd: io.NopCloser(r), size: size}
+}
+
+func NewLimitedUploaderMaxBytesReader(r io.ReadCloser, w http.ResponseWriter) *UploaderFile {
+	return &UploaderFile{rd: r, size: -1, respWriter: w}
+}
+
+type UploadAttachmentFunc func(ctx context.Context, file *UploaderFile, attach *repo_model.Attachment) (*repo_model.Attachment, error)
+
+func UploadAttachmentForIssue(ctx context.Context, file *UploaderFile, attach *repo_model.Attachment) (*repo_model.Attachment, error) {
+	return uploadAttachment(ctx, file, setting.Attachment.AllowedTypes, setting.Attachment.MaxSize<<20, attach)
+}
+
+func UploadAttachmentForRelease(ctx context.Context, file *UploaderFile, attach *repo_model.Attachment) (*repo_model.Attachment, error) {
+	// FIXME: although the release attachment has different settings from the issue attachment,
+	// it still uses the same attachment table, the same storage and the same upload logic
+	// So if the "issue attachment [attachment]" is not enabled, it will also affect the release attachment, which is not expected.
+	return uploadAttachment(ctx, file, setting.Repository.Release.AllowedTypes, setting.Repository.Release.FileMaxSize<<20, attach)
+}
+
+func uploadAttachment(ctx context.Context, file *UploaderFile, allowedTypes string, maxFileSize int64, attach *repo_model.Attachment) (*repo_model.Attachment, error) {
+	src := file.rd
+	if file.size < 0 {
+		src = http.MaxBytesReader(file.respWriter, src, maxFileSize)
+	}
+	buf := make([]byte, 1024)
+	n, _ := util.ReadAtMost(src, buf)
+	buf = buf[:n]
+
+	if err := upload.Verify(buf, attach.Name, allowedTypes); err != nil {
+		return nil, err
+	}
+
+	if maxFileSize >= 0 && file.size > maxFileSize {
+		return nil, util.ErrorWrap(util.ErrContentTooLarge, "attachment exceeds limit %d", maxFileSize)
+	}
+
+	attach, err := NewAttachment(ctx, attach, io.MultiReader(bytes.NewReader(buf), src), file.size)
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return nil, util.ErrorWrap(util.ErrContentTooLarge, "attachment exceeds limit %d", maxFileSize)
+	}
+	return attach, err
+}
+
+// UpdateAttachment updates an attachment, verifying that its name is among the allowed types.
+func UpdateAttachment(ctx context.Context, allowedTypes string, attach *repo_model.Attachment) error {
+	if err := upload.Verify(nil, attach.Name, allowedTypes); err != nil {
+		return err
+	}
+
+	return repo_model.UpdateAttachment(ctx, attach)
+}

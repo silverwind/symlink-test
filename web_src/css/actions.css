@@ -1,0 +1,154 @@
+.runner-container {
+  padding-bottom: 30px;
+}
+
+.runner-container .ui.table.segment {
+  overflow-x: auto;
+}
+
+.runner-container .task-status-success {
+  background-color: var(--color-green);
+  color: var(--color-white);
+}
+
+.runner-container .task-status-failure {
+  background-color: var(--color-red-light);
+  color: var(--color-white);
+}
+
+.runner-container .task-status-running {
+  background-color: var(--color-blue);
+  color: var(--color-white);
+}
+
+.runner-container .task-status-cancelled,
+.runner-container .task-status-blocked {
+  background-color: var(--color-yellow);
+  color: var(--color-white);
+}
+
+.run-list-item-right {
+  width: 130px;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 3px;
+  color: var(--color-text-light);
+}
+
+.run-list-item-right .run-list-meta {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: .25rem;
+  align-items: center;
+}
+
+.run-list-item-trailing {
+  display: flex;
+  gap: var(--gap-block);
+  align-items: center;
+  justify-content: end;
+  flex-wrap: nowrap;
+  width: 280px;
+  flex: 0 0 280px;
+}
+
+.ui.label.run-list-ref {
+  display: inline-block;
+  max-width: 110px;
+}
+
+@media (max-width: 767.98px) {
+  .run-list-item-trailing {
+    flex-direction: column;
+    align-items: flex-end;
+    max-width: 30%;
+    flex: 0 0 30%;
+  }
+  .run-list-item-right {
+    max-width: 110px;
+  }
+}
+
+.repository.actions .ui.vertical.menu details.scoped-workflow-group > .item {
+  display: flex;
+  padding-left: 2.5em;
+}
+.repository.actions .ui.vertical.menu details.scoped-workflow-group > .item > .gt-ellipsis {
+  font-size: 0.85714286em;
+}
+.repository.actions .ui.vertical.menu details.scoped-workflow-group > .item > .label {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.repository.actions .ui.vertical.menu details.scoped-workflow-group > summary {
+  justify-content: flex-start;
+  gap: var(--gap-block);
+  padding: 0.92857143em 1.14285714em;
+}
+.repository.actions .ui.vertical.menu details.scoped-workflow-group > summary::after {
+  order: 1;
+}
+.repository.actions .ui.vertical.menu details.scoped-workflow-group > summary > .label {
+  order: 2;
+  margin-left: auto;
+}
+
+.action-view-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  min-height: 50px; /* reserve the back link and title height so the body does not shift when the run data arrives */
+}
+
+.action-view-back {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--color-text-light-1);
+  text-decoration: none;
+}
+
+.action-view-back:hover {
+  color: var(--color-text);
+  text-decoration: none;
+}
+
+.action-info-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.action-info-summary-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+
+.action-info-summary-title-text {
+  font-size: 20px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.action-info-summary-title-index {
+  font-size: 20px;
+  color: var(--color-text-light-2);
+  flex: 1;
+}
+
+.action-info-summary .ui.button {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.ui.vertical.menu .artifact-preview-item {
+  padding-left: calc(1em + var(--depth, 0) * 1.25em);
+}

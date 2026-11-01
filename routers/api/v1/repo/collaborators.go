@@ -1,0 +1,396 @@
+// Copyright 2016 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	issue_service "gitea.dev/services/issue"
+	pull_service "gitea.dev/services/pull"
+	repo_service "gitea.dev/services/repository"
+)
+
+// ListCollaborators list a repository's collaborators
+func ListCollaborators(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/collaborators repository repoListCollaborators
+	// ---
+	// summary: List a repository's collaborators
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/UserList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	collaborators, total, err := repo_model.GetCollaborators(ctx, &repo_model.FindCollaborationOptions{
+		ListOptions: utils.GetListOptions(ctx),
+		RepoID:      ctx.Repo.Repository.ID,
+	})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	users := make([]*api.User, len(collaborators))
+	for i, collaborator := range collaborators {
+		users[i] = convert.ToUser(ctx, collaborator.User, ctx.Doer)
+	}
+
+	ctx.SetTotalCountHeader(total)
+	ctx.JSON(http.StatusOK, users)
+}
+
+// IsCollaborator check if a user is a collaborator of a repository
+func IsCollaborator(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/collaborators/{collaborator} repository repoCheckCollaborator
+	// ---
+	// summary: Check if a user is a collaborator of a repository
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: collaborator
+	//   in: path
+	//   description: username of the user to check for being a collaborator
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	user, err := user_model.GetUserByName(ctx, ctx.PathParam("collaborator"))
+	if err != nil {
+		if user_model.IsErrUserNotExist(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+	isColab, err := repo_model.IsCollaborator(ctx, ctx.Repo.Repository.ID, user.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	if isColab {
+		ctx.Status(http.StatusNoContent)
+	} else {
+		ctx.APIErrorNotFound()
+	}
+}
+
+// AddOrUpdateCollaborator add or update a collaborator to a repository
+func AddOrUpdateCollaborator(ctx *context.APIContext) {
+	// swagger:operation PUT /repos/{owner}/{repo}/collaborators/{collaborator} repository repoAddCollaborator
+	// ---
+	// summary: Add or Update a collaborator to a repository
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: collaborator
+	//   in: path
+	//   description: username of the user to add or update as a collaborator
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/AddCollaboratorOption"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.AddCollaboratorOption](ctx)
+
+	collaborator, err := user_model.GetUserByName(ctx, ctx.PathParam("collaborator"))
+	if err != nil {
+		if user_model.IsErrUserNotExist(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	if !collaborator.IsActive {
+		ctx.APIErrorInternal(errors.New("collaborator's account is inactive"))
+		return
+	}
+
+	p := perm.AccessModeWrite
+	if form.Permission != nil {
+		p = perm.ParseAccessMode(string(*form.Permission), perm.AccessModeRead, perm.AccessModeWrite, perm.AccessModeAdmin)
+	}
+
+	if err := repo_service.AddOrUpdateCollaborator(ctx, ctx.Repo.Repository, collaborator, p); err != nil {
+		if errors.Is(err, user_model.ErrBlockedUser) {
+			ctx.APIError(http.StatusForbidden, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// DeleteCollaborator delete a collaborator from a repository
+func DeleteCollaborator(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/collaborators/{collaborator} repository repoDeleteCollaborator
+	// ---
+	// summary: Delete a collaborator from a repository
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: collaborator
+	//   in: path
+	//   description: username of the collaborator to delete
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	collaborator, err := user_model.GetUserByName(ctx, ctx.PathParam("collaborator"))
+	if err != nil {
+		if user_model.IsErrUserNotExist(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	if err := repo_service.DeleteCollaboration(ctx, ctx.Repo.Repository, collaborator); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// GetRepoPermissions gets repository permissions for a user
+func GetRepoPermissions(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/collaborators/{collaborator}/permission repository repoGetRepoPermissions
+	// ---
+	// summary: Get repository permissions for a user
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: collaborator
+	//   in: path
+	//   description: username of the collaborator whose permissions are to be obtained
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/RepoCollaboratorPermission"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	collaboratorUsername := ctx.PathParam("collaborator")
+	if !ctx.Doer.IsAdmin && !strings.EqualFold(ctx.Doer.LowerName, collaboratorUsername) && !ctx.IsUserRepoAdmin() {
+		ctx.APIError(http.StatusForbidden, "Only admins can query all permissions, repo admins can query all repo permissions, collaborators can query only their own")
+		return
+	}
+
+	collaborator, err := user_model.GetUserByName(ctx, collaboratorUsername)
+	if err != nil {
+		if user_model.IsErrUserNotExist(err) {
+			ctx.APIError(http.StatusNotFound, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	permission, err := access_model.GetIndividualUserRepoPermission(ctx, ctx.Repo.Repository, collaborator)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToUserAndPermission(ctx, collaborator, ctx.ContextUser, permission.AccessMode))
+}
+
+// GetReviewers return all users that can be requested to review in this repo
+func GetReviewers(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/reviewers repository repoGetReviewers
+	// ---
+	// summary: Return all users that can be requested to review in this repo
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/UserList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	canChooseReviewer := issue_service.CanDoerChangeReviewRequests(ctx, ctx.Doer, ctx.Repo.Repository, 0)
+	if !canChooseReviewer {
+		ctx.APIError(http.StatusForbidden, "doer has no permission to get reviewers")
+		return
+	}
+
+	reviewers, err := pull_service.GetReviewers(ctx, ctx.Repo.Repository, ctx.Doer.ID, 0)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.JSON(http.StatusOK, convert.ToUsers(ctx, ctx.Doer, reviewers))
+}
+
+// GetAssignees return all users that have write access and can be assigned to issues
+func GetAssignees(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/assignees repository repoGetAssignees
+	// ---
+	// summary: Return all users that have write access and can be assigned to issues
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/UserList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	assignees, err := repo_model.GetRepoAssignees(ctx, ctx.Repo.Repository)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToUsers(ctx, ctx.Doer, assignees))
+}
+
+// CheckRepoIssueAssignee check if a user can be assigned to issues in a repository
+func CheckRepoIssueAssignee(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/assignees/{assignee} repository repoCheckAssignee
+	// ---
+	// summary: Check if a user can be assigned to issues in a repository
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: assignee
+	//   in: path
+	//   description: username of the user to check for being an assignee
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if checkAssignableUser(ctx, ctx.PathParam("assignee"), ctx.Repo.Repository) {
+		ctx.Status(http.StatusNoContent)
+	}
+}

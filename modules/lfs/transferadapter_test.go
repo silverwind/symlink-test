@@ -1,0 +1,132 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package lfs
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"gitea.dev/modules/json"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestBasicTransferAdapterName(t *testing.T) {
+	a := &BasicTransferAdapter{}
+
+	assert.Equal(t, "basic", a.Name())
+}
+
+func TestBasicTransferAdapter(t *testing.T) {
+	p := Pointer{Oid: "b5a2c96250612366ea272ffac6d9744aaf4b45aacd96aa7cfcb931ee3b558259", Size: 5}
+
+	roundTripHandler := func(req *http.Request) *http.Response {
+		assert.Equal(t, AcceptHeader, req.Header.Get("Accept"))
+		assert.Equal(t, "test-value", req.Header.Get("test-header"))
+
+		url := req.URL.String()
+		if strings.Contains(url, "download-request") {
+			assert.Equal(t, "GET", req.Method)
+
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("dummy"))}
+		} else if strings.Contains(url, "upload-request") {
+			assert.Equal(t, "PUT", req.Method)
+			assert.Equal(t, "application/octet-stream", req.Header.Get("Content-Type"))
+
+			b, err := io.ReadAll(req.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, "dummy", string(b))
+
+			return &http.Response{StatusCode: http.StatusOK}
+		} else if strings.Contains(url, "verify-request") {
+			assert.Equal(t, "POST", req.Method)
+			assert.Equal(t, MediaType, req.Header.Get("Content-Type"))
+
+			var vp Pointer
+			err := json.NewDecoder(req.Body).Decode(&vp)
+			assert.NoError(t, err)
+			assert.Equal(t, p.Oid, vp.Oid)
+			assert.Equal(t, p.Size, vp.Size)
+
+			return &http.Response{StatusCode: http.StatusOK}
+		} else if strings.Contains(url, "error-response") {
+			er := &ErrorResponse{
+				Message: "Object not found",
+			}
+			payload := new(bytes.Buffer)
+			json.NewEncoder(payload).Encode(er)
+
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(payload)}
+		}
+		t.Errorf("Unknown test case: %s", url)
+		return nil
+	}
+
+	hc := &http.Client{Transport: RoundTripFunc(roundTripHandler)}
+	a := &BasicTransferAdapter{hc}
+
+	testOperation := func(t *testing.T, endpoint string, transfer func(*Link) error) {
+		cases := []struct {
+			link          *Link
+			expectederror string
+		}{
+			// case 0
+			{
+				link: &Link{
+					Href:   endpoint,
+					Header: map[string]string{"test-header": "test-value"},
+				},
+				expectederror: "",
+			},
+			// case 1
+			{
+				link: &Link{
+					Href:   "https://error-response.io",
+					Header: map[string]string{"test-header": "test-value"},
+				},
+				expectederror: "Object not found",
+			},
+		}
+
+		for n, c := range cases {
+			err := transfer(c.link)
+			if len(c.expectederror) > 0 {
+				assert.Contains(t, err.Error(), c.expectederror, "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
+			} else {
+				assert.NoError(t, err, "case %d", n)
+			}
+		}
+	}
+
+	t.Run("Download", func(t *testing.T) {
+		testOperation(t, "https://download-request.io", func(link *Link) error {
+			_, err := a.Download(t.Context(), link)
+			return err
+		})
+	})
+
+	t.Run("Upload", func(t *testing.T) {
+		testOperation(t, "https://upload-request.io", func(link *Link) error {
+			return a.Upload(t.Context(), link, p, strings.NewReader("dummy"))
+		})
+	})
+
+	t.Run("Upload created", func(t *testing.T) {
+		client := &http.Client{Transport: RoundTripFunc(func(req *http.Request) *http.Response {
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(""))}
+		})}
+		adapter := &BasicTransferAdapter{client: client}
+		err := adapter.Upload(t.Context(), &Link{Href: "https://upload-created-request.io"}, p, strings.NewReader("dummy"))
+		assert.NoError(t, err)
+	})
+
+	t.Run("Verify", func(t *testing.T) {
+		testOperation(t, "https://verify-request.io", func(link *Link) error {
+			return a.Verify(t.Context(), link, p)
+		})
+	})
+}

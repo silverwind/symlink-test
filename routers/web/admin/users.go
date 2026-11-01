@@ -1,0 +1,717 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors.
+// SPDX-License-Identifier: MIT
+
+package admin
+
+import (
+	"errors"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	org_model "gitea.dev/models/organization"
+	packages_model "gitea.dev/models/packages"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/auth/password"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/web/explore"
+	user_setting "gitea.dev/routers/web/user/setting"
+	"gitea.dev/services/audit"
+	auth_service "gitea.dev/services/auth"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	"gitea.dev/services/forms"
+	"gitea.dev/services/mailer"
+	org_service "gitea.dev/services/org"
+	user_service "gitea.dev/services/user"
+)
+
+const (
+	tplUsers    templates.TplName = "admin/user/list"
+	tplUserNew  templates.TplName = "admin/user/new"
+	tplUserView templates.TplName = "admin/user/view"
+	tplUserEdit templates.TplName = "admin/user/edit"
+)
+
+// UserSearchDefaultAdminSort is the default sort type for admin view
+const UserSearchDefaultAdminSort = "alphabetically"
+
+// authSourceFilterOption is one radio item of the authentication source filter dropdown
+type authSourceFilterOption struct {
+	Value    string
+	Label    string
+	Selected bool
+}
+
+// Users show all the users
+func Users(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.users")
+	ctx.Data["PageIsAdminUsers"] = true
+
+	statusFilterKeys := []string{"is_active", "is_admin", "is_restricted", "is_2fa_enabled", "is_prohibit_login"}
+	statusFilterMap := map[string]string{}
+	for _, filterKey := range statusFilterKeys {
+		paramKey := "status_filter[" + filterKey + "]"
+		paramVal := ctx.FormString(paramKey)
+		statusFilterMap[filterKey] = paramVal
+	}
+
+	sortType := ctx.FormString("sort", UserSearchDefaultAdminSort)
+
+	types := user_model.AdminListedUserTypes
+	userTypeFilter := api.UserTypeString(ctx.FormString("user_type"))
+	ctx.Data["UserTypeFilter"] = ""
+	if t, err := convert.UserTypeFromString(userTypeFilter); err == nil {
+		types, ctx.Data["UserTypeFilter"] = []user_model.UserType{t}, userTypeFilter
+	}
+
+	ctx.PageData["adminUserListSearchForm"] = map[string]any{
+		"StatusFilterMap": statusFilterMap,
+		"SortType":        sortType,
+	}
+
+	// inactive sources are listed too, users stay attached to a source after it is deactivated
+	sources, err := db.Find[auth.Source](ctx, auth.FindSourcesOptions{})
+	if err != nil {
+		ctx.ServerError("auth.Sources", err)
+		return
+	}
+	sourceIDFilter := ctx.FormOptionalInt64("source_id")
+	sourceNames := make(map[int64]string, len(sources))
+	authSourceFilterOptions := []*authSourceFilterOption{
+		{Value: "", Label: ctx.Locale.TrString("all"), Selected: !sourceIDFilter.Has()},
+		{Value: "0", Label: ctx.Locale.TrString("admin.users.local"), Selected: sourceIDFilter.Has() && sourceIDFilter.Value() == 0},
+	}
+	for _, source := range sources {
+		sourceNames[source.ID] = source.Name
+		authSourceFilterOptions = append(authSourceFilterOptions, &authSourceFilterOption{
+			Value:    strconv.FormatInt(source.ID, 10),
+			Label:    source.Name,
+			Selected: sourceIDFilter.Has() && sourceIDFilter.Value() == source.ID,
+		})
+	}
+	ctx.Data["HasAuthSources"] = len(sources) > 0
+	ctx.Data["SourceNames"] = sourceNames
+	ctx.Data["AuthSourceFilterOptions"] = authSourceFilterOptions
+
+	explore.RenderUserSearch(ctx, user_model.SearchUserOptions{
+		Actor: ctx.Doer,
+		Types: types,
+		ListOptions: db.ListOptions{
+			PageSize: setting.UI.Admin.UserPagingNum,
+		},
+		SearchByEmail:      true,
+		IsActive:           optional.ParseBool(statusFilterMap["is_active"]),
+		IsAdmin:            optional.ParseBool(statusFilterMap["is_admin"]),
+		IsRestricted:       optional.ParseBool(statusFilterMap["is_restricted"]),
+		IsTwoFactorEnabled: optional.ParseBool(statusFilterMap["is_2fa_enabled"]),
+		IsProhibitLogin:    optional.ParseBool(statusFilterMap["is_prohibit_login"]),
+		SourceID:           sourceIDFilter,
+		OrderBy:            db.SearchOrderBy(sortType),
+	}, tplUsers)
+}
+
+// NewUser render adding a new user page
+func NewUser(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.users.new_account")
+	ctx.Data["PageIsAdminUsers"] = true
+	ctx.Data["DefaultUserVisibilityMode"] = setting.Service.DefaultUserVisibilityMode
+	ctx.Data["AllowedUserVisibilityModes"] = setting.Service.AllowedUserVisibilityModesSlice.ToVisibleTypeSlice()
+
+	ctx.Data["login_type"] = "0-0"
+	ctx.Data["user_type"] = api.UserTypeStringUser
+
+	sources, err := db.Find[auth.Source](ctx, auth.FindSourcesOptions{
+		IsActive: optional.Some(true),
+	})
+	if err != nil {
+		ctx.ServerError("auth.Sources", err)
+		return
+	}
+	ctx.Data["Sources"] = sources
+
+	ctx.Data["CanSendEmail"] = setting.MailService != nil
+	ctx.HTML(http.StatusOK, tplUserNew)
+}
+
+// NewUserPost response for adding a new user
+func NewUserPost(ctx *context.Context) {
+	form := web.GetForm[*forms.AdminCreateUserForm](ctx)
+	ctx.Data["Title"] = ctx.Tr("admin.users.new_account")
+	ctx.Data["PageIsAdminUsers"] = true
+	ctx.Data["DefaultUserVisibilityMode"] = setting.Service.DefaultUserVisibilityMode
+	ctx.Data["AllowedUserVisibilityModes"] = setting.Service.AllowedUserVisibilityModesSlice.ToVisibleTypeSlice()
+
+	sources, err := db.Find[auth.Source](ctx, auth.FindSourcesOptions{
+		IsActive: optional.Some(true),
+	})
+	if err != nil {
+		ctx.ServerError("auth.Sources", err)
+		return
+	}
+	ctx.Data["Sources"] = sources
+
+	ctx.Data["CanSendEmail"] = setting.MailService != nil
+
+	if ctx.HasError() {
+		ctx.HTML(http.StatusOK, tplUserNew)
+		return
+	}
+
+	u := &user_model.User{
+		Name:      form.UserName,
+		Email:     form.Email,
+		Passwd:    form.Password,
+		LoginType: auth.Plain,
+	}
+
+	overwriteDefault := &user_model.CreateUserOverwriteOptions{
+		IsActive:   optional.Some(true),
+		Visibility: &form.Visibility,
+	}
+
+	if form.UserType == api.UserTypeStringBot {
+		u.Type = user_model.UserTypeBot
+		u.Passwd = ""
+	} else if len(form.LoginType) > 0 {
+		fields := strings.Split(form.LoginType, "-")
+		if len(fields) == 2 {
+			lType, _ := strconv.ParseInt(fields[0], 10, 0)
+			u.LoginType = auth.Type(lType)
+			u.LoginSource, _ = strconv.ParseInt(fields[1], 10, 64)
+			u.LoginName = form.LoginName
+		}
+	}
+	if !u.IsTypeBot() && (u.LoginType == auth.NoType || u.LoginType == auth.Plain) {
+		if len(form.Password) < setting.MinPasswordLength {
+			ctx.Data["Err_Password"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("auth.password_too_short", setting.MinPasswordLength), tplUserNew, &form)
+			return
+		}
+		if !password.IsComplexEnough(form.Password) {
+			ctx.Data["Err_Password"] = true
+			ctx.RenderWithErrDeprecated(password.BuildComplexityError(ctx.Locale), tplUserNew, &form)
+			return
+		}
+		if err := password.IsPwned(ctx, form.Password); err != nil {
+			ctx.Data["Err_Password"] = true
+			errMsg := ctx.Tr("auth.password_pwned", "https://haveibeenpwned.com/Passwords")
+			if password.IsErrIsPwnedRequest(err) {
+				log.Error(err.Error())
+				errMsg = ctx.Tr("auth.password_pwned_err")
+			}
+			ctx.RenderWithErrDeprecated(errMsg, tplUserNew, &form)
+			return
+		}
+		u.MustChangePassword = form.MustChangePassword
+	}
+
+	if err := user_model.AdminCreateUser(ctx, u, &user_model.Meta{}, overwriteDefault); err != nil {
+		var errNameReserved db.ErrNameReserved
+		var errNamePatternNotAllowed db.ErrNamePatternNotAllowed
+		var errNameCharsNotAllowed db.ErrNameCharsNotAllowed
+		var errEmailInvalid user_model.ErrEmailInvalid
+		switch {
+		case user_model.IsErrUserAlreadyExist(err):
+			ctx.Data["Err_UserName"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.username_been_taken"), tplUserNew, &form)
+		case user_model.IsErrEmailAlreadyUsed(err):
+			ctx.Data["Err_Email"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.email_been_used"), tplUserNew, &form)
+		case errors.As(err, &errEmailInvalid):
+			ctx.Data["Err_Email"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.email_invalid"), tplUserNew, &form)
+		case errors.As(err, &errNameReserved):
+			ctx.Data["Err_UserName"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("user.form.name_reserved", errNameReserved.Name), tplUserNew, &form)
+		case errors.As(err, &errNamePatternNotAllowed):
+			ctx.Data["Err_UserName"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("user.form.name_pattern_not_allowed", errNamePatternNotAllowed.Pattern), tplUserNew, &form)
+		case errors.As(err, &errNameCharsNotAllowed):
+			ctx.Data["Err_UserName"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("user.form.name_chars_not_allowed", errNameCharsNotAllowed.Name), tplUserNew, &form)
+		default:
+			ctx.ServerError("CreateUser", err)
+		}
+		return
+	}
+
+	if !user_model.IsEmailDomainAllowed(u.Email) {
+		ctx.Flash.Warning(ctx.Tr("form.email_domain_is_not_allowed", u.Email))
+	}
+
+	audit.Record(ctx, audit_model.UserCreate, u)
+
+	log.Trace("Account created by admin (%s): %s", ctx.Doer.Name, u.Name)
+
+	// Send email notification.
+	if form.SendNotify {
+		mailer.SendRegisterNotifyMail(u)
+	}
+
+	ctx.Flash.Success(ctx.Tr("admin.users.new_success", u.Name))
+	ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + strconv.FormatInt(u.ID, 10))
+}
+
+func prepareUserInfo(ctx *context.Context) *user_model.User {
+	u, err := user_model.GetUserByID(ctx, ctx.PathParamInt64("userid"))
+	if err != nil {
+		if user_model.IsErrUserNotExist(err) {
+			ctx.Redirect(setting.AppSubURL + "/-/admin/users")
+		} else {
+			ctx.ServerError("GetUserByID", err)
+		}
+		return nil
+	}
+	ctx.Data["User"] = u
+
+	if u.LoginSource > 0 {
+		ctx.Data["LoginSource"], err = auth.GetSourceByID(ctx, u.LoginSource)
+		if err != nil {
+			ctx.ServerError("auth.GetSourceByID", err)
+			return nil
+		}
+	} else {
+		ctx.Data["LoginSource"] = &auth.Source{}
+	}
+
+	sources, err := db.Find[auth.Source](ctx, auth.FindSourcesOptions{})
+	if err != nil {
+		ctx.ServerError("auth.Sources", err)
+		return nil
+	}
+	ctx.Data["Sources"] = sources
+
+	hasTOTP, err := auth.HasTwoFactorByUID(ctx, u.ID)
+	if err != nil {
+		ctx.ServerError("auth.HasTwoFactorByUID", err)
+		return nil
+	}
+	hasWebAuthn, err := auth.HasWebAuthnRegistrationsByUID(ctx, u.ID)
+	if err != nil {
+		ctx.ServerError("auth.HasWebAuthnRegistrationsByUID", err)
+		return nil
+	}
+	ctx.Data["TwoFactorEnabled"] = hasTOTP || hasWebAuthn
+	ctx.Data["CanConvertUserType"] = user_service.CheckConvertUserType(u) == nil
+
+	return u
+}
+
+func ViewUser(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.users.details")
+	ctx.Data["PageIsAdminUsers"] = true
+	ctx.Data["DisableRegularOrgCreation"] = setting.Admin.DisableRegularOrgCreation
+	ctx.Data["DisableMigrations"] = setting.Repository.DisableMigrations
+	ctx.Data["AllowedUserVisibilityModes"] = setting.Service.AllowedUserVisibilityModesSlice.ToVisibleTypeSlice()
+
+	u := prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	repos, count, err := repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
+		ListOptions: db.ListOptionsAll,
+		OwnerID:     u.ID,
+		OrderBy:     db.SearchOrderByAlphabetically,
+		Private:     true,
+		Collaborate: optional.Some(false),
+	})
+	if err != nil {
+		ctx.ServerError("SearchRepository", err)
+		return
+	}
+
+	ctx.Data["Repos"] = repos
+	ctx.Data["ReposTotal"] = int(count)
+
+	emails, err := user_model.GetEmailAddresses(ctx, u.ID)
+	if err != nil {
+		ctx.ServerError("GetEmailAddresses", err)
+		return
+	}
+	ctx.Data["Emails"] = emails
+	ctx.Data["EmailsTotal"] = len(emails)
+
+	ctx.Data["UserOrgs"], err = org_model.GetUserOrganizations(ctx, u.ID)
+	if err != nil {
+		ctx.ServerError("FindOrgs", err)
+		return
+	}
+
+	if u.IsTypeBot() {
+		ctx.Data["BotAccessTokens"] = user_setting.NewAccessTokensPanel(ctx, u, ctx.Link+"/access_tokens")
+		if ctx.Written() {
+			return
+		}
+	}
+
+	ctx.HTML(http.StatusOK, tplUserView)
+}
+
+// getTargetBot loads the bot whose tokens an admin manages, other accounts manage their own
+func getTargetBot(ctx *context.Context) *user_model.User {
+	u, err := user_model.GetUserByID(ctx, ctx.PathParamInt64("userid"))
+	if err != nil {
+		ctx.ServerError("GetUserByID", err)
+		return nil
+	}
+	if !u.IsTypeBot() {
+		ctx.JSONError(ctx.Tr("admin.users.bot_token_only"))
+		return nil
+	}
+	return u
+}
+
+func NewBotTokenPost(ctx *context.Context) {
+	if u := getTargetBot(ctx); u != nil {
+		user_setting.CreateAccessToken(ctx, u)
+	}
+}
+
+func DeleteBotToken(ctx *context.Context) {
+	if u := getTargetBot(ctx); u != nil {
+		user_setting.DeleteAccessToken(ctx, u)
+	}
+}
+
+func RegenerateBotToken(ctx *context.Context) {
+	if u := getTargetBot(ctx); u != nil {
+		user_setting.RegenerateAccessToken(ctx, u)
+	}
+}
+
+func editUserCommon(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.users.edit_account")
+	ctx.Data["PageIsAdminUsers"] = true
+	ctx.Data["DisableRegularOrgCreation"] = setting.Admin.DisableRegularOrgCreation
+	ctx.Data["DisableMigrations"] = setting.Repository.DisableMigrations
+	ctx.Data["DisableGitHooks"] = setting.DisableGitHooks
+	ctx.Data["DisableImportLocal"] = !setting.ImportLocalPaths
+	ctx.Data["AllowedUserVisibilityModes"] = setting.Service.AllowedUserVisibilityModesSlice.ToVisibleTypeSlice()
+	ctx.Data["DisableGravatar"] = setting.Config().Picture.DisableGravatar.Value(ctx)
+}
+
+// EditUser show editing user page
+func EditUser(ctx *context.Context) {
+	editUserCommon(ctx)
+	prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.HTML(http.StatusOK, tplUserEdit)
+}
+
+// EditUserPost response for editing user
+func EditUserPost(ctx *context.Context) {
+	editUserCommon(ctx)
+	u := prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	form := web.GetForm[*forms.AdminEditUserForm](ctx)
+	if ctx.HasError() {
+		ctx.HTML(http.StatusOK, tplUserEdit)
+		return
+	}
+
+	userLink := setting.AppSubURL + "/-/admin/users/" + url.PathEscape(ctx.PathParam("userid"))
+
+	if form.UserName != "" {
+		if err := user_service.RenameUser(ctx, u, form.UserName, ctx.Doer); err != nil {
+			switch {
+			case user_model.IsErrUserIsNotLocal(err):
+				ctx.Data["Err_UserName"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("form.username_change_not_local_user"), tplUserEdit, &form)
+			case user_model.IsErrUserAlreadyExist(err):
+				ctx.Data["Err_UserName"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("form.username_been_taken"), tplUserEdit, &form)
+			case db.IsErrNameReserved(err):
+				ctx.Data["Err_UserName"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("user.form.name_reserved", form.UserName), tplUserEdit, &form)
+			case db.IsErrNamePatternNotAllowed(err):
+				ctx.Data["Err_UserName"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("user.form.name_pattern_not_allowed", form.UserName), tplUserEdit, &form)
+			case db.IsErrNameCharsNotAllowed(err):
+				ctx.Data["Err_UserName"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("user.form.name_chars_not_allowed", form.UserName), tplUserEdit, &form)
+			default:
+				ctx.ServerError("RenameUser", err)
+			}
+			return
+		}
+	}
+
+	userType := u.Type
+	if formUserType, err := convert.UserTypeFromString(form.UserType); err == nil {
+		userType = formUserType
+	}
+
+	authOpts := &user_service.UpdateAuthOptions{}
+	if !u.IsTypeBot() && userType != user_model.UserTypeBot { // the auth fields hidden for bots still submit their values
+		authOpts.Password = optional.FromNonDefault(form.Password)
+		authOpts.LoginName = optional.Some(form.LoginName)
+		if fields := strings.Split(form.LoginType, "-"); len(fields) == 2 {
+			authSource, _ := strconv.ParseInt(fields[1], 10, 64)
+			authOpts.LoginSource = optional.Some(authSource)
+		}
+	}
+
+	// skip self Prohibit Login
+	if ctx.Doer.ID == u.ID {
+		authOpts.ProhibitLogin = optional.Some(false)
+	} else {
+		authOpts.ProhibitLogin = optional.Some(form.ProhibitLogin)
+	}
+
+	if err := user_service.UpdateAuth(ctx, u, authOpts); err != nil {
+		switch {
+		case errors.Is(err, password.ErrMinLength):
+			ctx.Data["Err_Password"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("auth.password_too_short", setting.MinPasswordLength), tplUserEdit, &form)
+		case errors.Is(err, password.ErrComplexity):
+			ctx.Data["Err_Password"] = true
+			ctx.RenderWithErrDeprecated(password.BuildComplexityError(ctx.Locale), tplUserEdit, &form)
+		case errors.Is(err, password.ErrIsPwned):
+			ctx.Data["Err_Password"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("auth.password_pwned", "https://haveibeenpwned.com/Passwords"), tplUserEdit, &form)
+		case password.IsErrIsPwnedRequest(err):
+			ctx.Data["Err_Password"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("auth.password_pwned_err"), tplUserEdit, &form)
+		case errors.Is(err, util.ErrInvalidArgument):
+			ctx.Flash.Error(err.Error())
+			ctx.Redirect(userLink)
+		default:
+			ctx.ServerError("UpdateUser", err)
+		}
+		return
+	}
+
+	if form.Email != "" {
+		if err := user_service.ReplacePrimaryEmailAddress(ctx, u, form.Email); err != nil {
+			switch {
+			case user_model.IsErrEmailAlreadyUsed(err):
+				ctx.Data["Err_Email"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("form.email_been_used"), tplUserEdit, &form)
+			case errors.Is(err, util.ErrInvalidArgument):
+				ctx.Data["Err_Email"] = true
+				ctx.RenderWithErrDeprecated(ctx.Tr("form.email_invalid"), tplUserEdit, &form)
+			default:
+				ctx.ServerError("AddOrSetPrimaryEmailAddress", err)
+			}
+			return
+		}
+		if !user_model.IsEmailDomainAllowed(form.Email) {
+			ctx.Flash.Warning(ctx.Tr("form.email_domain_is_not_allowed", form.Email))
+		}
+	}
+
+	opts := &user_service.UpdateOptions{
+		FullName:                optional.Some(form.FullName),
+		Website:                 optional.Some(form.Website),
+		Location:                optional.Some(form.Location),
+		IsActive:                optional.Some(form.Active),
+		IsAdmin:                 user_service.UpdateOptionFieldFromValue(form.Admin),
+		AllowGitHook:            optional.Some(form.AllowGitHook),
+		AllowImportLocal:        optional.Some(form.AllowImportLocal),
+		MaxRepoCreation:         optional.Some(form.MaxRepoCreation),
+		AllowCreateOrganization: optional.Some(form.AllowCreateOrganization),
+		IsRestricted:            optional.Some(form.Restricted),
+		Visibility:              optional.Some(form.Visibility),
+		Language:                optional.Some(form.Language),
+		UserType:                optional.Some(userType),
+	}
+
+	if err := user_service.UpdateUser(ctx, u, opts); err != nil {
+		switch {
+		case user_model.IsErrDeleteLastAdminUser(err):
+			ctx.RenderWithErrDeprecated(ctx.Tr("auth.last_admin"), tplUserEdit, &form)
+		case errors.Is(err, user_model.ErrBotCanNotBeAdmin):
+			ctx.Flash.Error(ctx.Tr("admin.users.convert_type.admin_not_allowed"))
+			ctx.Redirect(userLink)
+		case errors.Is(err, util.ErrInvalidArgument):
+			ctx.Flash.Error(err.Error())
+			ctx.Redirect(userLink)
+		default:
+			ctx.ServerError("UpdateUser", err)
+		}
+		return
+	}
+
+	log.Trace("Account profile updated by admin (%s): %s", ctx.Doer.Name, u.Name)
+
+	if form.Reset2FA {
+		if _, _, err := auth.DisableTwoFactor(ctx, u.ID); err != nil {
+			ctx.ServerError("auth.DisableTwoFactor", err)
+			return
+		}
+	}
+
+	ctx.Flash.Success(ctx.Tr("admin.users.update_profile_success"))
+	ctx.Redirect(userLink)
+}
+
+func ImpersonateUser(ctx *context.Context) {
+	u, err := user_model.GetUserByID(ctx, ctx.PathParamInt64("userid"))
+	if err != nil {
+		ctx.JSONError("unable to get user")
+		return
+	}
+
+	if u.IsTypeBot() {
+		ctx.JSONError(ctx.Tr("admin.users.impersonate_bot_not_allowed"))
+		return
+	}
+
+	err = auth_service.ImpersonateUser(ctx.Session, u)
+	if err != nil {
+		ctx.ServerError("unable to impersonate user", err)
+		return
+	}
+	audit.Record(ctx, audit_model.UserImpersonation, u)
+	ctx.JSONRedirect(setting.AppSubURL + "/user/settings")
+}
+
+// DeleteUser response for deleting a user
+func DeleteUser(ctx *context.Context) {
+	u, err := user_model.GetUserByID(ctx, ctx.PathParamInt64("userid"))
+	if err != nil {
+		ctx.ServerError("GetUserByID", err)
+		return
+	}
+
+	// admin should not delete themself
+	if u.ID == ctx.Doer.ID {
+		ctx.Flash.Error(ctx.Tr("admin.users.cannot_delete_self"))
+		ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + url.PathEscape(ctx.PathParam("userid")))
+		return
+	}
+
+	if err = user_service.DeleteUser(ctx, u, ctx.FormBool("purge")); err != nil {
+		switch {
+		case repo_model.IsErrUserOwnRepos(err):
+			ctx.Flash.Error(ctx.Tr("admin.users.still_own_repo"))
+			ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + url.PathEscape(ctx.PathParam("userid")))
+		case org_model.IsErrUserHasOrgs(err):
+			ctx.Flash.Error(ctx.Tr("admin.users.still_has_org"))
+			ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + url.PathEscape(ctx.PathParam("userid")))
+		case packages_model.IsErrUserOwnPackages(err):
+			ctx.Flash.Error(ctx.Tr("admin.users.still_own_packages"))
+			ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + url.PathEscape(ctx.PathParam("userid")))
+		case user_model.IsErrDeleteLastAdminUser(err):
+			ctx.Flash.Error(ctx.Tr("auth.last_admin"))
+			ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + url.PathEscape(ctx.PathParam("userid")))
+		default:
+			ctx.ServerError("DeleteUser", err)
+		}
+		return
+	}
+	log.Trace("Account deleted by admin (%s): %s", ctx.Doer.Name, u.Name)
+
+	ctx.Flash.Success(ctx.Tr("admin.users.deletion_success"))
+	ctx.Redirect(setting.AppSubURL + "/-/admin/users")
+}
+
+func RemoveUserFromOrg(ctx *context.Context) {
+	u := prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	orgID := ctx.PathParamInt64("org_id")
+	org, err := org_model.GetOrgByID(ctx, orgID)
+	if err != nil {
+		ctx.ServerError("GetOrgByID", err)
+		return
+	}
+
+	err = org_service.RemoveOrgUser(ctx, org, u)
+	if org_model.IsErrLastOrgOwner(err) {
+		ctx.Flash.Error(ctx.Tr("form.last_org_owner"))
+		ctx.JSONRedirect("")
+		return
+	} else if err != nil {
+		ctx.ServerError("RemoveOrgUser", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("admin.users.org_removed", org.Name))
+	ctx.JSONRedirect("")
+}
+
+func RemoveUserFromAllOrgs(ctx *context.Context) {
+	u := prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	orgs, err := org_model.GetUserOrganizations(ctx, u.ID)
+	if err != nil {
+		ctx.ServerError("GetUserOrganizations", err)
+		return
+	}
+
+	removedCount := 0
+	for i := range orgs {
+		err = org_service.RemoveOrgUser(ctx, orgs[i], u)
+		if org_model.IsErrLastOrgOwner(err) {
+			continue
+		} else if err != nil {
+			log.Error("Failed to remove user %s from org %s: %v", u.Name, orgs[i].Name, err)
+			continue
+		}
+		removedCount++
+	}
+
+	if removedCount < len(orgs) {
+		ctx.Flash.Warning(ctx.Tr("admin.users.some_orgs_removed", removedCount, len(orgs)))
+	} else {
+		ctx.Flash.Success(ctx.Tr("admin.users.all_orgs_removed"))
+	}
+	ctx.JSONRedirect("")
+}
+
+// AvatarPost response for change user's avatar request
+func AvatarPost(ctx *context.Context) {
+	u := prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	form := web.GetForm[*forms.AvatarForm](ctx)
+	if err := user_setting.UpdateAvatarSetting(ctx, form, u); err != nil {
+		ctx.Flash.Error(err.Error())
+	} else {
+		ctx.Flash.Success(ctx.Tr("settings.update_user_avatar_success"))
+	}
+
+	ctx.Redirect(setting.AppSubURL + "/-/admin/users/" + strconv.FormatInt(u.ID, 10))
+}
+
+// DeleteAvatar render delete avatar page
+func DeleteAvatar(ctx *context.Context) {
+	u := prepareUserInfo(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	if err := user_service.DeleteAvatar(ctx, u); err != nil {
+		ctx.Flash.Error(err.Error())
+	}
+
+	ctx.JSONRedirect(setting.AppSubURL + "/-/admin/users/" + strconv.FormatInt(u.ID, 10))
+}

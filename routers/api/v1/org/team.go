@@ -1,0 +1,876 @@
+// Copyright 2016 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package org
+
+import (
+	"errors"
+	"maps"
+	"net/http"
+
+	activities_model "gitea.dev/models/activities"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/user"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	feed_service "gitea.dev/services/feed"
+	org_service "gitea.dev/services/org"
+	repo_service "gitea.dev/services/repository"
+)
+
+// ListTeams list all the teams of an organization
+func ListTeams(ctx *context.APIContext) {
+	// swagger:operation GET /orgs/{org}/teams organization orgListTeams
+	// ---
+	// summary: List an organization's teams
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/TeamList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	listOptions := utils.GetListOptions(ctx)
+	opts := &organization.SearchTeamOptions{
+		ListOptions: listOptions,
+		OrgID:       ctx.Org.Organization.ID,
+	}
+	if err := organization.ApplyTeamListFilter(ctx, ctx.Org.Organization.ID, ctx.Doer, ctx.IsSigned, opts); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	teams, count, err := organization.SearchTeam(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiTeams, err := convert.ToTeams(ctx, teams, false)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.SetLinkHeader(count, listOptions.PageSize)
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, apiTeams)
+}
+
+// ListUserTeams list all the teams a user belongs to
+func ListUserTeams(ctx *context.APIContext) {
+	// swagger:operation GET /user/teams user userListTeams
+	// ---
+	// summary: List all the teams a user belongs to
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/TeamList"
+
+	listOptions := utils.GetListOptions(ctx)
+	teams, count, err := organization.SearchTeam(ctx, &organization.SearchTeamOptions{
+		ListOptions: listOptions,
+		UserID:      ctx.Doer.ID,
+	})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiTeams, err := convert.ToTeams(ctx, teams, true)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.SetLinkHeader(count, listOptions.PageSize)
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, apiTeams)
+}
+
+// GetTeam api for get a team
+func GetTeam(ctx *context.APIContext) {
+	// swagger:operation GET /teams/{id} organization orgGetTeam
+	// ---
+	// summary: Get a team
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team to get
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Team"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	apiTeam, err := convert.ToTeam(ctx, ctx.Org.Team, true)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, apiTeam)
+}
+
+// assignTeamPermissionUnits sets authorize + team_unit rows.
+func assignTeamPermissionUnits(team *organization.Team, permission string, units []string, unitsMap map[string]string) (changed bool, _ error) {
+	if len(units) > 0 && len(unitsMap) > 0 {
+		return false, util.NewInvalidArgumentErrorf("only one of units or units_map can be set")
+	}
+	if len(units) > 0 {
+		unitsMap = map[string]string{}
+		for _, unit := range units {
+			unitsMap[unit] = permission
+		}
+	}
+
+	oldAccessMode := team.AccessMode
+	oldUnitPerms := team.GetUnitsMap()
+	if len(unitsMap) > 0 {
+		team.AccessMode = perm.AccessModeNone
+		team.Units = make([]*organization.TeamUnit, 0, len(unitsMap))
+		for unitKey, p := range unitsMap {
+			unitType, unitPerm := unit_model.TypeFromKey(unitKey), perm.ParseAccessMode(p)
+			team.Units = append(team.Units, &organization.TeamUnit{OrgID: team.OrgID, Type: unitType, AccessMode: unitPerm})
+		}
+	} else {
+		requested := perm.ParseAccessMode(permission, perm.AccessModeNone, perm.AccessModeRead, perm.AccessModeWrite, perm.AccessModeAdmin)
+		if requested == perm.AccessModeNone {
+			return false, util.NewInvalidArgumentErrorf("no permission specified")
+		}
+		team.AccessMode, team.Units = requested, nil
+	}
+
+	changed = oldAccessMode != team.AccessMode || !maps.Equal(oldUnitPerms, team.GetUnitsMap())
+	return changed, nil
+}
+
+// CreateTeam api for create a team
+func CreateTeam(ctx *context.APIContext) {
+	// swagger:operation POST /orgs/{org}/teams organization orgCreateTeam
+	// ---
+	// summary: Create a team
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateTeamOption"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Team"
+	//   default:
+	//     "$ref": "#/responses/error"
+	form := web.GetForm[*api.CreateTeamOption](ctx)
+	team := &organization.Team{
+		OrgID:                   ctx.Org.Organization.ID,
+		Name:                    form.Name,
+		Description:             form.Description,
+		IncludesAllRepositories: form.IncludesAllRepositories,
+		CanCreateOrgRepo:        form.CanCreateOrgRepo,
+		Visibility:              organization.NormalizeTeamVisibility(form.Visibility),
+	}
+	_, err := assignTeamPermissionUnits(team, string(form.Permission), form.Units, form.UnitsMap)
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	if err := org_service.NewTeam(ctx, team); err != nil {
+		if organization.IsErrTeamAlreadyExist(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	apiTeam, err := convert.ToTeam(ctx, team, true)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.JSON(http.StatusCreated, apiTeam)
+}
+
+// EditTeam api for edit a team
+func EditTeam(ctx *context.APIContext) {
+	// swagger:operation PATCH /teams/{id} organization orgEditTeam
+	// ---
+	// summary: Edit a team
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team to edit
+	//   type: integer
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/EditTeamOption"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Team"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.EditTeamOption](ctx)
+	team := ctx.Org.Team
+	if err := team.LoadUnits(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if form.CanCreateOrgRepo != nil {
+		team.CanCreateOrgRepo = team.IsOwnerTeam() || *form.CanCreateOrgRepo
+	}
+
+	if len(form.Name) > 0 {
+		team.Name = form.Name
+	}
+
+	if form.Description != nil {
+		team.Description = *form.Description
+	}
+
+	if form.Visibility != nil && !team.IsOwnerTeam() {
+		team.Visibility = organization.NormalizeTeamVisibility(*form.Visibility)
+	}
+
+	isAuthChanged := false
+	isIncludeAllChanged := false
+	hasPermFields := form.Permission != "" || len(form.Units) > 0 || len(form.UnitsMap) > 0
+	if !team.IsOwnerTeam() && hasPermFields {
+		var err error
+		isAuthChanged, err = assignTeamPermissionUnits(team, string(form.Permission), form.Units, form.UnitsMap)
+		if err != nil {
+			ctx.APIErrorAuto(err)
+			return
+		}
+	}
+
+	if !team.IsOwnerTeam() && form.IncludesAllRepositories != nil {
+		isIncludeAllChanged = true
+		team.IncludesAllRepositories = *form.IncludesAllRepositories
+	}
+
+	if err := org_service.UpdateTeam(ctx, team, isAuthChanged, isIncludeAllChanged); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiTeam, err := convert.ToTeam(ctx, team)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.JSON(http.StatusOK, apiTeam)
+}
+
+// DeleteTeam api for delete a team
+func DeleteTeam(ctx *context.APIContext) {
+	// swagger:operation DELETE /teams/{id} organization orgDeleteTeam
+	// ---
+	// summary: Delete a team
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team to delete
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "204":
+	//     description: team deleted
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if err := org_service.DeleteTeam(ctx, ctx.Org.Team); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// GetTeamMembers api for get a team's members
+func GetTeamMembers(ctx *context.APIContext) {
+	// swagger:operation GET /teams/{id}/members organization orgListTeamMembers
+	// ---
+	// summary: List a team's members
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/UserList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	listOptions := utils.GetListOptions(ctx)
+	teamMembers, err := organization.GetTeamMembers(ctx, &organization.SearchMembersOptions{
+		ListOptions: listOptions,
+		TeamID:      ctx.Org.Team.ID,
+	})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	members := make([]*api.User, len(teamMembers))
+	for i, member := range teamMembers {
+		members[i] = convert.ToUser(ctx, member, ctx.Doer)
+	}
+
+	ctx.SetLinkHeader(int64(ctx.Org.Team.NumMembers), listOptions.PageSize)
+	ctx.SetTotalCountHeader(int64(ctx.Org.Team.NumMembers))
+	ctx.JSON(http.StatusOK, members)
+}
+
+// GetTeamMember api for get a particular member of team
+func GetTeamMember(ctx *context.APIContext) {
+	// swagger:operation GET /teams/{id}/members/{username} organization orgListTeamMember
+	// ---
+	// summary: List a particular member of team
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: username
+	//   in: path
+	//   description: username of the user whose data is to be listed
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/User"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	u := user.GetContextUserByPathParam(ctx)
+	if ctx.Written() {
+		return
+	}
+	teamID := ctx.PathParamInt64("teamid")
+	isTeamMember, err := organization.IsUserInTeams(ctx, u.ID, []int64{teamID})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	} else if !isTeamMember {
+		ctx.APIErrorNotFound()
+		return
+	}
+	ctx.JSON(http.StatusOK, convert.ToUser(ctx, u, ctx.Doer))
+}
+
+// AddTeamMember api for add a member to a team
+func AddTeamMember(ctx *context.APIContext) {
+	// swagger:operation PUT /teams/{id}/members/{username} organization orgAddTeamMember
+	// ---
+	// summary: Add a team member
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: username
+	//   in: path
+	//   description: username of the user to add to a team
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	u := user.GetContextUserByPathParam(ctx)
+	if ctx.Written() {
+		return
+	}
+	if err := org_service.AddTeamMember(ctx, ctx.Org.Team, u); err != nil {
+		if errors.Is(err, user_model.ErrBlockedUser) {
+			ctx.APIError(http.StatusForbidden, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// RemoveTeamMember api for remove one member from a team
+func RemoveTeamMember(ctx *context.APIContext) {
+	// swagger:operation DELETE /teams/{id}/members/{username} organization orgRemoveTeamMember
+	// ---
+	// summary: Remove a team member
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: username
+	//   in: path
+	//   description: username of the user to remove from a team
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	u := user.GetContextUserByPathParam(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	if err := org_service.RemoveTeamMember(ctx, ctx.Org.Team, u); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// GetTeamRepos api for get a team's repos
+func GetTeamRepos(ctx *context.APIContext) {
+	// swagger:operation GET /teams/{id}/repos organization orgListTeamRepos
+	// ---
+	// summary: List a team's repos
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/RepositoryList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	team := ctx.Org.Team
+	listOptions := utils.GetListOptions(ctx)
+	searchOpts := &repo_model.SearchTeamRepoOptions{
+		ListOptions: listOptions,
+		TeamID:      team.ID,
+		Actor:       ctx.Doer,
+	}
+	teamRepos, err := repo_model.GetTeamRepositories(ctx, searchOpts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	count, err := repo_model.CountTeamRepositories(ctx, searchOpts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	repos := make([]*api.Repository, 0, len(teamRepos))
+	for _, repo := range teamRepos {
+		permission, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+		if err != nil {
+			ctx.APIErrorInternal(err)
+			return
+		}
+		// A team's repo list is reachable by non-team-members through the team's
+		// visibility tier, so never expose repos (incl. their names) the doer
+		// cannot access. This per-repo visibility trim can't be expressed in the
+		// SQL count above without regressing per-unit public access, so for such
+		// non-members the total-count header may be a small upper bound.
+		if !permission.HasAnyUnitAccessOrPublicAccess() {
+			continue
+		}
+		repos = append(repos, convert.ToRepo(ctx, repo, permission))
+	}
+	ctx.SetLinkHeader(count, listOptions.PageSize)
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, repos)
+}
+
+// GetTeamRepo api for get a particular repo of team
+func GetTeamRepo(ctx *context.APIContext) {
+	// swagger:operation GET /teams/{id}/repos/{org}/{repo} organization orgListTeamRepo
+	// ---
+	// summary: List a particular repo of team
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: org
+	//   in: path
+	//   description: organization that owns the repo to list
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo to list
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Repository"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	repo, permission := getRepositoryByParams(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	if !organization.HasTeamRepo(ctx, ctx.Org.Team.OrgID, ctx.Org.Team.ID, repo.ID) {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	// The team may be reachable by a non-team-member via its visibility tier;
+	// don't confirm the existence of a repo the doer cannot access.
+	if !permission.HasAnyUnitAccessOrPublicAccess() {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToRepo(ctx, repo, *permission))
+}
+
+// getRepositoryByParams get repository by a team's organization ID and repo name
+func getRepositoryByParams(ctx *context.APIContext) (*repo_model.Repository, *access_model.Permission) {
+	repo, err := repo_model.GetRepositoryByName(ctx, ctx.Org.Team.OrgID, ctx.PathParam("reponame"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return nil, nil
+	}
+	perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return nil, nil
+	}
+	return repo, &perm
+}
+
+func canManageRepoCollaboratorTeam(ctx *context.APIContext, repo *repo_model.Repository, perm *access_model.Permission) bool {
+	canChange := access_model.CanDoerManageOrgRepoCollaboratorTeam(ctx, repo, perm)
+	if !canChange {
+		ctx.APIError(http.StatusForbidden, "Must have permission to manage team repository access")
+		return false
+	}
+	return true
+}
+
+// AddTeamRepository api for adding a repository to a team
+func AddTeamRepository(ctx *context.APIContext) {
+	// swagger:operation PUT /teams/{id}/repos/{org}/{repo} organization orgAddTeamRepository
+	// ---
+	// summary: Add a repository to a team
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: org
+	//   in: path
+	//   description: organization that owns the repo to add
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo to add
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	repo, perm := getRepositoryByParams(ctx)
+	if ctx.Written() {
+		return
+	}
+	if !canManageRepoCollaboratorTeam(ctx, repo, perm) {
+		return
+	}
+	if err := repo_service.TeamAddRepository(ctx, ctx.Org.Team, repo); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// RemoveTeamRepository api for removing a repository from a team
+func RemoveTeamRepository(ctx *context.APIContext) {
+	// swagger:operation DELETE /teams/{id}/repos/{org}/{repo} organization orgRemoveTeamRepository
+	// ---
+	// summary: Remove a repository from a team
+	// description: This does not delete the repository, it only removes the
+	//              repository from the team.
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: org
+	//   in: path
+	//   description: organization that owns the repo to remove
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo to remove
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	repo, perm := getRepositoryByParams(ctx)
+	if ctx.Written() {
+		return
+	}
+	if !canManageRepoCollaboratorTeam(ctx, repo, perm) {
+		return
+	}
+	if err := repo_service.RemoveRepositoryFromTeam(ctx, ctx.Org.Team, repo.ID); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// SearchTeam api for searching teams
+func SearchTeam(ctx *context.APIContext) {
+	// swagger:operation GET /orgs/{org}/teams/search organization teamSearch
+	// ---
+	// summary: Search for teams within an organization
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// - name: q
+	//   in: query
+	//   description: keywords to search
+	//   type: string
+	// - name: include_desc
+	//   in: query
+	//   description: include search within team description (defaults to true)
+	//   type: boolean
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     description: "SearchResults of a successful search"
+	//     schema:
+	//       type: object
+	//       properties:
+	//         ok:
+	//           type: boolean
+	//         data:
+	//           type: array
+	//           items:
+	//             "$ref": "#/definitions/Team"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	listOptions := utils.GetListOptions(ctx)
+
+	opts := &organization.SearchTeamOptions{
+		Keyword:     ctx.FormTrim("q"),
+		OrgID:       ctx.Org.Organization.ID,
+		IncludeDesc: ctx.FormString("include_desc") == "" || ctx.FormBool("include_desc"),
+		ListOptions: listOptions,
+	}
+
+	if err := organization.ApplyTeamListFilter(ctx, ctx.Org.Organization.ID, ctx.Doer, ctx.IsSigned, opts); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	teams, maxResults, err := organization.SearchTeam(ctx, opts)
+	if err != nil {
+		log.Error("SearchTeam failed: %v", err)
+		ctx.JSON(http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "SearchTeam internal failure",
+		})
+		return
+	}
+
+	apiTeams, err := convert.ToTeams(ctx, teams, false)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.SetLinkHeader(maxResults, listOptions.PageSize)
+	ctx.SetTotalCountHeader(maxResults)
+	ctx.JSON(http.StatusOK, map[string]any{
+		"ok":   true,
+		"data": apiTeams,
+	})
+}
+
+func ListTeamActivityFeeds(ctx *context.APIContext) {
+	// swagger:operation GET /teams/{id}/activities/feeds organization orgListTeamActivityFeeds
+	// ---
+	// summary: List a team's activity feeds
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: id
+	//   in: path
+	//   description: id of the team
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: date
+	//   in: query
+	//   description: the date of the activities to be found
+	//   type: string
+	//   format: date
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/ActivityFeedsList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	listOptions := utils.GetListOptions(ctx)
+
+	opts := activities_model.GetFeedsOptions{
+		RequestedTeam:  ctx.Org.Team,
+		Actor:          ctx.Doer,
+		IncludePrivate: true,
+		Date:           ctx.FormString("date"),
+		ListOptions:    listOptions,
+	}
+
+	feeds, count, err := feed_service.GetFeeds(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.SetLinkHeader(count, listOptions.PageSize)
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, convert.ToActivities(ctx, feeds, ctx.Doer))
+}

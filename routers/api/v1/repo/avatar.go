@@ -1,0 +1,88 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"encoding/base64"
+	"net/http"
+
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	repo_service "gitea.dev/services/repository"
+)
+
+// UpdateAvatar updates the Avatar of a Repo
+func UpdateAvatar(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/avatar repository repoUpdateAvatar
+	// ---
+	// summary: Update avatar
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/UpdateRepoAvatarOption"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+	form := web.GetForm[*api.UpdateRepoAvatarOption](ctx)
+
+	content, err := base64.StdEncoding.DecodeString(form.Image)
+	if err != nil {
+		ctx.APIError(http.StatusBadRequest, err.Error())
+		return
+	}
+
+	err = repo_service.UploadAvatar(ctx, ctx.Repo.Repository, content)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// DeleteAvatar deletes the Avatar of a Repo
+func DeleteAvatar(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/avatar repository repoDeleteAvatar
+	// ---
+	// summary: Delete avatar
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+	err := repo_service.DeleteAvatar(ctx, ctx.Repo.Repository)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+	}
+
+	ctx.Status(http.StatusNoContent)
+}

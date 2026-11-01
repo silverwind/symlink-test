@@ -1,0 +1,647 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package webhook
+
+import (
+	"testing"
+
+	webhook_model "gitea.dev/models/webhook"
+	api "gitea.dev/modules/structs"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestToHookDelivery(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		payloadVersion int
+		requestContent string
+		body           string
+	}{
+		{"legacy payload", 1, `{"headers":{"Authorization":"stored credential","authorization":"lowercase credential","Content-Type":"application/json"}}`, "payload"},
+		{"recorded body", 1, `{"body":"sent body"}`, "sent body"},
+		{"empty current body", 2, `{}`, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			task := &webhook_model.HookTask{
+				PayloadVersion: test.payloadVersion,
+				PayloadContent: "payload",
+				RequestContent: test.requestContent,
+			}
+			task.AfterLoad()
+			delivery := ToHookDelivery(task)
+			require.NotNil(t, delivery.Request)
+			assert.Equal(t, test.body, delivery.Request.Body)
+			if task.RequestInfo.Headers != nil {
+				assert.Equal(t, map[string]string{
+					"Authorization": "******",
+					"authorization": "******",
+					"Content-Type":  "application/json",
+				}, delivery.Request.Headers)
+				assert.Equal(t, "stored credential", task.RequestInfo.Headers["Authorization"])
+				assert.Equal(t, "lowercase credential", task.RequestInfo.Headers["authorization"])
+			}
+		})
+	}
+}
+
+func createTestPayload() *api.CreatePayload {
+	return &api.CreatePayload{
+		Sha:     "2020558fe2e34debb818a514715839cabd25e777",
+		Ref:     "refs/heads/test",
+		RefType: "branch",
+		Repo: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+	}
+}
+
+func deleteTestPayload() *api.DeletePayload {
+	return &api.DeletePayload{
+		Ref:     "refs/heads/test",
+		RefType: "branch",
+		Repo: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+	}
+}
+
+func forkTestPayload() *api.ForkPayload {
+	return &api.ForkPayload{
+		Forkee: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo2",
+			Name:     "repo2",
+			FullName: "test/repo2",
+		},
+		Repo: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+	}
+}
+
+func pushTestPayload() *api.PushPayload {
+	return pushTestPayloadWithCommitMessage("commit message")
+}
+
+func pushTestMultilineCommitMessagePayload() *api.PushPayload {
+	return pushTestPayloadWithCommitMessage("chore: This is a commit summary\n\nThis is a commit description.")
+}
+
+func pushTestPayloadWithCommitMessage(message string) *api.PushPayload {
+	commit := &api.PayloadCommit{
+		ID:      "2020558fe2e34debb818a514715839cabd25e778",
+		Message: message,
+		URL:     "http://localhost:3000/test/repo/commit/2020558fe2e34debb818a514715839cabd25e778",
+		Author: &api.PayloadUser{
+			Name:     "user1",
+			Email:    "user1@localhost",
+			UserName: "user1",
+		},
+		Committer: &api.PayloadUser{
+			Name:     "user1",
+			Email:    "user1@localhost",
+			UserName: "user1",
+		},
+	}
+
+	return &api.PushPayload{
+		Ref:          "refs/heads/test",
+		Before:       "2020558fe2e34debb818a514715839cabd25e777",
+		After:        "2020558fe2e34debb818a514715839cabd25e778",
+		CompareURL:   "",
+		HeadCommit:   commit,
+		Commits:      []*api.PayloadCommit{commit, commit},
+		TotalCommits: 2,
+		Repo: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Pusher: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+			HTMLURL:   "http://localhost:3000/user1",
+		},
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+			HTMLURL:   "http://localhost:3000/user1",
+		},
+	}
+}
+
+func issueTestPayload() *api.IssuePayload {
+	return &api.IssuePayload{
+		Index: 2,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+			HTMLURL:   "http://localhost:3000/user1",
+		},
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Issue: &api.Issue{
+			ID:      2,
+			Index:   2,
+			URL:     "http://localhost:3000/api/v1/repos/test/repo/issues/2",
+			HTMLURL: "http://localhost:3000/test/repo/issues/2",
+			Title:   "crash",
+			Body:    "issue body",
+			Poster: &api.User{
+				UserName:  "user1",
+				AvatarURL: "http://localhost:3000/user1/avatar",
+			},
+			Assignees: []*api.User{
+				{
+					UserName:  "user1",
+					AvatarURL: "http://localhost:3000/user1/avatar",
+				},
+			},
+			Milestone: &api.Milestone{
+				ID:          1,
+				Title:       "Milestone Title",
+				Description: "Milestone Description",
+			},
+		},
+	}
+}
+
+func issueCommentTestPayload() *api.IssueCommentPayload {
+	return &api.IssueCommentPayload{
+		Action: api.HookIssueCommentCreated,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+			HTMLURL:   "http://localhost:3000/user1",
+		},
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Comment: &api.Comment{
+			HTMLURL:  "http://localhost:3000/test/repo/issues/2#issuecomment-4",
+			IssueURL: "http://localhost:3000/test/repo/issues/2",
+			Body:     "more info needed",
+		},
+		Issue: &api.Issue{
+			ID:      2,
+			Index:   2,
+			URL:     "http://localhost:3000/api/v1/repos/test/repo/issues/2",
+			HTMLURL: "http://localhost:3000/test/repo/issues/2",
+			Title:   "crash",
+			Poster: &api.User{
+				UserName:  "user1",
+				AvatarURL: "http://localhost:3000/user1/avatar",
+			},
+			Body: "this happened",
+		},
+	}
+}
+
+func pullRequestCommentTestPayload() *api.IssueCommentPayload {
+	return &api.IssueCommentPayload{
+		Action: api.HookIssueCommentCreated,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Comment: &api.Comment{
+			HTMLURL: "http://localhost:3000/test/repo/pulls/12#issuecomment-4",
+			PRURL:   "http://localhost:3000/test/repo/pulls/12",
+			Body:    "changes requested",
+		},
+		Issue: &api.Issue{
+			ID:      12,
+			Index:   12,
+			URL:     "http://localhost:3000/api/v1/repos/test/repo/pulls/12",
+			HTMLURL: "http://localhost:3000/test/repo/pulls/12",
+			Title:   "Fix bug",
+			Body:    "fixes bug #2",
+			Poster: &api.User{
+				UserName:  "user1",
+				AvatarURL: "http://localhost:3000/user1/avatar",
+			},
+		},
+		IsPull: true,
+	}
+}
+
+func wikiTestPayload() *api.WikiPayload {
+	return &api.WikiPayload{
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+		Page:    "index",
+		Comment: "Wiki change comment",
+	}
+}
+
+func pullReleaseTestPayload() *api.ReleasePayload {
+	return &api.ReleasePayload{
+		Action: api.HookReleasePublished,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		Release: &api.Release{
+			TagName: "v1.0",
+			Target:  "master",
+			Title:   "First stable release",
+			Note:    "Note of first stable release",
+			HTMLURL: "http://localhost:3000/test/repo/releases/tag/v1.0",
+		},
+	}
+}
+
+func pullRequestTestPayload() *api.PullRequestPayload {
+	return &api.PullRequestPayload{
+		Action: api.HookIssueOpened,
+		Index:  12,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+			HTMLURL:   "http://localhost:3000/user1",
+		},
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+		PullRequest: &api.PullRequest{
+			ID:        12,
+			Index:     12,
+			URL:       "http://localhost:3000/test/repo/pulls/12",
+			HTMLURL:   "http://localhost:3000/test/repo/pulls/12",
+			Title:     "Fix bug",
+			Body:      "fixes bug #2",
+			Mergeable: true,
+			Poster: &api.User{
+				UserName:  "user1",
+				AvatarURL: "http://localhost:3000/user1/avatar",
+			},
+			Assignees: []*api.User{
+				{
+					UserName:  "user1",
+					AvatarURL: "http://localhost:3000/user1/avatar",
+				},
+			},
+			Milestone: &api.Milestone{
+				ID:          1,
+				Title:       "Milestone Title",
+				Description: "Milestone Description",
+			},
+		},
+		Review: &api.ReviewPayload{
+			Content: "good job",
+		},
+	}
+}
+
+func repositoryTestPayload() *api.RepositoryPayload {
+	return &api.RepositoryPayload{
+		Action: api.HookRepoCreated,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+		Repository: &api.Repository{
+			HTMLURL:  "http://localhost:3000/test/repo",
+			Name:     "repo",
+			FullName: "test/repo",
+		},
+	}
+}
+
+func packageTestPayload() *api.PackagePayload {
+	return &api.PackagePayload{
+		Action: api.HookPackageCreated,
+		Sender: &api.User{
+			UserName:  "user1",
+			AvatarURL: "http://localhost:3000/user1/avatar",
+		},
+		Repository: nil,
+		Organization: &api.Organization{
+			Name:      "org1",
+			AvatarURL: "http://localhost:3000/org1/avatar",
+		},
+		Package: &api.Package{
+			Owner: &api.User{
+				UserName:  "user1",
+				AvatarURL: "http://localhost:3000/user1/avatar",
+			},
+			Repository: nil,
+			Creator: &api.User{
+				UserName:  "user1",
+				AvatarURL: "http://localhost:3000/user1/avatar",
+			},
+			Type:    "container",
+			Name:    "GiteaContainer",
+			Version: "latest",
+			HTMLURL: "http://localhost:3000/user1/-/packages/container/GiteaContainer/latest",
+		},
+	}
+}
+
+func TestGetIssuesPayloadInfo(t *testing.T) {
+	issue := issueTestPayload()
+	issue.Changes = &api.ChangesPayload{AddedAssignees: issue.Issue.Assignees}
+	pull := pullRequestTestPayload()
+	pull.Changes = &api.ChangesPayload{AddedAssignees: pull.PullRequest.Assignees}
+
+	cases := []struct {
+		action              api.HookIssueAction
+		issueText           string
+		pullRequestText     string
+		issueMarkdown       string
+		pullRequestMarkdown string
+		issueColor          int
+		pullRequestColor    int
+	}{
+		{
+			api.HookIssueOpened,
+			"[test/repo] Issue opened: #2 crash by user1",
+			"[test/repo] Pull request opened: #12 Fix bug by user1",
+			"issue body", "fixes bug #2",
+			orangeColor, greenColor,
+		},
+		{
+			api.HookIssueClosed,
+			"[test/repo] Issue closed: #2 crash by user1",
+			"[test/repo] Pull request closed: #12 Fix bug by user1",
+			"", "",
+			redColor, redColor,
+		},
+		{
+			api.HookIssueReOpened,
+			"[test/repo] Issue re-opened: #2 crash by user1",
+			"[test/repo] Pull request re-opened: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueEdited,
+			"[test/repo] Issue edited: #2 crash by user1",
+			"[test/repo] Pull request edited: #12 Fix bug by user1",
+			"issue body", "fixes bug #2",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueAssigned,
+			"[test/repo] Issue assigned to user1: #2 crash by user1",
+			"[test/repo] Pull request assigned to user1: #12 Fix bug by user1",
+			"", "",
+			greenColor, greenColor,
+		},
+		{
+			api.HookIssueUnassigned,
+			"[test/repo] Issue unassigned: #2 crash by user1",
+			"[test/repo] Pull request unassigned: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueLabelUpdated,
+			"[test/repo] Issue labels updated: #2 crash by user1",
+			"[test/repo] Pull request labels updated: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueLabelCleared,
+			"[test/repo] Issue labels cleared: #2 crash by user1",
+			"[test/repo] Pull request labels cleared: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueSynchronized,
+			"[test/repo] Issue synchronized: #2 crash by user1",
+			"[test/repo] Pull request synchronized: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueMilestoned,
+			"[test/repo] Issue milestoned to Milestone Title: #2 crash by user1",
+			"[test/repo] Pull request milestoned to Milestone Title: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+		{
+			api.HookIssueDemilestoned,
+			"[test/repo] Issue milestone cleared: #2 crash by user1",
+			"[test/repo] Pull request milestone cleared: #12 Fix bug by user1",
+			"", "",
+			yellowColor, yellowColor,
+		},
+	}
+
+	for i, c := range cases {
+		issue.Action = c.action
+		text, issueTitle, extraMarkdown, color := getIssuesPayloadInfo(issue, noneLinkFormatter, true)
+		assert.Equal(t, c.issueText, text, "case %d", i)
+		assert.Equal(t, "#2 crash", issueTitle, "case %d", i)
+		assert.Equal(t, c.issueMarkdown, extraMarkdown, "case %d", i)
+		assert.Equal(t, c.issueColor, color, "case %d", i)
+
+		pull.Action = c.action
+		text, issueTitle, extraMarkdown, color = getPullRequestPayloadInfo(pull, noneLinkFormatter, true)
+		assert.Equal(t, c.pullRequestText, text, "case %d", i)
+		assert.Equal(t, "#12 Fix bug", issueTitle, "case %d", i)
+		assert.Equal(t, c.pullRequestMarkdown, extraMarkdown, "case %d", i)
+		assert.Equal(t, c.pullRequestColor, color, "case %d", i)
+	}
+}
+
+func TestAssigneeChanges(t *testing.T) {
+	changes := &api.ChangesPayload{
+		AddedAssignees:   []*api.User{{UserName: "user2"}, {UserName: "user3"}},
+		RemovedAssignees: []*api.User{{UserName: "user4"}},
+	}
+	cases := []struct {
+		name      string
+		action    api.HookIssueAction
+		changes   *api.ChangesPayload
+		operation string
+		text      string
+	}{
+		{"assigned", api.HookIssueAssigned, changes, "user1 assign this to user2, user3", "assigned to user2, user3"},
+		{"unassigned", api.HookIssueUnassigned, changes, "user1 unassigned this for user4", "unassigned from user4"},
+		{"assigned without changes", api.HookIssueAssigned, nil, "user1 assigned this", "assigned"},
+		{"unassigned without changes", api.HookIssueUnassigned, nil, "user1 unassigned this for someone", "unassigned"},
+		{"assigned with empty changes", api.HookIssueAssigned, &api.ChangesPayload{}, "user1 assigned this", "assigned"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, assignees := range [][]*api.User{nil, {{UserName: "unrelated"}}} {
+				issue := issueTestPayload()
+				issue.Action = c.action
+				issue.Changes = c.changes
+				issue.Issue.Assignees = assignees
+				_, _, _, _, operation, _ := getIssuesInfo(issue)
+				assert.Equal(t, c.operation, operation)
+				text, _, _, _ := getIssuesPayloadInfo(issue, noneLinkFormatter, true)
+				assert.Equal(t, "[test/repo] Issue "+c.text+": #2 crash by user1", text)
+
+				pull := pullRequestTestPayload()
+				pull.Action = c.action
+				pull.Changes = c.changes
+				pull.PullRequest.Assignees = assignees
+				_, _, _, _, operation, _ = getPullRequestInfo(pull)
+				assert.Equal(t, c.operation, operation)
+				text, _, _, _ = getPullRequestPayloadInfo(pull, noneLinkFormatter, true)
+				assert.Equal(t, "[test/repo] Pull request "+c.text+": #12 Fix bug by user1", text)
+			}
+		})
+	}
+}
+
+func TestGetWikiPayloadInfo(t *testing.T) {
+	p := wikiTestPayload()
+
+	cases := []struct {
+		action api.HookWikiAction
+		text   string
+		color  int
+		link   string
+	}{
+		{
+			api.HookWikiCreated,
+			"[test/repo] New wiki page 'index' (Wiki change comment) by user1",
+			greenColor,
+			"index",
+		},
+		{
+			api.HookWikiEdited,
+			"[test/repo] Wiki page 'index' edited (Wiki change comment) by user1",
+			yellowColor,
+			"index",
+		},
+		{
+			api.HookWikiDeleted,
+			"[test/repo] Wiki page 'index' deleted by user1",
+			redColor,
+			"index",
+		},
+	}
+
+	for i, c := range cases {
+		p.Action = c.action
+		text, color, link := getWikiPayloadInfo(p, noneLinkFormatter, true)
+		assert.Equal(t, c.text, text, "case %d", i)
+		assert.Equal(t, c.color, color, "case %d", i)
+		assert.Equal(t, c.link, link, "case %d", i)
+	}
+}
+
+func TestGetReleasePayloadInfo(t *testing.T) {
+	p := pullReleaseTestPayload()
+	p.Release.Attachments = []*api.Attachment{{}, {}}
+
+	cases := []struct {
+		action api.HookReleaseAction
+		text   string
+		color  int
+	}{
+		{
+			api.HookReleasePublished,
+			"[test/repo] Release created: v1.0 by user1 (assets: 2)",
+			greenColor,
+		},
+		{
+			api.HookReleaseUpdated,
+			"[test/repo] Release updated: v1.0 by user1 (assets: 2)",
+			yellowColor,
+		},
+		{
+			api.HookReleaseDeleted,
+			"[test/repo] Release deleted: v1.0 by user1",
+			redColor,
+		},
+	}
+
+	for i, c := range cases {
+		p.Action = c.action
+		text, color := getReleasePayloadInfo(p, noneLinkFormatter, true)
+		assert.Equal(t, c.text, text, "case %d", i)
+		assert.Equal(t, c.color, color, "case %d", i)
+	}
+}
+
+func TestGetIssueCommentPayloadInfo(t *testing.T) {
+	p := pullRequestCommentTestPayload()
+
+	cases := []struct {
+		action     api.HookIssueCommentAction
+		text       string
+		issueTitle string
+		color      int
+	}{
+		{
+			api.HookIssueCommentCreated,
+			"[test/repo] New comment on pull request #12 Fix bug by user1",
+			"#12 Fix bug",
+			greenColorLight,
+		},
+		{
+			api.HookIssueCommentEdited,
+			"[test/repo] Comment edited on pull request #12 Fix bug by user1",
+			"#12 Fix bug",
+			yellowColor,
+		},
+		{
+			api.HookIssueCommentDeleted,
+			"[test/repo] Comment deleted on pull request #12 Fix bug by user1",
+			"#12 Fix bug",
+			redColor,
+		},
+	}
+
+	for i, c := range cases {
+		p.Action = c.action
+		text, issueTitle, color := getIssueCommentPayloadInfo(p, noneLinkFormatter, true)
+		assert.Equal(t, c.text, text, "case %d", i)
+		assert.Equal(t, c.issueTitle, issueTitle, "case %d", i)
+		assert.Equal(t, c.color, color, "case %d", i)
+	}
+}

@@ -1,0 +1,236 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"html/template"
+	"net/http"
+	"strings"
+
+	"gitea.dev/models/avatars"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+
+	"github.com/sergi/go-diff/diffmatchpatch"
+)
+
+// GetContentHistoryOverview get overview
+func GetContentHistoryOverview(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	editedHistoryCountMap, _ := issues_model.QueryIssueContentHistoryEditedCountMap(ctx, issue.ID)
+	ctx.JSON(http.StatusOK, map[string]any{
+		"i18n": map[string]any{
+			"textEdited":                   ctx.Tr("repo.issues.content_history.edited"),
+			"textDeleteFromHistory":        ctx.Tr("repo.issues.content_history.delete_from_history"),
+			"textDeleteFromHistoryConfirm": ctx.Tr("repo.issues.content_history.delete_from_history_confirm"),
+			"textOptions":                  ctx.Tr("repo.issues.content_history.options"),
+		},
+		"editedHistoryCountMap": editedHistoryCountMap,
+	})
+}
+
+// GetContentHistoryList  get list
+func GetContentHistoryList(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	commentID := ctx.FormInt64("comment_id")
+	items, _ := issues_model.FetchIssueContentHistoryList(ctx, issue.ID, commentID)
+
+	// render history list to HTML for frontend dropdown items: (name, value)
+	// name is HTML of "avatar + userName + userAction + timeSince"
+	// value is historyId
+	var results []map[string]any
+	for _, item := range items {
+		var actionHTML template.HTML
+		if item.IsDeleted {
+			actionHTML = htmlutil.HTMLFormat(`<i data-history-is-deleted="1">%s</i>`, ctx.Locale.TrString("repo.issues.content_history.deleted"))
+		} else if item.IsFirstCreated {
+			actionHTML = ctx.Locale.Tr("repo.issues.content_history.created")
+		} else {
+			actionHTML = ctx.Locale.Tr("repo.issues.content_history.edited")
+		}
+
+		var fullNameHTML template.HTML
+		userName, fullName := item.UserName, strings.TrimSpace(item.UserFullName)
+		if fullName != "" {
+			fullNameHTML = htmlutil.HTMLFormat(` (<span class="tw-inline-flex tw-max-w-[160px]"><span class="gt-ellipsis">%s</span></span>)`, fullName)
+		}
+
+		avatarHTML := templates.AvatarHTML(item.UserAvatarLink, 24, avatars.DefaultAvatarClass+" tw-mr-2", userName)
+		timeSinceHTML := templates.TimeSince(item.EditedUnix)
+		results = append(results, map[string]any{
+			"name":  htmlutil.HTMLFormat("%s <strong>%s</strong>%s %s %s", avatarHTML, userName, fullNameHTML, actionHTML, timeSinceHTML),
+			"value": item.HistoryID,
+		})
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"results": results,
+	})
+}
+
+// canSoftDeleteContentHistory checks whether current user can soft-delete a history revision
+// Admins or owners can always delete history revisions. Normal users can only delete own history revisions.
+func canSoftDeleteContentHistory(ctx *context.Context, issue *issues_model.Issue, comment *issues_model.Comment,
+	history *issues_model.ContentHistory,
+) (canSoftDelete bool) {
+	// CanWrite means the doer can manage the issue/PR list
+	if ctx.Repo.Permission.IsOwner() || ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull) {
+		canSoftDelete = true
+	} else if ctx.Doer != nil {
+		// for read-only users, they could still post issues or comments,
+		// they should be able to delete the history related to their own issue/comment, a case is:
+		// 1. the user posts some sensitive data
+		// 2. then the repo owner edits the post but didn't remove the sensitive data
+		// 3. the poster wants to delete the edited history revision
+		if comment == nil {
+			// the issue poster or the history poster can soft-delete
+			canSoftDelete = ctx.Doer.ID == issue.PosterID || ctx.Doer.ID == history.PosterID
+			canSoftDelete = canSoftDelete && (history.IssueID == issue.ID)
+		} else {
+			// the comment poster or the history poster can soft-delete
+			canSoftDelete = ctx.Doer.ID == comment.PosterID || ctx.Doer.ID == history.PosterID
+			canSoftDelete = canSoftDelete && (history.IssueID == issue.ID)
+			canSoftDelete = canSoftDelete && (history.CommentID == comment.ID)
+		}
+	}
+	return canSoftDelete
+}
+
+func diffContentHistory(oldContent, newContent string) template.HTML {
+	// compare the current history revision with the previous one
+	dmp := diffmatchpatch.New()
+	// `checklines=false` makes better diff result
+	diff := dmp.DiffMain(util.NormalizeStringEOL(oldContent), util.NormalizeStringEOL(newContent), false)
+	diff = dmp.DiffCleanupEfficiency(diff)
+
+	// use chroma to render the diff html
+	buf := &htmlutil.HTMLBuilder{}
+	buf.WriteHTML(`<pre class="chroma">`)
+	for _, it := range diff {
+		switch it.Type {
+		case diffmatchpatch.DiffInsert:
+			buf.WriteHTML(`<span class="gi">`)
+			buf.WriteString(it.Text)
+			buf.WriteHTML("</span>")
+		case diffmatchpatch.DiffDelete:
+			buf.WriteHTML(`<span class="gd">`)
+			buf.WriteString(it.Text)
+			buf.WriteHTML("</span>")
+		default:
+			buf.WriteString(it.Text)
+		}
+	}
+	buf.WriteHTML("</pre>")
+	return buf.HTMLString()
+}
+
+// GetContentHistoryDetail get detail
+func GetContentHistoryDetail(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	historyID := ctx.FormInt64("history_id")
+	history, prevHistory, err := issues_model.GetIssueContentHistoryAndPrev(ctx, issue.ID, historyID)
+	if err != nil {
+		ctx.JSON(http.StatusNotFound, map[string]any{
+			"message": "Can not find the content history",
+		})
+		return
+	}
+
+	// get the related comment if this history revision is for a comment, otherwise the history revision is for an issue.
+	var comment *issues_model.Comment
+	if history.CommentID != 0 {
+		var err error
+		if comment, err = issues_model.GetCommentByID(ctx, history.CommentID); err != nil {
+			log.Error("can not get comment for issue content history %v. err=%v", historyID, err)
+			return
+		}
+	}
+
+	// get the previous history revision (if exists)
+	var prevHistoryID int64
+	var prevHistoryContentText string
+	if prevHistory != nil {
+		prevHistoryID = prevHistory.ID
+		prevHistoryContentText = prevHistory.ContentText
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"canSoftDelete": canSoftDeleteContentHistory(ctx, issue, comment, history),
+		"historyId":     historyID,
+		"prevHistoryId": prevHistoryID,
+		"diffHtml":      diffContentHistory(prevHistoryContentText, history.ContentText),
+	})
+}
+
+// SoftDeleteContentHistory soft delete
+func SoftDeleteContentHistory(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+	if ctx.Doer == nil {
+		ctx.NotFound(nil)
+		return
+	}
+
+	commentID := ctx.FormInt64("comment_id")
+	historyID := ctx.FormInt64("history_id")
+
+	var comment *issues_model.Comment
+	var history *issues_model.ContentHistory
+	var err error
+
+	if history, err = issues_model.GetIssueContentHistoryByID(ctx, historyID); err != nil {
+		log.Error("can not get issue content history %v. err=%v", historyID, err)
+		return
+	}
+	if history.IssueID != issue.ID {
+		ctx.NotFound(issues_model.ErrCommentNotExist{})
+		return
+	}
+	if history.CommentID != commentID {
+		ctx.NotFound(issues_model.ErrCommentNotExist{})
+		return
+	}
+	if commentID != 0 {
+		if comment, err = issues_model.GetCommentByID(ctx, commentID); err != nil {
+			log.Error("can not get comment for issue content history %v. err=%v", historyID, err)
+			return
+		}
+		if comment.IssueID != issue.ID {
+			ctx.NotFound(issues_model.ErrCommentNotExist{})
+			return
+		}
+	}
+
+	canSoftDelete := canSoftDeleteContentHistory(ctx, issue, comment, history)
+	if !canSoftDelete {
+		ctx.JSON(http.StatusForbidden, map[string]any{
+			"message": "Can not delete the content history",
+		})
+		return
+	}
+
+	err = issues_model.SoftDeleteIssueContentHistory(ctx, historyID)
+	log.Debug("soft delete issue content history. issue=%d, comment=%d, history=%d", issue.ID, commentID, historyID)
+	ctx.JSON(http.StatusOK, map[string]any{
+		"ok": err == nil,
+	})
+}

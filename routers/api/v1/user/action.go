@@ -1,0 +1,408 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package user
+
+import (
+	"errors"
+	"net/http"
+
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/shared"
+	"gitea.dev/routers/api/v1/utils"
+	actions_service "gitea.dev/services/actions"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	secret_service "gitea.dev/services/secrets"
+)
+
+// create or update one secret of the user scope
+func CreateOrUpdateSecret(ctx *context.APIContext) {
+	// swagger:operation PUT /user/actions/secrets/{secretname} user updateUserSecret
+	// ---
+	// summary: Create or Update a secret value in a user scope
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: secretname
+	//   in: path
+	//   description: name of the secret
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateOrUpdateSecretOption"
+	// responses:
+	//   "201":
+	//     description: response when creating a secret
+	//   "204":
+	//     description: response when updating a secret
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	opt := web.GetForm[*api.CreateOrUpdateSecretOption](ctx)
+
+	s, created, err := secret_service.CreateOrUpdateSecret(ctx, actions_model.BelongingScopeOwner(ctx.Doer.ID), ctx.PathParam("secretname"), opt.Data, opt.Description)
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	actions := audit.SecretUpdate
+	if created {
+		actions = audit.SecretAdd
+	}
+	audit.RecordScoped(ctx, ctx.Doer, nil, actions, "secret", s.Name)
+
+	if created {
+		ctx.Status(http.StatusCreated)
+	} else {
+		ctx.Status(http.StatusNoContent)
+	}
+}
+
+// DeleteSecret delete one secret of the user scope
+func DeleteSecret(ctx *context.APIContext) {
+	// swagger:operation DELETE /user/actions/secrets/{secretname} user deleteUserSecret
+	// ---
+	// summary: Delete a secret in a user scope
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: secretname
+	//   in: path
+	//   description: name of the secret
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     description: delete one secret of the user
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	s, err := secret_service.DeleteSecretByName(ctx, actions_model.BelongingScopeOwner(ctx.Doer.ID), ctx.PathParam("secretname"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	audit.RecordScoped(ctx, ctx.Doer, nil, audit.SecretRemove, "secret", s.Name)
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// CreateVariable create a user-level variable
+func CreateVariable(ctx *context.APIContext) {
+	// swagger:operation POST /user/actions/variables/{variablename} user createUserVariable
+	// ---
+	// summary: Create a user-level variable
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: variablename
+	//   in: path
+	//   description: name of the variable
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateVariableOption"
+	// responses:
+	//   "201":
+	//     description: successfully created the user-level variable
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	opt := web.GetForm[*api.CreateVariableOption](ctx)
+
+	ownerID := ctx.Doer.ID
+	variableName := ctx.PathParam("variablename")
+
+	v, err := actions_service.GetVariable(ctx, actions_model.FindVariablesOpts{
+		BelongingScope: actions_model.BelongingScopeOwner(ownerID),
+		Name:           variableName,
+	})
+	if err != nil && !errors.Is(err, util.ErrNotExist) {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	if v != nil && v.ID > 0 {
+		ctx.APIError(http.StatusConflict, "variable name already exists")
+		return
+	}
+
+	if _, err := actions_service.CreateVariable(ctx, actions_model.BelongingScopeOwner(ownerID), variableName, opt.Value, opt.Description); err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	ctx.Status(http.StatusCreated)
+}
+
+// UpdateVariable update a user-level variable which is created by current doer
+func UpdateVariable(ctx *context.APIContext) {
+	// swagger:operation PUT /user/actions/variables/{variablename} user updateUserVariable
+	// ---
+	// summary: Update a user-level variable which is created by current doer
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: variablename
+	//   in: path
+	//   description: name of the variable
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/UpdateVariableOption"
+	// responses:
+	//   "201":
+	//     description: response when updating a variable
+	//   "204":
+	//     description: response when updating a variable
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	opt := web.GetForm[*api.UpdateVariableOption](ctx)
+
+	v, err := actions_service.GetVariable(ctx, actions_model.FindVariablesOpts{
+		BelongingScope: actions_model.BelongingScopeOwner(ctx.Doer.ID),
+		Name:           ctx.PathParam("variablename"),
+	})
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	if opt.Name == "" {
+		opt.Name = ctx.PathParam("variablename")
+	}
+
+	v.Name = opt.Name
+	v.Data = opt.Value
+	v.Description = opt.Description
+
+	if _, err := actions_service.UpdateVariableNameData(ctx, v); err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// DeleteVariable delete a user-level variable which is created by current doer
+func DeleteVariable(ctx *context.APIContext) {
+	// swagger:operation DELETE /user/actions/variables/{variablename} user deleteUserVariable
+	// ---
+	// summary: Delete a user-level variable which is created by current doer
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: variablename
+	//   in: path
+	//   description: name of the variable
+	//   type: string
+	//   required: true
+	// responses:
+	//   "201":
+	//     description: response when deleting a variable
+	//   "204":
+	//     description: response when deleting a variable
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if err := actions_service.DeleteVariableByName(ctx, actions_model.BelongingScopeOwner(ctx.Doer.ID), ctx.PathParam("variablename")); err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// GetVariable get a user-level variable which is created by current doer
+func GetVariable(ctx *context.APIContext) {
+	// swagger:operation GET /user/actions/variables/{variablename} user getUserVariable
+	// ---
+	// summary: Get a user-level variable which is created by current doer
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: variablename
+	//   in: path
+	//   description: name of the variable
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//			"$ref": "#/responses/ActionVariable"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	v, err := actions_service.GetVariable(ctx, actions_model.FindVariablesOpts{
+		BelongingScope: actions_model.BelongingScopeOwner(ctx.Doer.ID),
+		Name:           ctx.PathParam("variablename"),
+	})
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	variable := &api.ActionVariable{
+		OwnerID:     v.OwnerID,
+		RepoID:      v.RepoID,
+		Name:        v.Name,
+		Data:        v.Data,
+		Description: v.Description,
+	}
+
+	ctx.JSON(http.StatusOK, variable)
+}
+
+// ListVariables list user-level variables
+func ListVariables(ctx *context.APIContext) {
+	// swagger:operation GET /user/actions/variables user getUserVariablesList
+	// ---
+	// summary: Get the user-level list of variables which is created by current doer
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//			"$ref": "#/responses/VariableList"
+	//   default:
+	//     "$ref": "#/responses/error"
+	listOptions := utils.GetListOptions(ctx)
+	vars, count, err := db.FindAndCount[actions_model.ActionVariable](ctx, &actions_model.FindVariablesOpts{
+		BelongingScope: actions_model.BelongingScopeOwner(ctx.Doer.ID),
+		ListOptions:    listOptions,
+	})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	variables := make([]*api.ActionVariable, len(vars))
+	for i, v := range vars {
+		variables[i] = &api.ActionVariable{
+			OwnerID:     v.OwnerID,
+			RepoID:      v.RepoID,
+			Name:        v.Name,
+			Data:        v.Data,
+			Description: v.Description,
+		}
+	}
+
+	ctx.SetLinkHeader(count, listOptions.PageSize)
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, variables)
+}
+
+// ListWorkflowRuns lists workflow runs
+func ListWorkflowRuns(ctx *context.APIContext) {
+	// swagger:operation GET /user/actions/runs user getUserWorkflowRuns
+	// ---
+	// summary: Get workflow runs
+	// parameters:
+	// - name: event
+	//   in: query
+	//   description: workflow event name
+	//   type: string
+	//   required: false
+	// - name: branch
+	//   in: query
+	//   description: workflow branch
+	//   type: string
+	//   required: false
+	// - name: status
+	//   in: query
+	//   description: workflow status (requested, pending, queued, in_progress, failure, success, skipped)
+	//   type: string
+	//   required: false
+	// - name: actor
+	//   in: query
+	//   description: triggered by user
+	//   type: string
+	//   required: false
+	// - name: head_sha
+	//   in: query
+	//   description: triggering sha of the workflow run
+	//   type: string
+	//   required: false
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WorkflowRunsList"
+	//   default:
+	//     "$ref": "#/responses/error"
+	shared.ListRuns(ctx, ctx.Doer.ID, 0, "")
+}
+
+// ListWorkflowJobs lists workflow jobs
+func ListWorkflowJobs(ctx *context.APIContext) {
+	// swagger:operation GET /user/actions/jobs user getUserWorkflowJobs
+	// ---
+	// summary: Get workflow jobs
+	// parameters:
+	// - name: status
+	//   in: query
+	//   description: workflow status (requested, pending, queued, in_progress, failure, success, skipped)
+	//   type: string
+	//   required: false
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// - name: sort
+	//   in: query
+	//   description: sort jobs by attribute. Supported values are "id". Default is "id"
+	//   type: string
+	// - name: order
+	//   in: query
+	//   description: sort order, either "asc" (ascending) or "desc" (descending). Default is "asc"
+	//   type: string
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WorkflowJobsList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	shared.ListJobs(ctx, ctx.Doer.ID, 0, 0, nil)
+}

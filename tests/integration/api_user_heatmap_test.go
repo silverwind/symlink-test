@@ -1,0 +1,38 @@
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	activities_model "gitea.dev/models/activities"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestUserHeatmap(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	adminUsername := "user1"
+	normalUsername := "user2"
+	token := getUserToken(t, adminUsername, auth_model.AccessTokenScopeAll)
+
+	fakeNow := time.Date(2011, 10, 20, 0, 0, 0, 0, time.Local)
+	timeutil.MockSet(fakeNow)
+	defer timeutil.MockUnset()
+
+	req := NewRequest(t, "GET", fmt.Sprintf("/api/v1/users/%s/heatmap", normalUsername)).
+		AddTokenAuth(token)
+	resp := MakeRequest(t, req, http.StatusOK)
+	heatmap := DecodeJSON(t, resp, []*activities_model.UserHeatmapData{})
+	var dummyheatmap []*activities_model.UserHeatmapData
+	dummyheatmap = append(dummyheatmap, &activities_model.UserHeatmapData{Timestamp: 1603227600, Contributions: 1})
+
+	assert.Equal(t, dummyheatmap, heatmap)
+}

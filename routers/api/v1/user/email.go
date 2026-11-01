@@ -1,0 +1,127 @@
+// Copyright 2015 The Gogs Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package user
+
+import (
+	"net/http"
+
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	user_service "gitea.dev/services/user"
+)
+
+// ListEmails list all of the authenticated user's email addresses
+// see https://github.com/gogits/go-gogs-client/wiki/Users-Emails#list-email-addresses-for-a-user
+func ListEmails(ctx *context.APIContext) {
+	// swagger:operation GET /user/emails user userListEmails
+	// ---
+	// summary: List the authenticated user's email addresses
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/EmailList"
+
+	emails, err := user_model.GetEmailAddresses(ctx, ctx.Doer.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	apiEmails := make([]*api.Email, len(emails))
+	for i := range emails {
+		apiEmails[i] = convert.ToEmail(emails[i])
+	}
+	ctx.JSON(http.StatusOK, &apiEmails)
+}
+
+// AddEmail add an email address
+func AddEmail(ctx *context.APIContext) {
+	// swagger:operation POST /user/emails user userAddEmail
+	// ---
+	// summary: Add email addresses
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateEmailOption"
+	// responses:
+	//   '201':
+	//     "$ref": "#/responses/EmailList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureManageCredentials) {
+		ctx.APIErrorNotFound("emails are not allowed to be changed")
+		return
+	}
+
+	form := web.GetForm[*api.CreateEmailOption](ctx)
+	if len(form.Emails) == 0 {
+		ctx.APIError(http.StatusUnprocessableEntity, "Email list empty")
+		return
+	}
+
+	if err := user_service.AddEmailAddresses(ctx, ctx.Doer, form.Emails); err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	emails, err := user_model.GetEmailAddresses(ctx, ctx.Doer.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiEmails := make([]*api.Email, 0, len(emails))
+	for _, email := range emails {
+		apiEmails = append(apiEmails, convert.ToEmail(email))
+	}
+	ctx.JSON(http.StatusCreated, apiEmails)
+}
+
+// DeleteEmail delete email
+func DeleteEmail(ctx *context.APIContext) {
+	// swagger:operation DELETE /user/emails user userDeleteEmail
+	// ---
+	// summary: Delete email addresses
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/DeleteEmailOption"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureManageCredentials) {
+		ctx.APIErrorNotFound("emails are not allowed to be changed")
+		return
+	}
+
+	form := web.GetForm[*api.DeleteEmailOption](ctx)
+	if len(form.Emails) == 0 {
+		ctx.Status(http.StatusNoContent)
+		return
+	}
+
+	if err := user_service.DeleteEmailAddresses(ctx, ctx.Doer, form.Emails); err != nil {
+		if user_model.IsErrEmailAddressNotExist(err) {
+			ctx.APIError(http.StatusNotFound, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}

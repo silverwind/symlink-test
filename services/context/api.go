@@ -1,0 +1,287 @@
+// Copyright 2016 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package context
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/paginator"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	web_types "gitea.dev/modules/web/types"
+)
+
+// APIContext is a specific context for API service
+// ATTENTION: This struct should never be manually constructed in routes/services,
+// it has many internal details which should be carefully prepared by the framework.
+// If it is abused, it would cause strange bugs like panic/resource-leak.
+type APIContext struct {
+	*Base
+
+	Cache cache.StringCache
+
+	Doer        *user_model.User // current signed-in user
+	IsSigned    bool
+	IsBasicAuth bool
+
+	ContextUser *user_model.User // the user which is being visited, in most cases it differs from Doer
+
+	Repo    *Repository
+	Org     *APIOrganization
+	Package *Package
+}
+
+func init() {
+	web.RegisterResponseStatusProvider[*APIContext](func(req *http.Request) web_types.ResponseStatusProvider {
+		return GetAPIContext(req)
+	})
+}
+
+// Currently, we have the following common fields in error response:
+// * message: the message for end users (it shouldn't be used for error type detection)
+//            if we need to indicate some errors, we should introduce some new fields like ErrorCode or ErrorType
+// * url:     the swagger document URL
+
+// APIError is error format response
+// swagger:response error
+type APIError struct {
+	Message string `json:"message"`
+	URL     string `json:"url"`
+}
+
+// APIEmpty is an empty response
+// swagger:response empty
+type APIEmpty struct{}
+
+// APIString is a string response
+// swagger:response string
+type APIString string
+
+// APIErrorInternal responds with error message, status is 500
+func (ctx *APIContext) APIErrorInternal(err error) {
+	ctx.apiErrorInternal(1, err)
+}
+
+func (ctx *APIContext) apiErrorInternal(skip int, err error) {
+	log.ErrorWithSkip(skip+1, "InternalServerError: %v", err)
+
+	var message string
+	if !setting.IsProd || (ctx.Doer != nil && ctx.Doer.IsAdmin) {
+		message = err.Error()
+	}
+
+	ctx.JSON(http.StatusInternalServerError, APIError{
+		Message: message,
+		URL:     setting.API.SwaggerURL,
+	})
+}
+
+// APIErrorNotFound handles 404s for APIContext
+func (ctx *APIContext) APIErrorNotFound(msg ...string) {
+	ctx.JSON(http.StatusNotFound, APIError{
+		Message: util.OptionalArg(msg, "not found"),
+		URL:     setting.API.SwaggerURL,
+	})
+}
+
+// APIError responds with an error message to client.
+// If status is 500, also it prints error to log.
+func (ctx *APIContext) APIError(status int, msg string) {
+	message := msg
+	if status == http.StatusInternalServerError {
+		log.ErrorWithSkip(1, "APIError: %s", message)
+
+		if setting.IsProd && !(ctx.Doer != nil && ctx.Doer.IsAdmin) {
+			message = ""
+		}
+	}
+
+	ctx.JSON(status, APIError{
+		Message: message,
+		URL:     setting.API.SwaggerURL,
+	})
+}
+
+// APIErrorAuto use error check function to determine the response code
+func (ctx *APIContext) APIErrorAuto(err error) {
+	if errMsg, code := util.ErrorUnwrapForUser(err); errMsg != "" {
+		ctx.APIError(code, errMsg)
+		return
+	}
+	ctx.apiErrorInternal(1, err)
+}
+
+type apiContextKeyType struct{}
+
+var apiContextKey = apiContextKeyType{}
+
+// GetAPIContext returns a context for API routes
+func GetAPIContext(req *http.Request) *APIContext {
+	return reqctx.MustContextValue[*APIContext](req.Context(), apiContextKey)
+}
+
+func genAPILinks(curURL *url.URL, total int64, pageSize, curPage int) []string {
+	p := paginator.New(int(total), pageSize, curPage, 0)
+	links := make([]string, 0, 4)
+
+	if p.HasNext() {
+		u := *curURL
+		queries := u.Query()
+		queries.Set("page", strconv.Itoa(p.Next()))
+		u.RawQuery = queries.Encode()
+
+		links = append(links, fmt.Sprintf("<%s%s>; rel=\"next\"", setting.AppURL, u.RequestURI()[1:]))
+	}
+	if !p.IsLast() {
+		u := *curURL
+		queries := u.Query()
+		queries.Set("page", strconv.Itoa(p.TotalPages()))
+		u.RawQuery = queries.Encode()
+
+		links = append(links, fmt.Sprintf("<%s%s>; rel=\"last\"", setting.AppURL, u.RequestURI()[1:]))
+	}
+	if !p.IsFirst() {
+		u := *curURL
+		queries := u.Query()
+		queries.Set("page", "1")
+		u.RawQuery = queries.Encode()
+
+		links = append(links, fmt.Sprintf("<%s%s>; rel=\"first\"", setting.AppURL, u.RequestURI()[1:]))
+	}
+	if p.HasPrevious() {
+		u := *curURL
+		queries := u.Query()
+		queries.Set("page", strconv.Itoa(p.Previous()))
+		u.RawQuery = queries.Encode()
+
+		links = append(links, fmt.Sprintf("<%s%s>; rel=\"prev\"", setting.AppURL, u.RequestURI()[1:]))
+	}
+	return links
+}
+
+// SetLinkHeader sets pagination link header by given total number and page size.
+// "count" is usually from database result "count int64", so it also uses int64,
+func (ctx *APIContext) SetLinkHeader(total int64, pageSize int) {
+	links := genAPILinks(ctx.Req.URL, total, pageSize, ctx.FormInt("page"))
+
+	if len(links) > 0 {
+		ctx.RespHeader().Set("Link", strings.Join(links, ","))
+		ctx.AppendAccessControlExposeHeaders("Link")
+	}
+}
+
+// APIContexter returns APIContext middleware
+func APIContexter() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			base := NewBaseContext(w, req)
+			ctx := &APIContext{
+				Base:  base,
+				Cache: cache.GetCache(),
+				Repo:  &Repository{},
+				Org:   &APIOrganization{},
+			}
+			ctx.SetContextValue(apiContextKey, ctx)
+			httplib.MarkRequestSupportPublicURL(ctx)
+
+			// FIXME: GLOBAL-PARSE-FORM: see more details in another FIXME comment
+			if ctx.Req.Method == http.MethodPost && strings.Contains(ctx.Req.Header.Get("Content-Type"), "multipart/form-data") {
+				if !ctx.ParseMultipartForm() {
+					return
+				}
+			}
+
+			httpcache.SetCacheControlInHeader(ctx.Resp.Header(), &httpcache.CacheControlOptions{})
+			next.ServeHTTP(ctx.Resp, ctx.Req)
+		})
+	}
+}
+
+// ReferencesGitRepo injects the GitRepo into the Context
+// you can optional skip the IsEmpty check
+func ReferencesGitRepo(allowEmpty ...bool) func(ctx *APIContext) {
+	return func(ctx *APIContext) {
+		// Empty repository does not have reference information.
+		if ctx.Repo.Repository.IsEmpty && !(len(allowEmpty) != 0 && allowEmpty[0]) {
+			return
+		}
+
+		// For API calls.
+		if ctx.Repo.GitRepo == nil {
+			var err error
+			ctx.Repo.GitRepo, err = git.RepositoryFromRequestContextOrOpen(ctx, ctx.Repo.Repository)
+			if err != nil {
+				ctx.APIErrorInternal(err)
+				return
+			}
+		}
+	}
+}
+
+// RepoRefForAPI handles repository reference names when the ref name is not explicitly given
+func RepoRefForAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := GetAPIContext(req)
+
+		if ctx.Repo.Repository.IsEmpty {
+			ctx.APIErrorNotFound("repository is empty")
+			return
+		}
+
+		if ctx.Repo.GitRepo == nil {
+			panic("no GitRepo, forgot to call the middleware?") // it is a programming error
+		}
+
+		refName, refType, _ := getRefNameLegacy(ctx.Base, ctx.Repo, ctx.PathParam("*"), ctx.FormTrim("ref"))
+		var err error
+		switch refType {
+		case git.RefTypeBranch:
+			ctx.Repo.Commit, err = ctx.Repo.GitRepo.GetBranchCommit(ctx, refName)
+		case git.RefTypeTag:
+			ctx.Repo.Commit, err = ctx.Repo.GitRepo.GetTagCommit(ctx, refName)
+		case git.RefTypeCommit:
+			ctx.Repo.Commit, err = ctx.Repo.GitRepo.GetCommit(ctx, refName)
+		}
+		if ctx.Repo.Commit == nil || errors.Is(err, util.ErrNotExist) {
+			ctx.APIErrorNotFound("unable to find a git ref")
+			return
+		} else if err != nil {
+			ctx.APIErrorInternal(err)
+			return
+		}
+		ctx.Repo.CommitID = ctx.Repo.Commit.ID.String()
+		next.ServeHTTP(w, req)
+	})
+}
+
+// IsUserSiteAdmin returns true if current user is a site admin
+func (ctx *APIContext) IsUserSiteAdmin() bool {
+	return ctx.IsSigned && ctx.Doer.IsAdmin
+}
+
+// IsUserRepoAdmin returns true if current user is admin in current repo
+func (ctx *APIContext) IsUserRepoAdmin() bool {
+	return ctx.Repo.Permission.IsAdmin()
+}
+
+// IsUserRepoWriter returns true if current user has "write" privilege in current repo
+func (ctx *APIContext) IsUserRepoWriter(unitTypes []unit.Type) bool {
+	return slices.ContainsFunc(unitTypes, ctx.Repo.Permission.CanWrite)
+}

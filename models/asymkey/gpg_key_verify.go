@@ -1,0 +1,86 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package asymkey
+
+import (
+	"context"
+	"strconv"
+	"time"
+
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/log"
+)
+
+// This file provides functions relating verifying gpg keys
+
+// VerifyGPGKey marks a GPG key as verified
+func VerifyGPGKey(ctx context.Context, ownerID int64, keyID, token, signature string) (string, error) {
+	return db.WithTx2(ctx, func(ctx context.Context) (string, error) {
+		key := new(GPGKey)
+
+		has, err := db.GetEngine(ctx).Where("owner_id = ? AND key_id = ?", ownerID, keyID).Get(key)
+		if err != nil {
+			return "", err
+		} else if !has {
+			return "", ErrGPGKeyNotExist{}
+		}
+
+		if err := key.LoadSubKeys(ctx); err != nil {
+			return "", err
+		}
+
+		sig, err := ExtractSignature(signature)
+		if err != nil {
+			return "", ErrGPGInvalidTokenSignature{
+				ID:      key.KeyID,
+				Wrapped: err,
+			}
+		}
+
+		var signer *GPGKey
+		for _, tokenCandidate := range []string{token, token + "\n", token + "\n\n", token + "\r\n", token + "\r\n\r\n"} {
+			signer, err = hashAndVerifyWithSubKeys(sig, tokenCandidate, key)
+			if err != nil {
+				return "", ErrGPGInvalidTokenSignature{
+					ID:      key.KeyID,
+					Wrapped: err,
+				}
+			}
+			if signer != nil {
+				break
+			}
+		}
+
+		if signer == nil {
+			log.Debug("VerifyGPGKey failed: no signer")
+			return "", ErrGPGInvalidTokenSignature{
+				ID: key.KeyID,
+			}
+		}
+
+		if signer.PrimaryKeyID != key.KeyID && signer.KeyID != key.KeyID {
+			return "", ErrGPGKeyNotExist{}
+		}
+
+		key.Verified = true
+		if _, err := db.GetEngine(ctx).ID(key.ID).Cols("verified").Update(key); err != nil {
+			return "", err
+		}
+
+		return key.KeyID, nil
+	})
+}
+
+// VerificationToken returns token for the user that will be valid in minutes (time)
+func VerificationToken(user *user_model.User, minutes int) string {
+	return base.EncodeSha256(
+		time.Now().Truncate(1*time.Minute).Add(time.Duration(minutes)*time.Minute).Format(
+			time.RFC1123Z) + ":" +
+			user.CreatedUnix.Format(time.RFC1123Z) + ":" +
+			user.Name + ":" +
+			user.Email + ":" +
+			strconv.FormatInt(user.ID, 10))
+}

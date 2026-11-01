@@ -1,0 +1,47 @@
+/* These are the remnants of the fomantic comment module */
+/* TODO: remove all of these rules */
+
+.ui.comments {
+  margin: 1.5em 0;
+}
+
+.ui.comments:first-child {
+  margin-top: 0;
+}
+
+.ui.comments:last-child {
+  margin-bottom: 0;
+}
+
+.ui.comments .comment {
+  display: flex;
+  position: relative;
+  background: none;
+  margin: 3px 0 0;
+  padding: 0.5em 0 0;
+  border: none;
+  border-top: none;
+}
+
+.edit-content-zone .comment {
+  flex-direction: column;
+}
+
+.ui.comments .comment:first-child {
+  margin-top: 0;
+  padding-top: 0;
+}
+
+.ui.comments .comment > .content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.ui.comments .comment .text {
+  margin: 0.25em 0 0.5em;
+  font-size: 1em;
+  overflow-wrap: break-word;
+  line-height: 1.3;
+}

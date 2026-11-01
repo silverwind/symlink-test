@@ -1,0 +1,643 @@
+// Copyright 2015 The Gogs Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"net/http"
+
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/optional"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	issue_service "gitea.dev/services/issue"
+)
+
+// ListIssueComments list all the comments of an issue
+func ListIssueComments(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/comments issue issueGetComments
+	// ---
+	// summary: List all comments on an issue
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: since
+	//   in: query
+	//   description: if provided, only comments updated since the specified time are returned.
+	//   type: string
+	//   format: date-time
+	// - name: before
+	//   in: query
+	//   description: if provided, only comments updated before the provided time are returned.
+	//   type: string
+	//   format: date-time
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/CommentList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	before, since, err := context.GetQueryBeforeSince(ctx.Base)
+	if err != nil {
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	opts := &issues_model.FindCommentsOptions{
+		IssueID: issue.ID,
+		Since:   since,
+		Before:  before,
+		Type:    issues_model.CommentTypeComment,
+	}
+
+	comments, err := issues_model.FindComments(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	totalCount, err := issues_model.CountComments(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if err := comments.LoadPosters(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if err := comments.LoadAttachments(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiComments := make([]*api.Comment, len(comments))
+	for i, comment := range comments {
+		comment.Issue = issue
+		apiComments[i] = convert.ToAPIComment(ctx, ctx.Repo.Repository, comments[i])
+	}
+
+	ctx.SetTotalCountHeader(totalCount)
+	ctx.JSON(http.StatusOK, &apiComments)
+}
+
+// ListIssueCommentsAndTimeline list all the comments and events of an issue
+func ListIssueCommentsAndTimeline(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/timeline issue issueGetCommentsAndTimeline
+	// ---
+	// summary: List all comments and events on an issue
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: since
+	//   in: query
+	//   description: if provided, only comments updated since the specified time are returned.
+	//   type: string
+	//   format: date-time
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// - name: before
+	//   in: query
+	//   description: if provided, only comments updated before the provided time are returned.
+	//   type: string
+	//   format: date-time
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/TimelineList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	before, since, err := context.GetQueryBeforeSince(ctx.Base)
+	if err != nil {
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	opts := &issues_model.FindCommentsOptions{
+		ListOptions: utils.GetListOptions(ctx),
+		IssueID:     issue.ID,
+		Since:       since,
+		Before:      before,
+		Type:        issues_model.CommentTypeUndefined,
+	}
+
+	comments, err := issues_model.FindComments(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if err := comments.LoadPosters(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	if comments, err = issue_service.FilterReadableComments(ctx, ctx.Doer, ctx.Repo.Permission, issue, comments); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	var apiComments []*api.TimelineComment
+	for _, comment := range comments {
+		if comment.Type != issues_model.CommentTypeCode {
+			comment.Issue = issue
+			apiComments = append(apiComments, convert.ToTimelineComment(ctx, issue.Repo, comment, ctx.Doer))
+		}
+	}
+
+	ctx.SetTotalCountHeader(int64(len(apiComments)))
+	ctx.JSON(http.StatusOK, &apiComments)
+}
+
+// ListRepoIssueComments returns all issue-comments for a repo
+func ListRepoIssueComments(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/comments issue issueGetRepoComments
+	// ---
+	// summary: List all comments in a repository
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: since
+	//   in: query
+	//   description: if provided, only comments updated since the provided time are returned.
+	//   type: string
+	//   format: date-time
+	// - name: before
+	//   in: query
+	//   description: if provided, only comments updated before the provided time are returned.
+	//   type: string
+	//   format: date-time
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/CommentList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	before, since, err := context.GetQueryBeforeSince(ctx.Base)
+	if err != nil {
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	var isPull optional.Option[bool]
+	canReadIssue := ctx.Repo.Permission.CanRead(unit.TypeIssues)
+	canReadPull := ctx.Repo.Permission.CanRead(unit.TypePullRequests)
+	if canReadIssue && canReadPull {
+		isPull = optional.None[bool]()
+	} else if canReadIssue {
+		isPull = optional.Some(false)
+	} else if canReadPull {
+		isPull = optional.Some(true)
+	} else {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	opts := &issues_model.FindCommentsOptions{
+		ListOptions: utils.GetListOptions(ctx),
+		RepoID:      ctx.Repo.Repository.ID,
+		Type:        issues_model.CommentTypeComment,
+		Since:       since,
+		Before:      before,
+		IsPull:      isPull,
+	}
+
+	comments, err := issues_model.FindComments(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	totalCount, err := issues_model.CountComments(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if err = comments.LoadPosters(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiComments := make([]*api.Comment, len(comments))
+	if err := comments.LoadIssues(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	if err := comments.LoadAttachments(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	if _, err := comments.Issues().LoadRepositories(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	for i := range comments {
+		apiComments[i] = convert.ToAPIComment(ctx, ctx.Repo.Repository, comments[i])
+	}
+
+	ctx.SetTotalCountHeader(totalCount)
+	ctx.JSON(http.StatusOK, &apiComments)
+}
+
+// CreateIssueComment create a comment for an issue
+func CreateIssueComment(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/issues/{index}/comments issue issueCreateComment
+	// ---
+	// summary: Add a comment to an issue
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateIssueCommentOption"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Comment"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.CreateIssueCommentOption](ctx)
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	if isIssueLockedForDoer(ctx, issue) {
+		return
+	}
+
+	comment, err := issue_service.CreateIssueComment(ctx, ctx.Doer, ctx.Repo.Repository, issue, form.Body, nil)
+	if err != nil {
+		if errors.Is(err, user_model.ErrBlockedUser) {
+			ctx.APIError(http.StatusForbidden, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIComment(ctx, ctx.Repo.Repository, comment))
+}
+
+// GetIssueComment Get a comment by ID
+func GetIssueComment(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/comments/{id} issue issueGetComment
+	// ---
+	// summary: Get a comment
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: id
+	//   in: path
+	//   description: id of the comment
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Comment"
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	comment, err := issues_model.GetCommentWithRepoID(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("id"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	if !ctx.Repo.Permission.CanReadIssuesOrPulls(comment.Issue.IsPull) {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	if comment.Type != issues_model.CommentTypeComment {
+		ctx.Status(http.StatusNoContent)
+		return
+	}
+
+	if err := comment.LoadPoster(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToAPIComment(ctx, ctx.Repo.Repository, comment))
+}
+
+// EditIssueComment modify a comment of an issue
+func EditIssueComment(ctx *context.APIContext) {
+	// swagger:operation PATCH /repos/{owner}/{repo}/issues/comments/{id} issue issueEditComment
+	// ---
+	// summary: Edit a comment
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: id
+	//   in: path
+	//   description: id of the comment to edit
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/EditIssueCommentOption"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Comment"
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.EditIssueCommentOption](ctx)
+	editIssueComment(ctx, *form)
+}
+
+// EditIssueCommentDeprecated modify a comment of an issue
+func EditIssueCommentDeprecated(ctx *context.APIContext) {
+	// swagger:operation PATCH /repos/{owner}/{repo}/issues/{index}/comments/{id} issue issueEditCommentDeprecated
+	// ---
+	// summary: Edit a comment
+	// deprecated: true
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: this parameter is ignored
+	//   type: integer
+	//   required: true
+	// - name: id
+	//   in: path
+	//   description: id of the comment to edit
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/EditIssueCommentOption"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Comment"
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.EditIssueCommentOption](ctx)
+	editIssueComment(ctx, *form)
+}
+
+func editIssueComment(ctx *context.APIContext, form api.EditIssueCommentOption) {
+	comment, err := issues_model.GetCommentWithRepoID(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("id"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+	if !issue_service.CanSelfChangeOrAccessContent(ctx.Doer, ctx.Repo.Permission, comment.Issue, comment.PosterID, perm.AccessModeWrite) {
+		ctx.Status(http.StatusForbidden)
+		return
+	}
+
+	if !comment.Type.HasContentSupport() {
+		ctx.Status(http.StatusNoContent)
+		return
+	}
+
+	if form.Body != comment.Content {
+		oldContent := comment.Content
+		comment.Content = form.Body
+		if err := issue_service.UpdateComment(ctx, comment, comment.ContentVersion, ctx.Doer, oldContent); err != nil {
+			if errors.Is(err, user_model.ErrBlockedUser) {
+				ctx.APIError(http.StatusForbidden, err.Error())
+			} else {
+				ctx.APIErrorInternal(err)
+			}
+			return
+		}
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToAPIComment(ctx, ctx.Repo.Repository, comment))
+}
+
+// DeleteIssueComment delete a comment from an issue
+func DeleteIssueComment(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/comments/{id} issue issueDeleteComment
+	// ---
+	// summary: Delete a comment
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: id
+	//   in: path
+	//   description: id of comment to delete
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	deleteIssueComment(ctx)
+}
+
+// DeleteIssueCommentDeprecated delete a comment from an issue
+func DeleteIssueCommentDeprecated(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/{index}/comments/{id} issue issueDeleteCommentDeprecated
+	// ---
+	// summary: Delete a comment
+	// deprecated: true
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: this parameter is ignored
+	//   type: integer
+	//   required: true
+	// - name: id
+	//   in: path
+	//   description: id of comment to delete
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	deleteIssueComment(ctx)
+}
+
+func deleteIssueComment(ctx *context.APIContext) {
+	comment, err := issues_model.GetCommentWithRepoID(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("id"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+	if !issue_service.CanSelfChangeOrAccessContent(ctx.Doer, ctx.Repo.Permission, comment.Issue, comment.PosterID, perm.AccessModeWrite) {
+		ctx.Status(http.StatusForbidden)
+		return
+	}
+	if !comment.Type.HasContentSupport() {
+		ctx.Status(http.StatusBadRequest)
+		return
+	}
+
+	if err = issue_service.DeleteComment(ctx, ctx.Doer, comment); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}

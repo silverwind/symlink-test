@@ -1,0 +1,147 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package template
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"strconv"
+
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+
+	"go.yaml.in/yaml/v4"
+)
+
+// CouldBe indicates a file with the filename could be a template,
+// it is a low cost check before further processing.
+func CouldBe(filename string) bool {
+	it := &api.IssueTemplate{
+		FileName: filename,
+	}
+	return it.Type() != ""
+}
+
+// Unmarshal parses out a valid template from the content
+func Unmarshal(filename string, content []byte) (*api.IssueTemplate, error) {
+	it, err := unmarshal(filename, content)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := Validate(it); err != nil {
+		return nil, err
+	}
+
+	return it, nil
+}
+
+// UnmarshalFromEntry parses out a valid template from the blob in entry
+func UnmarshalFromEntry(ctx context.Context, gitRepo *git.Repository, entry *git.TreeEntry, dir string) (*api.IssueTemplate, error) {
+	return unmarshalFromEntry(ctx, gitRepo, entry, path.Join(dir, entry.Name())) // Filepaths in Git are ALWAYS '/' separated do not use filepath here
+}
+
+// UnmarshalFromCommit parses out a valid template from the commit
+func UnmarshalFromCommit(ctx context.Context, gitRepo *git.Repository, commit *git.Commit, filename string) (*api.IssueTemplate, error) {
+	entry, err := commit.GetTreeEntryByPath(ctx, gitRepo, filename)
+	if err != nil {
+		return nil, fmt.Errorf("get entry for %q: %w", filename, err)
+	}
+	return unmarshalFromEntry(ctx, gitRepo, entry, filename)
+}
+
+// UnmarshalFromRepo parses out a valid template from the head commit of the branch
+func UnmarshalFromRepo(ctx context.Context, repo *git.Repository, branch, filename string) (*api.IssueTemplate, error) {
+	commit, err := repo.GetBranchCommit(ctx, branch)
+	if err != nil {
+		return nil, fmt.Errorf("get commit on branch %q: %w", branch, err)
+	}
+
+	return UnmarshalFromCommit(ctx, repo, commit, filename)
+}
+
+func unmarshalFromEntry(ctx context.Context, gitRepo *git.Repository, entry *git.TreeEntry, filename string) (*api.IssueTemplate, error) {
+	if size := entry.Blob(gitRepo).Size(ctx); size > setting.UI.MaxDisplayFileSize {
+		return nil, fmt.Errorf("too large: %v > MaxDisplayFileSize", size)
+	}
+
+	r, err := entry.Blob(gitRepo).DataAsync(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("data async: %w", err)
+	}
+	defer r.Close()
+
+	content, err := util.ReadWithLimit(r, 1024*1024)
+	if err != nil {
+		return nil, fmt.Errorf("read all: %w", err)
+	}
+
+	return Unmarshal(filename, content)
+}
+
+func unmarshal(filename string, content []byte) (*api.IssueTemplate, error) {
+	it := &api.IssueTemplate{
+		FileName: filename,
+	}
+
+	// Compatible with treating description as about
+	compatibleTemplate := &struct {
+		About string `yaml:"description"`
+	}{}
+
+	if typ := it.Type(); typ == api.IssueTemplateTypeMarkdown {
+		if templateBody, err := markdown.ExtractMetadata(string(content), it); err != nil {
+			// The only thing we know here is that we can't extract metadata from the content,
+			// it's hard to tell if metadata doesn't exist or metadata isn't valid.
+			// There's an example template:
+			//
+			//    ---
+			//    # Title
+			//    ---
+			//    Content
+			//
+			// It could be a valid markdown with two horizontal lines, or an invalid markdown with wrong metadata.
+
+			it.Content = string(content)
+			it.Name = path.Base(it.FileName) // paths in Git are always '/' separated - do not use filepath!
+			it.About = util.EllipsisDisplayString(it.Content, 80)
+		} else {
+			it.Content = templateBody
+			if it.About == "" {
+				if _, err := markdown.ExtractMetadata(string(content), compatibleTemplate); err == nil && compatibleTemplate.About != "" {
+					it.About = compatibleTemplate.About
+				}
+			}
+		}
+	} else if typ == api.IssueTemplateTypeYaml {
+		if err := yaml.Unmarshal(content, it); err != nil {
+			return nil, fmt.Errorf("yaml unmarshal: %w", err)
+		}
+		if it.About == "" {
+			if err := yaml.Unmarshal(content, compatibleTemplate); err == nil && compatibleTemplate.About != "" {
+				it.About = compatibleTemplate.About
+			}
+		}
+		for i, v := range it.Fields {
+			// set default id value
+			if v.ID == "" {
+				v.ID = strconv.Itoa(i)
+			}
+			// set default visibility
+			if v.Visible == nil {
+				v.Visible = []api.IssueFormFieldVisible{api.IssueFormFieldVisibleForm}
+				// markdown is not submitted by default
+				if v.Type != api.IssueFormFieldTypeMarkdown {
+					v.Visible = append(v.Visible, api.IssueFormFieldVisibleContent)
+				}
+			}
+		}
+	}
+
+	return it, nil
+}

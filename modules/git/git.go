@@ -1,0 +1,203 @@
+// Copyright 2015 The Gogs Authors. All rights reserved.
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package git
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/globallock"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/tempdir"
+	"gitea.dev/modules/testlogger"
+
+	"github.com/hashicorp/go-version"
+)
+
+const RequiredVersion = "2.34.0" // the minimum Git version required
+
+type Features struct {
+	gitVersion *version.Version
+
+	SupportHashSha256          bool           // >= 2.42, SHA-256 repositories no longer an ‘experimental curiosity’
+	SupportedObjectFormats     []ObjectFormat // sha1, sha256
+	SupportCheckAttrOnBare     bool           // >= 2.40
+	SupportCatFileBatchCommand bool           // >= 2.36, support `git cat-file --batch-command`
+	SupportGitMergeTree        bool           // >= 2.40 // we also need "--merge-base"
+}
+
+type GlobalConfigStruct struct {
+	DiffOrderFile string
+}
+
+var (
+	defaultFeatures *Features
+	GlobalConfig    *GlobalConfigStruct
+)
+
+func (f *Features) CheckVersionAtLeast(atLeast string) bool {
+	return f.gitVersion.Compare(version.Must(version.NewVersion(atLeast))) >= 0
+}
+
+// VersionInfo returns git version information
+func (f *Features) VersionInfo() string {
+	return f.gitVersion.Original()
+}
+
+func DefaultFeatures() *Features {
+	if defaultFeatures == nil {
+		if !setting.IsProd || setting.IsInTesting {
+			log.Warn("git.DefaultFeatures is called before git.InitXxx, initializing with default values")
+		}
+		if err := InitSimple(); err != nil {
+			log.Fatal("git.InitSimple failed: %v", err)
+		}
+	}
+	return defaultFeatures
+}
+
+func loadGitVersionFeatures() (*Features, error) {
+	stdout, _, runErr := gitcmd.NewCommand("version").RunStdString(context.Background())
+	if runErr != nil {
+		return nil, fmt.Errorf(`failed to run command "git version": %w`, runErr)
+	}
+
+	ver, err := parseGitVersionLine(strings.TrimSpace(stdout))
+	if err != nil {
+		return nil, fmt.Errorf(`failed to parse output of command "git version": %w`, err)
+	}
+
+	features := &Features{gitVersion: ver}
+	features.SupportHashSha256 = features.CheckVersionAtLeast("2.42")
+	features.SupportedObjectFormats = []ObjectFormat{Sha1ObjectFormat}
+	if features.SupportHashSha256 {
+		features.SupportedObjectFormats = append(features.SupportedObjectFormats, Sha256ObjectFormat)
+	}
+	features.SupportCheckAttrOnBare = features.CheckVersionAtLeast("2.40")
+	features.SupportCatFileBatchCommand = features.CheckVersionAtLeast("2.36")
+	features.SupportGitMergeTree = features.CheckVersionAtLeast("2.40") // we also need "--merge-base"
+	return features, nil
+}
+
+func parseGitVersionLine(s string) (*version.Version, error) {
+	fields := strings.Fields(s)
+	if len(fields) < 3 {
+		return nil, fmt.Errorf("invalid git version: %q", s)
+	}
+
+	// version output is like: "git version {versionString}"
+	// versionString can be:
+	// * "2.5.3"
+	// * "2.29.3.windows.1"
+	// * "2.28.0.618.gf4bc123cb7": https://github.com/go-gitea/gitea/issues/12731
+	versionString := fields[2]
+	versionFields := strings.Split(versionString, ".")
+	if len(versionFields) > 3 {
+		versionFields = versionFields[:3]
+	}
+	ver, err := version.NewVersion(strings.Join(versionFields, "."))
+	if err != nil {
+		return nil, fmt.Errorf("invalid git version: %q: %w", s, err)
+	}
+	return ver, nil
+}
+
+func checkGitVersionCompatibility(gitVer *version.Version) error {
+	badVersions := []struct {
+		Version *version.Version
+		Reason  string
+	}{
+		{version.Must(version.NewVersion("2.43.1")), "regression bug of GIT_FLUSH"},
+	}
+	for _, bad := range badVersions {
+		if gitVer.Equal(bad.Version) {
+			return errors.New(bad.Reason)
+		}
+	}
+	return nil
+}
+
+func ensureGitVersion() error {
+	if !DefaultFeatures().CheckVersionAtLeast(RequiredVersion) {
+		moreHint := "get git: https://git-scm.com/downloads"
+		return fmt.Errorf("installed git version %q is not supported, Gitea requires git version >= %q, %s", DefaultFeatures().gitVersion.Original(), RequiredVersion, moreHint)
+	}
+	if err := checkGitVersionCompatibility(DefaultFeatures().gitVersion); err != nil {
+		return fmt.Errorf("installed git version %s has a known compatibility issue with Gitea: %w, please upgrade (or downgrade) git", DefaultFeatures().gitVersion.String(), err)
+	}
+	return nil
+}
+
+// InitSimple initializes git module with a very simple step, no config changes, no global command arguments.
+// This method doesn't change anything to filesystem. At the moment, it is only used by some Gitea sub-commands.
+func InitSimple() error {
+	if setting.Git.HomePath == "" {
+		return errors.New("unable to init Git's HomeDir, incorrect initialization of the setting and git modules")
+	}
+
+	if defaultFeatures != nil && (!setting.IsProd || setting.IsInTesting) {
+		log.Warn("git module has been initialized already, duplicate init may work but it's better to fix it")
+	}
+
+	if err := gitcmd.SetExecutablePath(setting.Git.Path); err != nil {
+		return err
+	}
+
+	var err error
+	defaultFeatures, err = loadGitVersionFeatures()
+	if err != nil {
+		return err
+	}
+	if err = ensureGitVersion(); err != nil {
+		return err
+	}
+
+	// when git works with gnupg (commit signing), there should be a stable home for gnupg commands
+	if _, ok := os.LookupEnv("GNUPGHOME"); !ok {
+		_ = os.Setenv("GNUPGHOME", filepath.Join(gitcmd.HomeDir(), ".gnupg"))
+	}
+	return nil
+}
+
+// InitFull initializes git module with version check and change global variables, sync gitconfig.
+// It should only be called once at the beginning of the program initialization (TestMain/GlobalInitInstalled) as this code makes unsynchronized changes to variables.
+func InitFull() (err error) {
+	if err = InitSimple(); err != nil {
+		return err
+	}
+	return syncGitConfig(context.Background())
+}
+
+// RunGitTests helps to init the git module and run tests.
+// FIXME: GIT-PACKAGE-DEPENDENCY: the dependency is not right, setting.Git.HomePath is initialized in this package but used in gitcmd package
+func RunGitTests(m interface{ Run() int }) {
+	os.Exit(runGitTests(m))
+}
+
+func runGitTests(m interface{ Run() int }) int {
+	_ = cache.Init()
+	gitHomePath, cleanup, err := tempdir.OsTempDir("gitea-test").MkdirTempRandom("git-home")
+	if err != nil {
+		return testlogger.MainErrorf("unable to create temp dir: %v", err)
+	}
+	defer cleanup()
+
+	setting.Git.HomePath = gitHomePath
+	if err = InitFull(); err != nil {
+		return testlogger.MainErrorf("failed to call Init: %v", err)
+	}
+	return m.Run()
+}
+
+func LockConfigAndDo(ctx context.Context, repo RepositoryFacade, fn func(ctx context.Context) error) error {
+	return globallock.LockAndDo(ctx, "repo-config:"+repo.GitRepoManagedID(), fn)
+}

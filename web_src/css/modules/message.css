@@ -1,0 +1,100 @@
+/* based on Fomantic UI message module, with just the parts extracted that we use. If you find any
+   unused rules here after refactoring, please remove them. */
+
+.ui.message {
+  background: var(--color-box-body);
+  color: var(--color-text);
+  border: 1px solid var(--color-secondary);
+  position: relative;
+  min-height: 1em;
+  margin: 1em 0;
+  padding: 1em 1.5em;
+  border-radius: var(--border-radius);
+}
+
+details.ui.message {
+  padding: 0;
+}
+
+details.ui.message summary {
+  padding: 1em 1.5em;
+}
+
+details.ui.message pre {
+  margin: -1.25em 0 0;
+  padding: 0.5em 1.5em;
+  white-space: pre-wrap;
+}
+
+details.ui.message:not(:has(pre)) summary {
+  list-style: none;
+  cursor: text;
+}
+
+.ui.message.flash-message pre {
+  white-space: pre-line;
+  margin: 0;
+}
+
+.ui.message:first-child {
+  margin-top: 0;
+}
+
+.ui.message:last-child {
+  margin-bottom: 0;
+}
+
+.ui.attached.message {
+  margin-bottom: -1px;
+  border-radius: var(--border-radius) var(--border-radius) 0 0;
+  margin-left: -1px;
+  margin-right: -1px;
+}
+
+.ui.attached + .ui.attached.message:not(.top):not(.bottom) {
+  margin-top: -1px;
+  border-radius: 0;
+}
+
+.ui.message .header {
+  color: inherit;
+  font-weight: var(--font-weight-semibold);
+}
+
+.ui.info.message,
+.ui.attached.info.message,
+.ui.blue.message,
+.ui.attached.blue.message {
+  background: var(--color-info-bg);
+  border-color: var(--color-info-border);
+}
+
+.ui.success.message,
+.ui.positive.message {
+  background: var(--color-success-bg);
+  border-color: var(--color-success-border);
+}
+
+.ui.error.message,
+.ui.red.message,
+.ui.negative.message {
+  background: var(--color-error-bg);
+  border-color: var(--color-error-border);
+}
+
+.ui.warning.message {
+  background: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+}
+
+.ui.message > .close.icon {
+  cursor: pointer;
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  opacity: .7;
+}
+
+.ui.message > .close.icon:hover {
+  opacity: 1;
+}

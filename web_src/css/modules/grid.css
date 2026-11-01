@@ -1,0 +1,226 @@
+/* based on Fomantic UI grid module, with just the parts extracted that we use. If you find any
+   unused rules here after refactoring, please remove them. */
+
+.ui.grid {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: stretch;
+  padding: 0;
+  margin: -1rem;
+}
+
+.ui[class*="very relaxed"].grid {
+  margin-left: -2.5rem;
+  margin-right: -2.5rem;
+}
+
+.ui.grid + .grid {
+  margin-top: 1rem;
+}
+
+.ui.grid > .column:not(.row),
+.ui.grid > .row > .column {
+  position: relative;
+  display: inline-block;
+  width: 6.25%;
+  padding-left: 1rem;
+  padding-right: 1rem;
+  vertical-align: top;
+}
+.ui.grid > * {
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+
+.ui.grid > .row {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: inherit;
+  align-items: stretch;
+  width: 100% !important;
+  padding: 0;
+  padding-top: 1rem;
+  padding-bottom: 1rem;
+}
+
+.ui.grid > .column:not(.row) {
+  padding-top: 1rem;
+  padding-bottom: 1rem;
+}
+.ui.grid > .row > .column {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.ui.grid > .row > .column > img {
+  max-width: 100%;
+}
+
+.ui.grid > .column:last-child > .horizontal.segment {
+  box-shadow: none;
+}
+
+@media only screen and (max-width: 767.98px) {
+  .ui.page.grid {
+    width: auto;
+    padding-left: 0;
+    padding-right: 0;
+    margin-left: 0;
+    margin-right: 0;
+  }
+}
+@media only screen and (min-width: 768px) and (max-width: 991.98px) {
+  .ui.page.grid {
+    width: auto;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 2em;
+    padding-right: 2em;
+  }
+}
+@media only screen and (min-width: 992px) and (max-width: 1199.98px) {
+  .ui.page.grid {
+    width: auto;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 3%;
+    padding-right: 3%;
+  }
+}
+@media only screen and (min-width: 1200px) and (max-width: 1919.98px) {
+  .ui.page.grid {
+    width: auto;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 15%;
+    padding-right: 15%;
+  }
+}
+@media only screen and (min-width: 1920px) {
+  .ui.page.grid {
+    width: auto;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 23%;
+    padding-right: 23%;
+  }
+}
+
+.ui.grid > .column:only-child {
+  width: 100%;
+}
+
+.ui[class*="two column"].grid > .column:not(.row) {
+  width: 50%;
+}
+
+.ui.grid > [class*="two column"].row > .column {
+  width: 50% !important;
+}
+
+.ui.grid > .column.row > [class*="one wide"].column,
+.ui.grid > [class*="one wide"].column,
+.ui.column.grid > [class*="one wide"].column {
+  width: 6.25% !important;
+}
+.ui.grid > .column.row > [class*="two wide"].column,
+.ui.grid > [class*="two wide"].column,
+.ui.column.grid > [class*="two wide"].column {
+  width: 12.5% !important;
+}
+.ui.grid > [class*="three wide"].column {
+  width: 18.75% !important;
+}
+.ui.grid > [class*="four wide"].column {
+  width: 25% !important;
+}
+.ui.grid > [class*="five wide"].column {
+  width: 31.25% !important;
+}
+.ui.grid > [class*="six wide"].column {
+  width: 37.5% !important;
+}
+.ui.grid > [class*="seven wide"].column {
+  width: 43.75% !important;
+}
+.ui.grid > [class*="eight wide"].column {
+  width: 50% !important;
+}
+.ui.grid > [class*="ten wide"].column {
+  width: 62.5% !important;
+}
+.ui.grid > [class*="eleven wide"].column {
+  width: 68.75% !important;
+}
+.ui.grid > [class*="twelve wide"].column {
+  width: 75% !important;
+}
+.ui.grid > [class*="thirteen wide"].column {
+  width: 81.25% !important;
+}
+.ui.grid > [class*="fourteen wide"].column {
+  width: 87.5% !important;
+}
+.ui.grid > [class*="sixteen wide"].column {
+  width: 100% !important;
+}
+
+.ui.centered.grid {
+  text-align: center;
+  justify-content: center;
+}
+.ui.centered.grid > .column:not(.aligned):not(.justified):not(.row) {
+  text-align: left;
+}
+.ui.grid > .centered.column {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.ui[class*="very relaxed"].grid > .column:not(.row) {
+  padding-left: 2.5rem;
+  padding-right: 2.5rem;
+}
+
+.ui.grid [class*="very relaxed"].row + .ui.divider {
+  margin-left: 2.5rem;
+  margin-right: 2.5rem;
+}
+
+@media only screen and (max-width: 767.98px) {
+  .ui[class*="mobile reversed"].grid {
+    flex-direction: row-reverse;
+  }
+  .ui.stackable[class*="mobile reversed"] {
+    flex-direction: column-reverse;
+  }
+}
+
+@media only screen and (max-width: 767.98px) {
+  .ui.stackable.grid {
+    width: auto;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+  }
+  .ui.stackable.grid > .wide.column,
+  .ui.stackable.grid > .column:not(.row) {
+    width: 100% !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    padding: 1rem;
+  }
+
+  .ui.container > .ui.stackable.grid > .column {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+
+  .ui.grid .ui.stackable.grid {
+    margin-left: -1rem !important;
+    margin-right: -1rem !important;
+  }
+}

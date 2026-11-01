@@ -1,0 +1,309 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"net/http"
+	"net/url"
+	"slices"
+
+	admin_model "gitea.dev/models/admin"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
+	"gitea.dev/services/migrations"
+	repo_service "gitea.dev/services/repository"
+	"gitea.dev/services/task"
+)
+
+const (
+	tplMigrate templates.TplName = "repo/migrate/migrate"
+)
+
+// Migrate render migration of repository page
+func Migrate(ctx *context.Context) {
+	if setting.Repository.DisableMigrations {
+		ctx.HTTPError(http.StatusForbidden, "Migrate: the site administrator has disabled migrations")
+		return
+	}
+
+	serviceType := structs.GitServiceType(ctx.FormInt("service_type"))
+
+	setMigrationContextData(ctx, serviceType)
+
+	if serviceType == 0 {
+		ctx.Data["Org"] = ctx.FormString("org")
+		ctx.Data["Mirror"] = ctx.FormString("mirror")
+
+		ctx.HTML(http.StatusOK, tplMigrate)
+		return
+	}
+
+	ctx.Data["private"] = getRepoPrivate(ctx)
+	ctx.Data["mirror"] = ctx.FormBool("mirror") // from "gogs#2037": "new mirror" button on org's home page
+
+	ctxUser := checkContextUser(ctx, ctx.FormInt64("org"))
+	if ctx.Written() {
+		return
+	}
+	ctx.Data["ContextUser"] = ctxUser
+
+	ctx.HTML(http.StatusOK, templates.TplName("repo/migrate/"+serviceType.Name()))
+}
+
+func handleMigrateError(ctx *context.Context, owner *user_model.User, err error) {
+	if setting.Repository.DisableMigrations {
+		ctx.HTTPError(http.StatusForbidden, "MigrateError: the site administrator has disabled migrations")
+		return
+	}
+
+	var errNameReserved db.ErrNameReserved
+	var errNamePatternNotAllowed db.ErrNamePatternNotAllowed
+	switch {
+	case repo_model.IsErrReachLimitOfRepo(err):
+		maxCreationLimit := owner.MaxCreationLimit()
+		msg := ctx.TrN(maxCreationLimit, "repo.form.reach_limit_of_creation_1", "repo.form.reach_limit_of_creation_n", maxCreationLimit)
+		ctx.JSONError(msg)
+	case repo_model.IsErrRepoAlreadyExist(err):
+		ctx.JSONErrorWithField(ctx.Tr("form.repo_name_been_taken"), "repo_name")
+	case repo_model.IsErrRepoFilesAlreadyExist(err):
+		switch {
+		case ctx.IsUserSiteAdmin() || (setting.Repository.AllowAdoptionOfUnadoptedRepositories && setting.Repository.AllowDeleteOfUnadoptedRepositories):
+			ctx.JSONErrorWithField(ctx.Tr("form.repository_files_already_exist.adopt_or_delete"), "repo_name")
+		case setting.Repository.AllowAdoptionOfUnadoptedRepositories:
+			ctx.JSONErrorWithField(ctx.Tr("form.repository_files_already_exist.adopt"), "repo_name")
+		case setting.Repository.AllowDeleteOfUnadoptedRepositories:
+			ctx.JSONErrorWithField(ctx.Tr("form.repository_files_already_exist.delete"), "repo_name")
+		default:
+			ctx.JSONErrorWithField(ctx.Tr("form.repository_files_already_exist"), "repo_name")
+		}
+	case errors.As(err, &errNameReserved):
+		ctx.JSONErrorWithField(ctx.Tr("repo.form.name_reserved", errNameReserved.Name), "repo_name")
+	case errors.As(err, &errNamePatternNotAllowed):
+		ctx.JSONErrorWithField(ctx.Tr("repo.form.name_pattern_not_allowed", errNamePatternNotAllowed.Pattern), "repo_name")
+	default:
+		err = util.SanitizeErrorCredentialURLs(err)
+		if _, fromGit := gitcmd.ErrorAsStderr(err); fromGit {
+			ctx.JSONErrorWithField(ctx.Tr("repo.migrate.failed", err.Error()), "clone_addr")
+		} else {
+			ctx.JSONErrorAuto(err)
+		}
+	}
+}
+
+func handleMigrateRemoteAddrError(ctx *context.Context, err error, field string) {
+	if addrErr, ok := err.(*git.ErrInvalidCloneAddr); ok {
+		switch {
+		case addrErr.IsProtocolInvalid:
+			ctx.JSONErrorWithField(ctx.Tr("repo.mirror_address_protocol_invalid"), field)
+		case addrErr.IsURLError:
+			ctx.JSONErrorWithField(ctx.Tr("form.url_error", addrErr.Host), field)
+		case addrErr.IsPermissionDenied:
+			if addrErr.LocalPath {
+				ctx.JSONErrorWithField(ctx.Tr("repo.migrate.permission_denied"), field)
+			} else {
+				ctx.JSONErrorWithField(ctx.Tr("repo.migrate.permission_denied_blocked"), field)
+			}
+		case addrErr.IsInvalidPath:
+			ctx.JSONErrorWithField(ctx.Tr("repo.migrate.invalid_local_path"), field)
+		default:
+			log.Error("Error whilst updating url: %v", err)
+			ctx.JSONErrorWithField(ctx.Tr("form.url_error", "unknown"), field)
+		}
+	} else {
+		log.Error("Error whilst updating url: %v", err)
+		ctx.JSONErrorWithField(ctx.Tr("form.url_error", "unknown"), field)
+	}
+}
+
+// MigratePost response for migrating from external git repository
+func MigratePost(ctx *context.Context) {
+	form := context.GetFetchActionForm[*forms.MigrateRepoForm](ctx)
+	if form == nil {
+		return
+	}
+	if setting.Repository.DisableMigrations {
+		ctx.HTTPError(http.StatusForbidden, "MigratePost: the site administrator has disabled migrations")
+		return
+	}
+
+	if form.Mirror && setting.Mirror.DisableNewPull {
+		ctx.HTTPError(http.StatusBadRequest, "MigratePost: the site administrator has disabled creation of new mirrors")
+		return
+	}
+
+	ctxUser := checkContextUser(ctx, form.UID)
+	if ctx.Written() {
+		return
+	}
+
+	remoteAddr, err := git.ParseRemoteAddr(form.CloneAddr, form.AuthUsername, form.AuthPassword)
+	if err == nil {
+		err = migrations.IsMigrateURLAllowedForService(remoteAddr, form.Service, ctx.Doer)
+	}
+	if err != nil {
+		handleMigrateRemoteAddrError(ctx, err, "clone_addr")
+		return
+	}
+
+	form.LFS = form.LFS && setting.LFS.StartServer
+
+	if form.LFS && len(form.LFSEndpoint) > 0 {
+		ep := lfs.DetermineEndpoint("", form.LFSEndpoint)
+		if ep == nil {
+			ctx.JSONErrorWithField(ctx.Tr("repo.migrate.invalid_lfs_endpoint"), "lfs_endpoint")
+			return
+		}
+		err = migrations.IsMigrateURLAllowed(ep.String(), ctx.Doer)
+		if err != nil {
+			handleMigrateRemoteAddrError(ctx, err, "lfs_endpoint")
+			return
+		}
+	}
+
+	opts := migrations.MigrateOptions{
+		OriginalURL:    form.CloneAddr,
+		GitServiceType: form.Service,
+		CloneAddr:      remoteAddr,
+		RepoName:       form.RepoName,
+		Description:    form.Description,
+		Private:        form.Private || setting.Repository.ForcePrivate,
+		Mirror:         form.Mirror,
+		LFS:            form.LFS,
+		LFSEndpoint:    form.LFSEndpoint,
+		AuthUsername:   form.AuthUsername,
+		AuthPassword:   form.AuthPassword,
+		AuthToken:      form.AuthToken,
+		Wiki:           form.Wiki,
+		Issues:         form.Issues,
+		Milestones:     form.Milestones,
+		Labels:         form.Labels,
+		Comments:       form.Issues || form.PullRequests,
+		PullRequests:   form.PullRequests,
+		Releases:       form.Releases,
+	}
+	if opts.Mirror {
+		opts.Issues = false
+		opts.Milestones = false
+		opts.Labels = false
+		opts.Comments = false
+		opts.PullRequests = false
+		opts.Releases = false
+	}
+	if form.Service == structs.CodeCommitService {
+		opts.AWSAccessKeyID = form.AWSAccessKeyID
+		opts.AWSSecretAccessKey = form.AWSSecretAccessKey
+	}
+
+	err = repo_service.CheckCreateRepository(ctx, ctx.Doer, ctxUser, opts.RepoName, false)
+	if err != nil {
+		handleMigrateError(ctx, ctxUser, err)
+		return
+	}
+
+	err = task.MigrateRepository(ctx, ctx.Doer, ctxUser, opts)
+	if err == nil {
+		ctx.JSONRedirect(ctxUser.HomeLink() + "/" + url.PathEscape(opts.RepoName))
+		return
+	}
+
+	handleMigrateError(ctx, ctxUser, err)
+}
+
+func setMigrationContextData(ctx *context.Context, serviceType structs.GitServiceType) {
+	ctx.Data["Title"] = ctx.Tr("new_migrate")
+
+	ctx.Data["LFSActive"] = setting.LFS.StartServer
+	ctx.Data["IsForcedPrivate"] = setting.Repository.ForcePrivate
+	ctx.Data["DisableNewPullMirrors"] = setting.Mirror.DisableNewPull
+
+	// Plain git should be first
+	services := append([]structs.GitServiceType{structs.PlainGitService}, structs.SupportedFullGitService...)
+	ctx.Data["Services"] = slices.DeleteFunc(services, func(gt structs.GitServiceType) bool {
+		variants := gt.Variants()
+		return len(variants) > 0 && variants[0] != gt
+	})
+	ctx.Data["service"] = serviceType
+	ctx.Data["ServiceVariants"] = serviceType.Variants()
+}
+
+func MigrateRetryPost(ctx *context.Context) {
+	if err := task.RetryMigrateTask(ctx, ctx.Repo.Repository.ID); err != nil {
+		log.Error("Retry task failed: %v", err)
+		ctx.ServerError("task.RetryMigrateTask", err)
+		return
+	}
+	ctx.JSONOK()
+}
+
+func MigrateCancelPost(ctx *context.Context) {
+	migratingTask, err := admin_model.GetMigratingTask(ctx, ctx.Repo.Repository.ID)
+	if err != nil {
+		log.Error("GetMigratingTask: %v", err)
+		ctx.Redirect(ctx.Repo.Repository.Link())
+		return
+	}
+	if migratingTask.Status == structs.TaskStatusRunning {
+		taskUpdate := &admin_model.Task{ID: migratingTask.ID, Status: structs.TaskStatusFailed, Message: "canceled"}
+		if err = taskUpdate.UpdateCols(ctx, "status", "message"); err != nil {
+			ctx.ServerError("task.UpdateCols", err)
+			return
+		}
+	}
+	ctx.Redirect(ctx.Repo.Repository.Link())
+}
+
+// MigrateStatus returns migrate task's status
+func MigrateStatus(ctx *context.Context) {
+	task, err := admin_model.GetMigratingTask(ctx, ctx.Repo.Repository.ID)
+	if err != nil {
+		if admin_model.IsErrTaskDoesNotExist(err) {
+			ctx.JSON(http.StatusNotFound, map[string]any{
+				"err": "task does not exist or you do not have access to this task",
+			})
+			return
+		}
+		log.Error("GetMigratingTask: %v", err)
+		ctx.JSON(http.StatusInternalServerError, map[string]any{
+			"err": http.StatusText(http.StatusInternalServerError),
+		})
+		return
+	}
+
+	message := task.Message
+
+	// a failure message can echo bytes the remote chose, so only whoever started the migration may read it
+	canSeeFailure := (ctx.Doer != nil && ctx.Doer.ID == task.DoerID) || ctx.Repo.Permission.IsAdmin()
+	if task.Status == structs.TaskStatusFailed && !canSeeFailure {
+		message = ctx.Locale.TrString("repo.migrate.migrating_failed_no_addr")
+	} else if message != "" && message[0] == '{' {
+		// assume message is actually a translatable string
+		var translatableMessage admin_model.TranslatableMessage
+		if err := json.Unmarshal([]byte(message), &translatableMessage); err != nil {
+			translatableMessage = admin_model.TranslatableMessage{
+				Format: "migrate.migrating_failed.error",
+				Args:   []any{task.Message},
+			}
+		}
+		message = ctx.Locale.TrString(translatableMessage.Format, translatableMessage.Args...)
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"status":  task.Status,
+		"message": message,
+	})
+}

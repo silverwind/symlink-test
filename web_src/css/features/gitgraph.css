@@ -1,0 +1,165 @@
+#git-graph-container {
+  overflow-x: auto;
+  width: 100%;
+  min-height: 350px;
+}
+
+#git-graph-container h2 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#git-graph-container #flow-select-refs-dropdown {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  min-width: 250px;
+  border-right: none;
+}
+
+#git-graph-container #flow-select-refs-dropdown .ui.label {
+  max-width: 180px;
+  display: inline-flex !important;
+  align-items: center;
+}
+
+#git-graph-container li {
+  list-style-type: none;
+  height: 24px;
+  line-height: 24px;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+
+#git-graph-container li > span {
+  flex-shrink: 0;
+}
+
+#git-graph-container li > span.message {
+  flex-shrink: 1;
+}
+
+#git-graph-container li .ui.label.commit-id-short {
+  padding: 2px 4px;
+  height: 20px;
+}
+
+#git-graph-container li .time {
+  color: var(--color-text-light-3);
+  font-size: 80%;
+}
+
+#git-graph-container #rel-container {
+  max-width: 30%;
+  overflow-x: auto;
+  float: left;
+}
+
+#git-graph-container #rev-container {
+  width: 100%;
+}
+
+#git-graph-container #rev-list {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+
+#git-graph-container li .commit-refs .ui.button,
+#git-graph-container li .commit-refs .ui.label.tag-label {
+  padding: 2px 4px;
+  margin-right: 0.25em;
+  display: inline-block;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: var(--line-height-default);
+  min-height: 0;
+}
+
+#git-graph-container.monochrome #rel-container .flow-group {
+  stroke: var(--color-secondary-dark-5);
+  fill: var(--color-secondary-dark-5);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-0 {
+  stroke: var(--color-series-16-0);
+  fill: var(--color-series-16-0);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-1 {
+  stroke: var(--color-series-16-1);
+  fill: var(--color-series-16-1);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-2 {
+  stroke: var(--color-series-16-2);
+  fill: var(--color-series-16-2);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-3 {
+  stroke: var(--color-series-16-3);
+  fill: var(--color-series-16-3);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-4 {
+  stroke: var(--color-series-16-4);
+  fill: var(--color-series-16-4);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-5 {
+  stroke: var(--color-series-16-5);
+  fill: var(--color-series-16-5);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-6 {
+  stroke: var(--color-series-16-6);
+  fill: var(--color-series-16-6);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-7 {
+  stroke: var(--color-series-16-7);
+  fill: var(--color-series-16-7);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-8 {
+  stroke: var(--color-series-16-8);
+  fill: var(--color-series-16-8);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-9 {
+  stroke: var(--color-series-16-9);
+  fill: var(--color-series-16-9);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-10 {
+  stroke: var(--color-series-16-10);
+  fill: var(--color-series-16-10);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-11 {
+  stroke: var(--color-series-16-11);
+  fill: var(--color-series-16-11);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-12 {
+  stroke: var(--color-series-16-12);
+  fill: var(--color-series-16-12);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-13 {
+  stroke: var(--color-series-16-13);
+  fill: var(--color-series-16-13);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-14 {
+  stroke: var(--color-series-16-14);
+  fill: var(--color-series-16-14);
+}
+
+#git-graph-container:not(.monochrome) #rel-container .flow-group.flow-color-16-15 {
+  stroke: var(--color-series-16-15);
+  fill: var(--color-series-16-15);
+}

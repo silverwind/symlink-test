@@ -1,0 +1,63 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package convert
+
+import (
+	"context"
+	"slices"
+
+	"gitea.dev/models/packages"
+	access_model "gitea.dev/models/perm/access"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	packages_service "gitea.dev/services/packages"
+)
+
+// ToPackage convert a packages.PackageDescriptor to api.Package
+func ToPackage(ctx context.Context, pd *packages.PackageDescriptor, doer *user_model.User) (*api.Package, error) {
+	var repo *api.Repository
+	if pd.Repository != nil {
+		permission, err := access_model.GetDoerRepoPermission(ctx, pd.Repository, doer)
+		if err != nil {
+			return nil, err
+		}
+
+		if permission.HasAnyUnitAccess() {
+			repo = ToRepo(ctx, pd.Repository, permission)
+		}
+	}
+
+	return &api.Package{
+		ID:         pd.Version.ID,
+		Owner:      ToUser(ctx, pd.Owner, doer),
+		Repository: repo,
+		Creator:    ToUser(ctx, pd.Creator, doer),
+		Type:       string(pd.Package.Type),
+		Name:       pd.Package.Name,
+		Version:    pd.Version.Version,
+		CreatedAt:  pd.Version.CreatedUnix.AsTime(),
+		HTMLURL:    pd.VersionHTMLURL(ctx),
+	}, nil
+}
+
+// ToPackageFile converts packages.PackageFileDescriptor to api.PackageFile
+func ToPackageFile(packageType packages.Type, pfd *packages.PackageFileDescriptor) *api.PackageFile {
+	properties := make(map[string]string)
+	publicPropertyNames := packages_service.GetSpecManager().Get(packageType).PublicPropertyNames()
+	for _, pp := range pfd.Properties {
+		if slices.Contains(publicPropertyNames, pp.Name) {
+			properties[pp.Name] = pp.Value
+		}
+	}
+	return &api.PackageFile{
+		ID:         pfd.File.ID,
+		Size:       pfd.Blob.Size,
+		Name:       pfd.File.Name,
+		HashMD5:    pfd.Blob.HashMD5,
+		HashSHA1:   pfd.Blob.HashSHA1,
+		HashSHA256: pfd.Blob.HashSHA256,
+		HashSHA512: pfd.Blob.HashSHA512,
+		Properties: properties,
+	}
+}

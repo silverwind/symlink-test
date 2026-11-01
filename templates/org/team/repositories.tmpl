@@ -1,0 +1,65 @@
+{{template "base/head" .}}
+<div role="main" aria-label="{{.Title}}" class="page-content organization teams">
+	{{template "org/header" .}}
+	<div class="ui container">
+		{{template "base/alert" .}}
+		<div class="ui stackable grid">
+			{{template "org/team/sidebar" .}}
+			<div class="ui ten wide column">
+				{{template "org/team/navbar" .}}
+				{{$hasTopAttachedSegment := false}}
+				{{$canAddRemove := and $.IsOrganizationOwner (not $.Team.IncludesAllRepositories)}}
+				{{if $canAddRemove}}
+					{{$hasTopAttachedSegment = true}}
+					<div class="ui top attached segment flex-text-block tw-flex-wrap">
+						<form class="ui form ignore-dirty tw-flex-1 tw-flex" action="{{$.OrgLink}}/teams/{{$.Team.LowerName | PathEscape}}/action/repo/add" method="post">
+							<div data-global-init="initSearchRepoBox" data-uid="{{.Org.ID}}" class="ui search">
+								<div class="ui input">
+									<input class="prompt" name="repo_name" placeholder="{{ctx.Locale.Tr "search.repo_kind"}}" autocomplete="off" required>
+								</div>
+							</div>
+							<button type="submit" class="ui primary button tw-ml-2">{{ctx.Locale.Tr "add"}}</button>
+						</form>
+						<div class="tw-inline-block">
+							<button type="button" class="ui primary button link-action" data-modal-confirm="{{ctx.Locale.Tr "org.teams.add_all_repos_desc"}}" data-url="{{$.OrgLink}}/teams/{{$.Team.LowerName | PathEscape}}/action/repo/addall">{{ctx.Locale.Tr "add_all"}}</button>
+							<button type="button" class="ui red button link-action" data-modal-confirm="{{ctx.Locale.Tr "org.teams.remove_all_repos_desc"}}" data-url="{{$.OrgLink}}/teams/{{$.Team.LowerName | PathEscape}}/action/repo/removeall">{{ctx.Locale.Tr "remove_all"}}</button>
+						</div>
+					</div>
+				{{end}}
+				{{if $.Team.IncludesAllRepositories}}
+					{{$hasTopAttachedSegment = true}}
+					<div class="ui top attached segment">{{ctx.Locale.Tr "org.teams.all_repositories"}}</div>
+				{{end}}
+				<div class="ui {{if not $hasTopAttachedSegment}}top{{end}} attached segment">
+					<div class="flex-divided-list items-with-main">
+						{{range $.TeamRepos}}
+							<div class="item tw-items-center">
+								<div class="item-leading">
+									{{template "repo/icon" .}}
+								</div>
+								<div class="item-main">
+									<a class="item-title tw-text-primary" href="{{$.Org.HomeLink}}/{{.Name | PathEscape}}">
+										{{$.Org.Name}}/{{.Name}}
+									</a>
+								</div>
+								<div class="item-trailing">
+									{{if $canAddRemove}}
+										<form method="post" action="{{$.OrgLink}}/teams/{{$.Team.LowerName | PathEscape}}/action/repo/remove">
+											<button type="submit" class="ui red small button" name="repoid" value="{{.ID}}">{{ctx.Locale.Tr "remove"}}</button>
+										</form>
+									{{end}}
+								</div>
+							</div>
+						{{else}}
+							<div class="item">
+								<span class="tw-text-text-light tw-italic">{{ctx.Locale.Tr "org.teams.repos.none"}}</span>
+							</div>
+						{{end}}
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+</div>
+
+{{template "base/footer" .}}

@@ -1,0 +1,127 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package actions
+
+import (
+	"math"
+	"testing"
+	"time"
+
+	"gitea.dev/modules/timeutil"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLogIndexes_ToDB(t *testing.T) {
+	inputIndexes := LogIndexes{1, 2, 0, -1, -2, math.MaxInt64, math.MinInt64}
+	got, err := inputIndexes.ToDB()
+	require.NoError(t, err)
+
+	indexes := LogIndexes{}
+	require.NoError(t, indexes.FromDB(got))
+
+	assert.Equal(t, inputIndexes, indexes)
+}
+
+func Test_calculateDuration(t *testing.T) {
+	oldTimeSince := timeSince
+	defer func() {
+		timeSince = oldTimeSince
+	}()
+
+	timeSince = func(t time.Time) time.Duration {
+		return timeutil.TimeStamp(1000).AsTime().Sub(t)
+	}
+	type args struct {
+		started     timeutil.TimeStamp
+		stopped     timeutil.TimeStamp
+		status      Status
+		fallbackEnd timeutil.TimeStamp
+	}
+	tests := []struct {
+		name string
+		args args
+		want time.Duration
+	}{
+		{
+			name: "unknown",
+			args: args{
+				started: 0,
+				stopped: 0,
+				status:  StatusUnknown,
+			},
+			want: 0,
+		},
+		{
+			name: "running",
+			args: args{
+				started: 500,
+				stopped: 0,
+				status:  StatusRunning,
+			},
+			want: 500 * time.Second,
+		},
+		{
+			name: "running started in the future",
+			args: args{
+				started: 1005,
+				status:  StatusRunning,
+			},
+			want: 0,
+		},
+		{
+			name: "done",
+			args: args{
+				started: 500,
+				stopped: 600,
+				status:  StatusSuccess,
+			},
+			want: 100 * time.Second,
+		},
+		{
+			name: "done_stopped_zero_no_fallback",
+			args: args{
+				started: 500,
+				stopped: 0,
+				status:  StatusSuccess,
+			},
+			want: 0,
+		},
+		{
+			name: "done_stopped_zero_uses_fallback",
+			args: args{
+				started:     500,
+				stopped:     0,
+				status:      StatusSuccess,
+				fallbackEnd: 600,
+			},
+			want: 100 * time.Second,
+		},
+		{
+			name: "done_stopped_before_started_no_fallback",
+			args: args{
+				started: 600,
+				stopped: 550,
+				status:  StatusSuccess,
+			},
+			want: 0,
+		},
+		{
+			name: "done_stopped_before_started_uses_fallback",
+			args: args{
+				started:     600,
+				stopped:     550,
+				status:      StatusSuccess,
+				fallbackEnd: 650,
+			},
+			want: 50 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equalf(t, tt.want, calculateDuration(tt.args.started, tt.args.stopped, tt.args.status, tt.args.fallbackEnd), "calculateDuration(%v, %v, %v, %v)", tt.args.started, tt.args.stopped, tt.args.status, tt.args.fallbackEnd)
+		})
+	}
+}

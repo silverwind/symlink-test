@@ -1,0 +1,42 @@
+import {toggleElem} from '../utils/dom.ts';
+import {showModal} from '../modules/modal.ts';
+import {trString} from '../modules/i18n.ts';
+import {registerGlobalEventFunc} from '../modules/observer.ts';
+
+export function initRepoBranchButton() {
+  initRepoCreateBranchButton();
+  initRepoRenameBranchButton();
+}
+
+function initRepoCreateBranchButton() {
+  // 2 pages share this code, one is the branch list page, the other is the commit view page: create branch/tag from current commit (dirty code)
+  for (const el of document.querySelectorAll('.show-create-branch-modal')) {
+    el.addEventListener('click', () => {
+      const modalFormName = el.getAttribute('data-modal-form') || '#create-branch-form';
+      const modalForm = document.querySelector<HTMLFormElement>(modalFormName);
+      if (!modalForm) return;
+      modalForm.action = `${modalForm.getAttribute('data-base-action')}${el.getAttribute('data-branch-from-urlcomponent')}`;
+
+      const fromSpanName = el.getAttribute('data-modal-from-span') || '#modal-create-branch-from-span';
+      document.querySelector(fromSpanName)!.textContent = el.getAttribute('data-branch-from');
+
+      showModal(document.querySelector(el.getAttribute('data-modal')!)!);
+    });
+  }
+}
+
+function initRepoRenameBranchButton() {
+  registerGlobalEventFunc('click', 'showRenameBranchModal', (el) => {
+    const target = el.getAttribute('data-modal')!;
+    const modal = document.querySelector(target)!;
+    const oldBranchName = el.getAttribute('data-old-branch-name')!;
+    modal.querySelector<HTMLInputElement>('input[name=from]')!.value = oldBranchName;
+
+    // display the warning that the branch which is chosen is the default branch
+    const warn = modal.querySelector('.default-branch-warning')!;
+    toggleElem(warn, el.getAttribute('data-is-default-branch') === 'true');
+
+    const text = modal.querySelector('[data-rename-branch-to]')!;
+    text.textContent = trString(text.getAttribute('data-rename-branch-to')!, oldBranchName);
+  });
+}

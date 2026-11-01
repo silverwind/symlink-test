@@ -1,0 +1,243 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"archive/tar"
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"testing"
+
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	conda_module "gitea.dev/modules/packages/conda"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/zstd"
+	"gitea.dev/tests"
+
+	"github.com/dsnet/compress/bzip2"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestPackageConda(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	packageName := "test_package"
+	packageVersion := "1.0.1"
+
+	channel := "test-channel"
+	root := fmt.Sprintf("/api/packages/%s/conda", user.Name)
+
+	t.Run("Upload", func(t *testing.T) {
+		tarContent := func() []byte {
+			var buf bytes.Buffer
+			tw := tar.NewWriter(&buf)
+
+			content := []byte(`{"name":"` + packageName + `","version":"` + packageVersion + `","subdir":"noarch","build":"xxx"}`)
+
+			hdr := &tar.Header{
+				Name: "info/index.json",
+				Mode: 0o600,
+				Size: int64(len(content)),
+			}
+			tw.WriteHeader(hdr)
+			tw.Write(content)
+			tw.Close()
+			return buf.Bytes()
+		}()
+
+		t.Run(".tar.bz2", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			var buf bytes.Buffer
+			bw, _ := bzip2.NewWriter(&buf, nil)
+			io.Copy(bw, bytes.NewReader(tarContent))
+			bw.Close()
+
+			filename := fmt.Sprintf("%s-%s.tar.bz2", packageName, packageVersion)
+
+			for _, status := range []int{http.StatusUnauthorized, http.StatusCreated, http.StatusConflict} {
+				req := NewRequestWithBody(t, "PUT", root+"/"+filename, bytes.NewReader(buf.Bytes()))
+				if status != http.StatusUnauthorized {
+					req.AddBasicAuth(user.Name)
+				}
+				MakeRequest(t, req, status)
+			}
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeConda)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
+
+			pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+			assert.NoError(t, err)
+			assert.Nil(t, pd.SemVer)
+			assert.IsType(t, &conda_module.VersionMetadata{}, pd.Metadata)
+			assert.Equal(t, packageName, pd.Package.Name)
+			assert.Equal(t, packageVersion, pd.Version.Version)
+			assert.Empty(t, pd.PackageProperties.GetByName(conda_module.PropertyChannel))
+		})
+
+		t.Run(".conda", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			var infoBuf bytes.Buffer
+			zsw, _ := zstd.NewWriter(&infoBuf)
+			io.Copy(zsw, bytes.NewReader(tarContent))
+			zsw.Close()
+
+			buf := test.WriteZipArchive(map[string]string{
+				"info-x.tar.zst": infoBuf.String(),
+			})
+
+			fullName := channel + "/" + packageName
+			filename := fmt.Sprintf("%s-%s.conda", packageName, packageVersion)
+
+			for _, status := range []int{http.StatusUnauthorized, http.StatusCreated, http.StatusConflict} {
+				req := NewRequestWithBody(t, "PUT", root+"/"+channel+"/"+filename, bytes.NewReader(buf.Bytes()))
+				if status != http.StatusUnauthorized {
+					req.AddBasicAuth(user.Name)
+				}
+				MakeRequest(t, req, status)
+			}
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeConda)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 2)
+
+			pds, err := packages.GetPackageDescriptors(t.Context(), pvs)
+			assert.NoError(t, err)
+
+			assert.Condition(t, func() bool {
+				for _, pd := range pds {
+					if pd.Package.Name == fullName {
+						return true
+					}
+				}
+				return false
+			})
+
+			for _, pd := range pds {
+				if pd.Package.Name == fullName {
+					assert.Nil(t, pd.SemVer)
+					assert.IsType(t, &conda_module.VersionMetadata{}, pd.Metadata)
+					assert.Equal(t, fullName, pd.Package.Name)
+					assert.Equal(t, packageVersion, pd.Version.Version)
+					assert.Equal(t, channel, pd.PackageProperties.GetByName(conda_module.PropertyChannel))
+				}
+			}
+		})
+	})
+
+	t.Run("Download", func(t *testing.T) {
+		t.Run(".tar.bz2", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequest(t, "GET", fmt.Sprintf("%s/noarch/%s-%s-xxx.tar.bz2", root, packageName, packageVersion))
+			MakeRequest(t, req, http.StatusOK)
+
+			req = NewRequest(t, "GET", fmt.Sprintf("%s/%s/noarch/%s-%s-xxx.tar.bz2", root, channel, packageName, packageVersion))
+			MakeRequest(t, req, http.StatusNotFound)
+		})
+
+		t.Run(".conda", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequest(t, "GET", fmt.Sprintf("%s/noarch/%s-%s-xxx.conda", root, packageName, packageVersion))
+			MakeRequest(t, req, http.StatusNotFound)
+
+			req = NewRequest(t, "GET", fmt.Sprintf("%s/%s/noarch/%s-%s-xxx.conda", root, channel, packageName, packageVersion))
+			MakeRequest(t, req, http.StatusOK)
+		})
+	})
+
+	t.Run("EnumeratePackages", func(t *testing.T) {
+		type Info struct {
+			Subdir string `json:"subdir"`
+		}
+
+		type PackageInfo struct {
+			Name          string   `json:"name"`
+			Version       string   `json:"version"`
+			NoArch        string   `json:"noarch"`
+			Subdir        string   `json:"subdir"`
+			Timestamp     int64    `json:"timestamp"`
+			Build         string   `json:"build"`
+			BuildNumber   int64    `json:"build_number"`
+			Dependencies  []string `json:"depends"`
+			License       string   `json:"license"`
+			LicenseFamily string   `json:"license_family"`
+			HashMD5       string   `json:"md5"`
+			HashSHA256    string   `json:"sha256"`
+			Size          int64    `json:"size"`
+		}
+
+		type RepoData struct {
+			Info          Info                    `json:"info"`
+			Packages      map[string]*PackageInfo `json:"packages"`
+			PackagesConda map[string]*PackageInfo `json:"packages.conda"`
+			Removed       map[string]*PackageInfo `json:"removed"`
+		}
+
+		for _, c := range []struct {
+			filename, contentType string
+		}{
+			{"repodata.json", "application/json"},
+			{"repodata.json.bz2", "application/x-bzip2"},
+			{"current_repodata.json", "application/json"},
+			{"current_repodata.json.bz2", "application/x-bzip2"},
+		} {
+			req := NewRequest(t, "GET", root+"/noarch/"+c.filename)
+			resp := MakeRequest(t, req, http.StatusOK)
+			assert.Equal(t, c.contentType, resp.Header().Get("Content-Type"))
+		}
+
+		for _, c := range []struct {
+			extension, name, root string
+		}{
+			{".tar.bz2", packageName, root},
+			{".conda", channel + "/" + packageName, root + "/" + channel},
+		} {
+			t.Run(c.extension, func(t *testing.T) {
+				defer tests.PrintCurrentTest(t)()
+
+				pv, err := packages.GetVersionByNameAndVersion(t.Context(), user.ID, packages.TypeConda, c.name, packageVersion)
+				assert.NoError(t, err)
+
+				pd, err := packages.GetPackageDescriptor(t.Context(), pv)
+				assert.NoError(t, err)
+
+				req := NewRequest(t, "GET", c.root+"/noarch/repodata.json")
+				resp := MakeRequest(t, req, http.StatusOK)
+
+				result := DecodeJSON(t, resp, &RepoData{})
+				packageInfos, otherPackages := result.Packages, result.PackagesConda
+				if c.extension == ".conda" {
+					packageInfos, otherPackages = result.PackagesConda, result.Packages
+				}
+
+				assert.Equal(t, "noarch", result.Info.Subdir)
+				assert.Empty(t, otherPackages)
+				assert.Empty(t, result.Removed)
+
+				filename := fmt.Sprintf("%s-%s-xxx%s", packageName, packageVersion, c.extension)
+				assert.Contains(t, packageInfos, filename)
+				packageInfo := packageInfos[filename]
+				assert.Equal(t, packageName, packageInfo.Name)
+				assert.Equal(t, packageVersion, packageInfo.Version)
+				assert.Equal(t, "noarch", packageInfo.Subdir)
+				assert.Equal(t, "xxx", packageInfo.Build)
+				assert.Equal(t, pd.Files[0].Blob.HashMD5, packageInfo.HashMD5)
+				assert.Equal(t, pd.Files[0].Blob.HashSHA256, packageInfo.HashSHA256)
+				assert.Equal(t, pd.Files[0].Blob.Size, packageInfo.Size)
+				assert.NotNil(t, packageInfo.Dependencies)
+				assert.Empty(t, packageInfo.Dependencies)
+			})
+		}
+	})
+}

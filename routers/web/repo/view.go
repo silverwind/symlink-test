@@ -1,0 +1,410 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	gocontext "context"
+	"errors"
+	"fmt"
+	"html/template"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"time"
+
+	activities_model "gitea.dev/models/activities"
+	admin_model "gitea.dev/models/admin"
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	"gitea.dev/models/gituser"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/charset"
+	"gitea.dev/modules/fileicon"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/typesniffer"
+	"gitea.dev/modules/util"
+	asymkey_service "gitea.dev/services/asymkey"
+	"gitea.dev/services/context"
+	repo_service "gitea.dev/services/repository"
+
+	_ "golang.org/x/image/bmp"  // for processing bmp images
+	_ "golang.org/x/image/webp" // for processing webp images
+	_ "image/gif"               // for processing gif images
+	_ "image/jpeg"              // for processing jpeg images
+	_ "image/png"               // for processing png images
+)
+
+const (
+	tplRepoEMPTY       templates.TplName = "repo/empty"
+	tplRepoHome        templates.TplName = "repo/home"
+	tplRepoView        templates.TplName = "repo/view"
+	tplRepoViewContent templates.TplName = "repo/view_content"
+	tplRepoViewList    templates.TplName = "repo/view_list"
+	tplWatchers        templates.TplName = "repo/watchers"
+	tplForks           templates.TplName = "repo/forks"
+	tplMigrating       templates.TplName = "repo/migrate/migrating"
+)
+
+type fileInfo struct {
+	blobOrLfsSize int64
+	lfsMeta       *lfs.Pointer
+	st            typesniffer.SniffedType
+}
+
+func (fi *fileInfo) isLFSFile() bool {
+	return fi.lfsMeta != nil && fi.lfsMeta.Oid != ""
+}
+
+func getFileReader(ctx gocontext.Context, repoID int64, blob *git.Blob) (buf []byte, dataRc io.ReadCloser, fi *fileInfo, err error) {
+	dataRc, err = blob.DataAsync(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	const prefetchSize = lfs.MetaFileMaxSize
+
+	buf = make([]byte, prefetchSize)
+	n, _ := util.ReadAtMost(dataRc, buf)
+	buf = buf[:n]
+
+	fi = &fileInfo{blobOrLfsSize: blob.Size(ctx), st: typesniffer.DetectContentType(buf)}
+
+	// FIXME: what happens when README file is an image?
+	if !fi.st.IsText() || !setting.LFS.StartServer {
+		return buf, dataRc, fi, nil
+	}
+
+	pointer, _ := lfs.ReadPointerFromBuffer(buf)
+	if !pointer.IsValid() { // fallback to a plain file
+		return buf, dataRc, fi, nil
+	}
+
+	meta, err := git_model.GetLFSMetaObjectByOid(ctx, repoID, pointer.Oid)
+	if err != nil { // fallback to a plain file
+		fi.lfsMeta = &pointer
+		log.Warn("Unable to access LFS pointer %s in repo %d: %v", pointer.Oid, repoID, err)
+		return buf, dataRc, fi, nil
+	}
+
+	// close the old dataRc and open the real LFS target
+	_ = dataRc.Close()
+	dataRc, err = lfs.ReadMetaObject(pointer)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	buf = make([]byte, prefetchSize)
+	n, err = util.ReadAtMost(dataRc, buf)
+	if err != nil {
+		_ = dataRc.Close()
+		return nil, nil, fi, err
+	}
+	buf = buf[:n]
+	fi.st = typesniffer.DetectContentType(buf)
+	fi.blobOrLfsSize = meta.Pointer.Size
+	fi.lfsMeta = &meta.Pointer
+	return buf, dataRc, fi, nil
+}
+
+func loadLatestCommitData(ctx *context.Context, latestCommit *git.Commit) bool {
+	// Show latest commit info of repository in table header,
+	// or of directory if not in root directory.
+	ctx.Data["LatestCommit"] = latestCommit
+	if latestCommit != nil {
+		verification := asymkey_service.ParseCommitWithSignature(ctx, latestCommit)
+
+		if err := asymkey_model.CalculateTrustStatus(verification, ctx.Repo.Repository.GetTrustModel(), func(user *user_model.User) (bool, error) {
+			return repo_model.HasAccessToRepoCodeUnit(ctx, ctx.Repo.Repository, user.ID)
+		}, nil); err != nil {
+			ctx.ServerError("CalculateTrustStatus", err)
+			return false
+		}
+
+		avatarStackData := gituser.BuildAvatarStackData(ctx, latestCommit.AllAuthorIdentities(), nil)
+		avatarStackData.SearchByEmailLink = gituser.RepoCommitSearchByEmailLink(ctx.Repo.RepoLink, ctx.Repo.RefFullName)
+		ctx.Data["LatestCommitAvatarStackData"] = avatarStackData
+		ctx.Data["LatestCommitVerification"] = verification
+
+		statuses, err := git_model.GetLatestCommitStatus(ctx, ctx.Repo.Repository.ID, latestCommit.ID.String(), db.ListOptionsAll)
+		if err != nil {
+			log.Error("GetLatestCommitStatus: %v", err)
+		}
+		git_model.CommitStatusesApplyDoerPermission(ctx, ctx.Doer, statuses)
+
+		ctx.Data["LatestCommitStatus"] = git_model.CalcCommitStatus(statuses)
+		ctx.Data["LatestCommitStatuses"] = statuses
+	}
+
+	return true
+}
+
+func markupRenderToHTML(ctx *context.Context, renderCtx *markup.RenderContext, renderer markup.Renderer, input io.Reader) (escaped *charset.EscapeStatus, output template.HTML, err error) {
+	markupRd, markupWr := io.Pipe()
+	defer markupWr.Close()
+
+	done := make(chan struct{})
+	go func() {
+		sb := &htmlutil.HTMLBuilder{}
+		if markup.RendererNeedPostProcess(renderer) {
+			escaped, _ = charset.EscapeControlReader(markupRd, sb, ctx.Locale, charset.EscapeOptionsForView())
+		} else {
+			escaped = &charset.EscapeStatus{}
+			_, _ = io.Copy(sb.OriginWriter(), markupRd)
+		}
+		output = sb.HTMLString()
+		close(done)
+	}()
+
+	err = markup.RenderWithRenderer(renderCtx, renderer, input, markupWr)
+	_ = markupWr.CloseWithError(err)
+	<-done
+	return escaped, output, err
+}
+
+func checkHomeCodeViewable(ctx *context.Context) {
+	if ctx.Repo.Permission.HasUnits() {
+		if ctx.Repo.Repository.IsBeingCreated() {
+			task, err := admin_model.GetMigratingTask(ctx, ctx.Repo.Repository.ID)
+			if err != nil {
+				if admin_model.IsErrTaskDoesNotExist(err) {
+					ctx.Data["CloneAddr"] = ""
+					ctx.Data["Failed"] = true
+					ctx.HTML(http.StatusOK, tplMigrating)
+					return
+				}
+				ctx.ServerError("models.GetMigratingTask", err)
+				return
+			}
+			cfg, err := task.MigrateConfig()
+			if err != nil {
+				ctx.ServerError("task.MigrateConfig", err)
+				return
+			}
+
+			ctx.Data["MigrateTask"] = task
+			ctx.Data["CloneAddr"], _ = util.SanitizeURL(cfg.CloneAddr)
+			ctx.Data["Failed"] = task.Status == structs.TaskStatusFailed
+			ctx.HTML(http.StatusOK, tplMigrating)
+			return
+		}
+
+		if ctx.IsSigned {
+			// Set repo notification-status read if unread
+			if err := activities_model.SetRepoReadBy(ctx, ctx.Repo.Repository.ID, ctx.Doer.ID); err != nil {
+				ctx.ServerError("ReadBy", err)
+				return
+			}
+		}
+
+		var firstUnit *unit_model.Unit
+		for _, repoUnitType := range ctx.Repo.Permission.ReadableUnitTypes() {
+			if repoUnitType == unit_model.TypeCode {
+				// we are doing this check in "code" unit related pages, so if the code unit is readable, no need to do any further redirection
+				return
+			}
+
+			unit, ok := unit_model.Units[repoUnitType]
+			if ok && (firstUnit == nil || !firstUnit.IsLessThan(unit)) {
+				firstUnit = &unit
+			}
+		}
+
+		if firstUnit != nil {
+			ctx.Redirect(fmt.Sprintf("%s%s", ctx.Repo.Repository.Link(), firstUnit.URI))
+			return
+		}
+	}
+
+	ctx.NotFound(errors.New(ctx.Locale.TrString("units.error.no_unit_allowed_repo")))
+}
+
+// LastCommit returns lastCommit data for the provided branch/tag/commit and directory (in url) and filenames in body
+func LastCommit(ctx *context.Context) {
+	checkHomeCodeViewable(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	// The "/lastcommit/" endpoint is used to render the embedded HTML content for the directory file listing with latest commit info
+	// It needs to construct correct links to the file items, but the route only accepts a commit ID, not a full ref name (branch or tag).
+	// So we need to get the ref name from the query parameter "refSubUrl".
+	// TODO: LAST-COMMIT-ASYNC-LOADING: it needs more tests to cover this
+	refSubURL := path.Clean(ctx.FormString("refSubUrl"))
+	prepareRepoViewContent(ctx, util.IfZero(refSubURL, ctx.Repo.RefTypeNameSubURL()))
+	renderDirectoryFiles(ctx, 0)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.HTML(http.StatusOK, tplRepoViewList)
+}
+
+func prepareDirectoryFileIcons(ctx *context.Context, files []git.CommitInfo) {
+	renderedIconPool := fileicon.NewRenderedIconPool()
+	fileIcons := map[string]template.HTML{}
+	for _, f := range files {
+		fullPath := path.Join(ctx.Repo.TreePath, f.Entry.Name())
+		entryInfo := fileicon.EntryInfoFromGitTreeEntry(ctx, ctx.Repo.GitRepo, ctx.Repo.Commit, fullPath, f.Entry)
+		fileIcons[f.Entry.Name()] = fileicon.RenderEntryIconHTML(renderedIconPool, entryInfo)
+	}
+	fileIcons[".."] = fileicon.RenderEntryIconHTML(renderedIconPool, fileicon.EntryInfoFolder())
+	ctx.Data["FileIcons"] = fileIcons
+	ctx.Data["FileIconPoolHTML"] = renderedIconPool.RenderToHTML()
+}
+
+func renderDirectoryFiles(ctx *context.Context, timeout time.Duration) (*git.TreeEntry, git.Entries) {
+	tree, err := ctx.Repo.Commit.SubTree(ctx, ctx.Repo.GitRepo, ctx.Repo.TreePath)
+	if err != nil {
+		HandleGitError(ctx, "Repo.Commit.SubTree", err)
+		return nil, nil
+	}
+
+	// TODO: LAST-COMMIT-ASYNC-LOADING: search this keyword to see more details
+	lastCommitLoaderURL := ctx.Repo.RepoLink + "/lastcommit/" + url.PathEscape(ctx.Repo.CommitID) + "/" + util.PathEscapeSegments(ctx.Repo.TreePath)
+	ctx.Data["LastCommitLoaderURL"] = lastCommitLoaderURL + "?refSubUrl=" + url.QueryEscape(ctx.Repo.RefTypeNameSubURL())
+
+	// Get current entry user currently looking at.
+	entry, err := ctx.Repo.Commit.GetTreeEntryByPath(ctx, ctx.Repo.GitRepo, ctx.Repo.TreePath)
+	if err != nil {
+		HandleGitError(ctx, "Repo.Commit.GetTreeEntryByPath", err)
+		return nil, nil
+	}
+
+	if !entry.IsDir() {
+		HandleGitError(ctx, "Repo.Commit.GetTreeEntryByPath", err)
+		return nil, nil
+	}
+
+	subEntries, err := tree.ListEntries(ctx, ctx.Repo.GitRepo)
+	if err != nil {
+		ctx.ServerError("ListEntries", err)
+		return nil, nil
+	}
+	subEntries.CustomSort(base.NaturalSortCompare)
+
+	files, latestCommit, err := subEntries.GetCommitsInfo(ctx, timeout, ctx.Repo.RepoLink, ctx.Repo.GitRepo, ctx.Repo.Commit, ctx.Repo.TreePath)
+	if err != nil {
+		ctx.ServerError("GetCommitsInfo", err)
+		return nil, nil
+	}
+
+	{ // this block is for testing purpose only
+		if timeout != 0 && !setting.IsProd && !setting.IsInTesting {
+			log.Debug("first call to get directory file commit info")
+			clearFilesCommitInfo := func() {
+				log.Warn("clear directory file commit info to force async loading on frontend")
+				for i := range files {
+					if i%2 == 0 { // for testing purpose, only clear half of the files' commit info
+						files[i].Commit = nil
+					}
+				}
+			}
+			_ = clearFilesCommitInfo
+			// clearFilesCommitInfo() // TODO: LAST-COMMIT-ASYNC-LOADING: debug the frontend async latest commit info loading, uncomment this line, and it needs more tests
+		}
+	}
+
+	ctx.Data["Files"] = files
+	ctx.Data["GetSubJumpablePathName"] = func(entry *git.TreeEntry) string {
+		return entry.GetSubJumpablePathName(ctx, ctx.Repo.GitRepo)
+	}
+	prepareDirectoryFileIcons(ctx, files)
+	for _, f := range files {
+		if f.Commit == nil {
+			ctx.Data["HasFilesWithoutLatestCommit"] = true
+			break
+		}
+	}
+
+	if !loadLatestCommitData(ctx, latestCommit) {
+		return nil, nil
+	}
+	return entry, subEntries
+}
+
+// RenderUserCards render a page show users according the input template
+func RenderUserCards(ctx *context.Context, total int, getter func(opts db.ListOptions) ([]*user_model.User, error), tpl templates.TplName) {
+	page := ctx.FormInt("page")
+	if page <= 0 {
+		page = 1
+	}
+	pager := context.NewPagerBuilder(ctx).TotalCount(int64(total)).PerPageLimit(setting.ItemsPerPage).CurPage(page).Build()
+	ctx.Data["Page"] = pager
+
+	items, err := getter(db.ListOptions{
+		Page:     pager.Paginator.Current(),
+		PageSize: setting.ItemsPerPage,
+	})
+	if err != nil {
+		ctx.ServerError("getter", err)
+		return
+	}
+	ctx.Data["Cards"] = items
+
+	ctx.HTML(http.StatusOK, tpl)
+}
+
+// Watchers render repository's watch users
+func Watchers(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("repo.watchers")
+	ctx.Data["CardsTitle"] = ctx.Tr("repo.watchers")
+	RenderUserCards(ctx, ctx.Repo.Repository.NumWatches, func(opts db.ListOptions) ([]*user_model.User, error) {
+		return repo_model.GetRepoWatchers(ctx, ctx.Repo.Repository.ID, opts)
+	}, tplWatchers)
+}
+
+// Stars render repository's starred users
+func Stars(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("repo.stargazers")
+	ctx.Data["CardsTitle"] = ctx.Tr("repo.stargazers")
+	RenderUserCards(ctx, ctx.Repo.Repository.NumStars, func(opts db.ListOptions) ([]*user_model.User, error) {
+		return repo_model.GetStargazers(ctx, ctx.Repo.Repository, opts)
+	}, tplWatchers)
+}
+
+// Forks render repository's forked users
+func Forks(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("repo.forks")
+
+	page := ctx.FormInt("page")
+	if page <= 0 {
+		page = 1
+	}
+	pageSize := setting.ItemsPerPage
+
+	forks, total, err := repo_service.FindForks(ctx, ctx.Repo.Repository, ctx.Doer, db.ListOptions{
+		Page:     page,
+		PageSize: pageSize,
+	})
+	if err != nil {
+		ctx.ServerError("FindForks", err)
+		return
+	}
+
+	if err := repo_model.RepositoryList(forks).LoadOwners(ctx); err != nil {
+		ctx.ServerError("LoadAttributes", err)
+		return
+	}
+
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(pageSize).CurPage(page).Build()
+	ctx.Data["ShowRepoOwnerAvatar"] = true
+	ctx.Data["ShowRepoOwnerOnList"] = true
+	ctx.Data["Page"] = pager
+	ctx.Data["Repos"] = forks
+
+	ctx.HTML(http.StatusOK, tplForks)
+}

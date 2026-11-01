@@ -1,0 +1,286 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+	"time"
+
+	"gitea.dev/modules/generate"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/ssh"
+	"gitea.dev/modules/util"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func withKeyFile(t *testing.T, keyname string, callback func(string)) {
+	tmpDir := t.TempDir()
+
+	err := os.Chmod(tmpDir, 0o700)
+	assert.NoError(t, err)
+
+	keyFile := filepath.Join(tmpDir, keyname)
+	err = ssh.GenKeyPair(keyFile, generate.SSHKeyECDSA, 0)
+	assert.NoError(t, err)
+
+	err = os.WriteFile(filepath.Join(tmpDir, "ssh"), []byte("#!/bin/bash\n"+
+		"ssh -F none -o \"UserKnownHostsFile=/dev/null\" -o \"StrictHostKeyChecking=no\" -o \"IdentitiesOnly=yes\" -i \""+keyFile+"\" \"$@\""), 0o700)
+	assert.NoError(t, err)
+
+	// Setup ssh wrapper
+	t.Setenv("GIT_SSH", filepath.Join(tmpDir, "ssh"))
+	t.Setenv("GIT_SSH_COMMAND",
+		"ssh -F none -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -i \""+keyFile+"\"")
+	t.Setenv("GIT_SSH_VARIANT", "ssh")
+
+	callback(keyFile)
+}
+
+func createSSHUrl(gitPath string, u *url.URL) *url.URL {
+	u2 := *u
+	u2.Scheme = "ssh"
+	u2.User = url.User("git")
+	u2.Host = net.JoinHostPort(setting.SSH.ListenHost, strconv.Itoa(setting.SSH.ListenPort))
+	u2.Path = gitPath
+	return &u2
+}
+
+// gitAddChangesDeprecated marks local changes to be ready for commit.
+// Deprecated: use "git fast-import" instead for better performance and more control over the commit creation.
+func gitAddChangesDeprecated(ctx context.Context, repoPath string, all bool, files ...string) error {
+	cmd := gitcmd.NewCommand().AddArguments("add")
+	if all {
+		cmd.AddArguments("--all")
+	}
+	cmd.AddDashesAndList(files...)
+	_, _, err := cmd.WithDir(repoPath).RunStdString(ctx)
+	return err
+}
+
+// CommitChangesOptions the options when a commit created
+type gitCommitChangesOptions struct {
+	Committer *git.Signature
+	Author    *git.Signature
+	Message   string
+}
+
+// gitCommitChangesDeprecated commits local changes with given committer, author and message.
+// If author is nil, it will be the same as committer.
+// Deprecated: use "git fast-import" instead for better performance and more control over the commit creation.
+func gitCommitChangesDeprecated(ctx context.Context, repoPath string, opts gitCommitChangesOptions) error {
+	cmd := gitcmd.NewCommand()
+	if opts.Committer != nil {
+		cmd.AddOptionValues("-c", "user.name="+opts.Committer.Name)
+		cmd.AddOptionValues("-c", "user.email="+opts.Committer.Email)
+	}
+	cmd.AddArguments("commit")
+
+	if opts.Author == nil {
+		opts.Author = opts.Committer
+	}
+	if opts.Author != nil {
+		cmd.AddOptionFormat("--author='%s <%s>'", opts.Author.Name, opts.Author.Email)
+	}
+	cmd.AddOptionFormat("--message=%s", opts.Message)
+
+	_, _, err := cmd.WithDir(repoPath).RunStdString(ctx)
+	// No stderr but exit status 1 means nothing to commit.
+	if gitcmd.IsErrorExitCode(err, 1) {
+		return nil
+	}
+	return err
+}
+
+func onGiteaRun[T testing.TB](t T, callback func(T, *url.URL)) {
+	defer tests.PrepareTestEnv(t, 1)()
+	s := http.Server{
+		Handler: testWebRoutes,
+	}
+
+	u, err := url.Parse(setting.AppURL)
+	assert.NoError(t, err)
+	listener, err := net.Listen("tcp", u.Host)
+	i := 0
+	for err != nil && i <= 10 {
+		time.Sleep(100 * time.Millisecond)
+		listener, err = net.Listen("tcp", u.Host)
+		i++
+	}
+	assert.NoError(t, err)
+	u.Host = listener.Addr().String()
+
+	defer func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+		s.Shutdown(ctx)
+		cancel()
+	}()
+
+	go s.Serve(listener)
+	// Started by config go ssh.Listen(setting.SSH.ListenHost, setting.SSH.ListenPort, setting.SSH.ServerCiphers, setting.SSH.ServerKeyExchanges, setting.SSH.ServerMACs)
+
+	callback(t, u)
+}
+
+func doGitClone(dstLocalPath string, u *url.URL) func(*testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+		assert.NoError(t, git.Clone(t.Context(), u.String(), dstLocalPath, git.CloneRepoOptions{}))
+		exist, err := util.IsExist(filepath.Join(dstLocalPath, "README.md"))
+		assert.NoError(t, err)
+		assert.True(t, exist)
+	}
+}
+
+func doPartialGitClone(dstLocalPath string, u *url.URL) func(*testing.T) {
+	return func(t *testing.T) {
+		assert.NoError(t, git.Clone(t.Context(), u.String(), dstLocalPath, git.CloneRepoOptions{
+			Filter: "blob:none",
+		}))
+		exist, err := util.IsExist(filepath.Join(dstLocalPath, "README.md"))
+		assert.NoError(t, err)
+		assert.True(t, exist)
+	}
+}
+
+func doGitCloneFail(u *url.URL) func(*testing.T) {
+	return func(t *testing.T) {
+		tmpDir := t.TempDir()
+		assert.Error(t, git.Clone(t.Context(), u.String(), tmpDir, git.CloneRepoOptions{}))
+		exist, err := util.IsExist(filepath.Join(tmpDir, "README.md"))
+		assert.NoError(t, err)
+		assert.False(t, exist)
+	}
+}
+
+func doGitInitTestRepository(dstPath string) func(*testing.T) {
+	return func(t *testing.T) {
+		// Init repository in dstPath
+		assert.NoError(t, git.InitRepositoryLocal(t.Context(), dstPath, false, git.Sha1ObjectFormat.Name(), "master"))
+		assert.NoError(t, os.WriteFile(filepath.Join(dstPath, "README.md"), []byte("# Testing Repository\n\nOriginally created in: "+dstPath), 0o644))
+		assert.NoError(t, gitAddChangesDeprecated(t.Context(), dstPath, true))
+		signature := git.Signature{
+			Email: "test@example.com",
+			Name:  "test",
+			When:  time.Now(),
+		}
+		assert.NoError(t, gitCommitChangesDeprecated(t.Context(), dstPath, gitCommitChangesOptions{
+			Committer: &signature,
+			Author:    &signature,
+			Message:   "Initial Commit",
+		}))
+	}
+}
+
+func doGitAddRemote(dstPath, remoteName string, u *url.URL) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand("remote", "add").AddDynamicArguments(remoteName, u.String()).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+	}
+}
+
+func doGitPushTestRepository(dstPath string, args ...string) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand("push", "-u").AddArguments(gitcmd.ToTrustedCmdArgs(args)...).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+	}
+}
+
+func doGitPushTestRepositoryFail(dstPath string, args ...string) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand("push").AddArguments(gitcmd.ToTrustedCmdArgs(args)...).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.Error(t, err)
+	}
+}
+
+type localGitAddCommitOptions struct {
+	LocalRepoPath   string
+	CheckoutBranch  string
+	TreeFilePath    string
+	TreeFileContent string
+}
+
+func doGitCheckoutWriteFileCommit(opts localGitAddCommitOptions) func(*testing.T) {
+	return func(t *testing.T) {
+		doGitCheckoutBranch(opts.LocalRepoPath, opts.CheckoutBranch)(t)
+		localFilePath := filepath.Join(opts.LocalRepoPath, opts.TreeFilePath)
+		require.NoError(t, os.WriteFile(localFilePath, []byte(opts.TreeFileContent), 0o644))
+		require.NoError(t, gitAddChangesDeprecated(t.Context(), opts.LocalRepoPath, true))
+		signature := git.Signature{
+			Email: "test@test.test",
+			Name:  "test",
+		}
+		require.NoError(t, gitCommitChangesDeprecated(t.Context(), opts.LocalRepoPath, gitCommitChangesOptions{
+			Committer: &signature,
+			Author:    &signature,
+			Message:   fmt.Sprintf("update %s @ %s", opts.TreeFilePath, opts.CheckoutBranch),
+		}))
+	}
+}
+
+func doGitCreateBranch(dstPath, branch string) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand("checkout", "-b").AddDynamicArguments(branch).
+			WithDir(dstPath).RunStdString(t.Context())
+		assert.NoError(t, err)
+	}
+}
+
+func doGitCheckoutBranch(dstPath string, args ...string) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand().AddArguments("checkout").
+			AddArguments(gitcmd.ToTrustedCmdArgs(args)...).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+	}
+}
+
+func doGitMerge(dstPath string, args ...string) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand("merge").AddArguments(gitcmd.ToTrustedCmdArgs(args)...).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+	}
+}
+
+func doGitPull(dstPath string, args ...string) func(*testing.T) {
+	return func(t *testing.T) {
+		_, _, err := gitcmd.NewCommand().AddArguments("pull").AddArguments(gitcmd.ToTrustedCmdArgs(args)...).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+	}
+}
+
+// doGitRemoteArchive runs a git archive command requesting an archive from remote
+// and verifies that the command did not error out and returned only normal output
+func doGitRemoteArchive(remote string, args ...string) func(*testing.T) {
+	return func(t *testing.T) {
+		stdout, stderr, err := gitcmd.NewCommand("archive").AddOptionValues("--remote", remote).AddArguments(gitcmd.ToTrustedCmdArgs(args)...).
+			RunStdString(t.Context())
+		require.NoError(t, err)
+		assert.Empty(t, stderr)
+		assert.NotEmpty(t, stdout)
+	}
+}

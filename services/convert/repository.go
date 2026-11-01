@@ -1,0 +1,280 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package convert
+
+import (
+	"context"
+	"time"
+
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	"gitea.dev/modules/log"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+)
+
+// ToRepo converts a Repository to api.Repository
+func ToRepo(ctx context.Context, repo *repo_model.Repository, permissionInRepo access_model.Permission) *api.Repository {
+	return innerToRepo(ctx, repo, permissionInRepo, false)
+}
+
+func innerToRepo(ctx context.Context, repo *repo_model.Repository, permissionInRepo access_model.Permission, isParent bool) *api.Repository {
+	var parent *api.Repository
+
+	if !permissionInRepo.HasUnits() && permissionInRepo.AccessMode > perm.AccessModeNone {
+		// If units is empty, it means that it's a hard-coded permission, like access_model.Permission{AccessMode: perm.AccessModeAdmin}
+		// So we need to load units for the repo, otherwise UnitAccessMode will just return perm.AccessModeNone.
+		// TODO: this logic is still not right (because unit modes are not correctly prepared)
+		//   the caller should prepare a proper "permission" before calling this function.
+		_ = repo.LoadUnits(ctx) // the error is not important, so ignore it
+		permissionInRepo.SetUnitsWithDefaultAccessMode(repo.Units, permissionInRepo.AccessMode)
+	}
+
+	// TODO: ideally we should pass "doer" into "ToRepo" to make CloneLink could generate user-related links
+	// And passing "doer" in will also fix other FIXMEs in this file.
+	cloneLink := repo.CloneLinkGeneral(ctx) // no doer at the moment
+	permission := &api.Permission{
+		Admin: permissionInRepo.AccessMode >= perm.AccessModeAdmin,
+		Push:  permissionInRepo.UnitAccessMode(unit_model.TypeCode) >= perm.AccessModeWrite,
+		Pull:  permissionInRepo.UnitAccessMode(unit_model.TypeCode) >= perm.AccessModeRead,
+	}
+	if !isParent {
+		err := repo.GetBaseRepo(ctx)
+		if err != nil {
+			return nil
+		}
+		if repo.BaseRepo != nil {
+			// FIXME: The permission of the parent repo is not correct.
+			//        It's the permission of the current repo, so it's probably different from the parent repo.
+			//        But there isn't a good way to get the permission of the parent repo, because the doer is not passed in.
+			//        Use the permission of the current repo to keep the behavior consistent with the old API.
+			//        Maybe the right way is setting the permission of the parent repo to nil, empty is better than wrong.
+			parent = innerToRepo(ctx, repo.BaseRepo, permissionInRepo, true)
+		}
+	}
+
+	// check enabled/disabled units
+	hasIssues := false
+	var externalTracker *api.ExternalTracker
+	var internalTracker *api.InternalTracker
+	if unit, err := repo.GetUnit(ctx, unit_model.TypeIssues); err == nil {
+		config := unit.IssuesConfig()
+		hasIssues = true
+		internalTracker = &api.InternalTracker{
+			EnableTimeTracker:                config.EnableTimetracker,
+			AllowOnlyContributorsToTrackTime: config.AllowOnlyContributorsToTrackTime,
+			EnableIssueDependencies:          config.EnableDependencies,
+		}
+	} else if unit, err := repo.GetUnit(ctx, unit_model.TypeExternalTracker); err == nil {
+		config := unit.ExternalTrackerConfig()
+		hasIssues = true
+		externalTracker = &api.ExternalTracker{
+			ExternalTrackerURL:           config.ExternalTrackerURL,
+			ExternalTrackerFormat:        config.ExternalTrackerFormat,
+			ExternalTrackerStyle:         config.ExternalTrackerStyle,
+			ExternalTrackerRegexpPattern: config.ExternalTrackerRegexpPattern,
+		}
+	}
+	hasWiki := false
+	var externalWiki *api.ExternalWiki
+	if _, err := repo.GetUnit(ctx, unit_model.TypeWiki); err == nil {
+		hasWiki = true
+	} else if unit, err := repo.GetUnit(ctx, unit_model.TypeExternalWiki); err == nil {
+		hasWiki = true
+		config := unit.ExternalWikiConfig()
+		externalWiki = &api.ExternalWiki{
+			ExternalWikiURL: config.ExternalWikiURL,
+		}
+	}
+	hasPullRequests := false
+	ignoreWhitespaceConflicts := false
+	allowMerge := false
+	allowRebase := false
+	allowRebaseMerge := false
+	allowSquash := false
+	allowFastForwardOnly := false
+	allowMergeUpdate := false
+	allowRebaseUpdate := false
+	allowManualMerge := true
+	autodetectManualMerge := false
+	defaultDeleteBranchAfterMerge := false
+	defaultMergeStyle := repo_model.MergeStyleMerge
+	defaultUpdateStyle := repo_model.UpdateStyleMerge
+	defaultSquashMergeMessage := repo_model.DefaultPullRequestsConfig().DefaultSquashMergeMessage
+	defaultAllowMaintainerEdit := false
+	defaultTargetBranch := ""
+	if unit, err := repo.GetUnit(ctx, unit_model.TypePullRequests); err == nil {
+		config := unit.PullRequestsConfig()
+		hasPullRequests = true
+		ignoreWhitespaceConflicts = config.IgnoreWhitespaceConflicts
+		allowMerge = config.AllowMerge
+		allowRebase = config.AllowRebase
+		allowRebaseMerge = config.AllowRebaseMerge
+		allowSquash = config.AllowSquash
+		allowFastForwardOnly = config.AllowFastForwardOnly
+		allowMergeUpdate = config.AllowMergeUpdate
+		allowRebaseUpdate = config.AllowRebaseUpdate
+		allowManualMerge = config.AllowManualMerge
+		autodetectManualMerge = config.AutodetectManualMerge
+		defaultDeleteBranchAfterMerge = config.DefaultDeleteBranchAfterMerge
+		defaultMergeStyle = config.DefaultMergeStyle
+		defaultUpdateStyle = config.DefaultUpdateStyle
+		defaultSquashMergeMessage = config.DefaultSquashMergeMessage
+		defaultAllowMaintainerEdit = config.DefaultAllowMaintainerEdit
+		defaultTargetBranch = config.DefaultTargetBranch
+	}
+	hasProjects := false
+	projectsMode := repo_model.ProjectsModeAll
+	if unit, err := repo.GetUnit(ctx, unit_model.TypeProjects); err == nil {
+		hasProjects = true
+		config := unit.ProjectsConfig()
+		projectsMode = config.ProjectsMode
+	}
+
+	hasCode := repo.UnitEnabled(ctx, unit_model.TypeCode)
+	hasReleases := repo.UnitEnabled(ctx, unit_model.TypeReleases)
+	hasPackages := repo.UnitEnabled(ctx, unit_model.TypePackages)
+	hasActions := repo.UnitEnabled(ctx, unit_model.TypeActions)
+
+	if err := repo.LoadOwner(ctx); err != nil {
+		return nil
+	}
+
+	numReleases, _ := db.Count[repo_model.Release](ctx, repo_model.FindReleasesOptions{
+		IncludeDrafts: false,
+		IncludeTags:   false,
+		RepoID:        repo.ID,
+	})
+
+	branchCount, err := git_model.CountBranches(ctx, repo.ID, false)
+	if err != nil {
+		log.Error("CountBranches [%d]: %v", repo.ID, err)
+	}
+
+	mirrorInterval := ""
+	var mirrorUpdated time.Time
+	var lastSync time.Time
+	if repo.IsMirror {
+		pullMirror, err := repo_model.GetMirrorByRepoID(ctx, repo.ID)
+		if err == nil {
+			mirrorInterval = pullMirror.Interval.String()
+			mirrorUpdated = pullMirror.UpdatedUnix.AsTime()
+			lastSync = pullMirror.LastSyncUnix.AsTime()
+		}
+	}
+
+	var transfer *api.RepoTransfer
+	if repo.Status == repo_model.RepositoryPendingTransfer {
+		t, err := repo_model.GetPendingRepositoryTransfer(ctx, repo)
+		if err != nil && !repo_model.IsErrNoPendingTransfer(err) {
+			log.Warn("GetPendingRepositoryTransfer: %v", err)
+		} else {
+			if err := t.LoadAttributes(ctx); err != nil {
+				log.Warn("LoadAttributes of RepoTransfer: %v", err)
+			} else {
+				transfer = ToRepoTransfer(ctx, t)
+			}
+		}
+	}
+
+	var language string
+	if repo.PrimaryLanguage != nil {
+		language = repo.PrimaryLanguage.Language
+	}
+
+	repoLicenses, err := repo_model.GetRepoLicenses(ctx, repo)
+	if err != nil {
+		return nil
+	}
+
+	repoAPIURL := repo.APIURL()
+
+	return &api.Repository{
+		ID:                            repo.ID,
+		Owner:                         ToUserWithAccessMode(ctx, repo.Owner, permissionInRepo.AccessMode),
+		Name:                          repo.Name,
+		FullName:                      repo.FullName(),
+		Description:                   repo.Description,
+		Private:                       repo.IsPrivate,
+		Template:                      repo.IsTemplate,
+		Empty:                         repo.IsEmpty,
+		Archived:                      repo.IsArchived,
+		Size:                          int(repo.Size / 1024),
+		Fork:                          repo.IsFork,
+		Parent:                        parent,
+		Mirror:                        repo.IsMirror,
+		HTMLURL:                       repo.HTMLURL(ctx),
+		URL:                           repoAPIURL,
+		SSHURL:                        cloneLink.SSH,
+		CloneURL:                      cloneLink.HTTPS,
+		OriginalURL:                   repo.SanitizedOriginalURL(),
+		Website:                       repo.Website,
+		Language:                      language,
+		LanguagesURL:                  repoAPIURL + "/languages",
+		Stars:                         repo.NumStars,
+		Forks:                         repo.NumForks,
+		Watchers:                      repo.NumWatches,
+		BranchCount:                   int(branchCount),
+		OpenIssues:                    repo.NumOpenIssues,
+		OpenPulls:                     repo.NumOpenPulls,
+		Releases:                      int(numReleases),
+		DefaultBranch:                 repo.DefaultBranch,
+		Created:                       repo.CreatedUnix.AsTime(),
+		Updated:                       repo.UpdatedUnix.AsTime(),
+		ArchivedAt:                    repo.ArchivedUnix.AsTime(),
+		Permissions:                   permission,
+		HasCode:                       hasCode,
+		HasIssues:                     hasIssues,
+		ExternalTracker:               externalTracker,
+		InternalTracker:               internalTracker,
+		HasWiki:                       hasWiki,
+		HasProjects:                   hasProjects,
+		ProjectsMode:                  string(projectsMode),
+		HasReleases:                   hasReleases,
+		HasPackages:                   hasPackages,
+		HasActions:                    hasActions,
+		ExternalWiki:                  externalWiki,
+		HasPullRequests:               hasPullRequests,
+		IgnoreWhitespaceConflicts:     ignoreWhitespaceConflicts,
+		AllowMerge:                    allowMerge,
+		AllowRebase:                   allowRebase,
+		AllowRebaseMerge:              allowRebaseMerge,
+		AllowSquash:                   allowSquash,
+		AllowFastForwardOnly:          allowFastForwardOnly,
+		AllowMergeUpdate:              allowMergeUpdate,
+		AllowRebaseUpdate:             allowRebaseUpdate,
+		AllowManualMerge:              allowManualMerge,
+		AutodetectManualMerge:         autodetectManualMerge,
+		DefaultDeleteBranchAfterMerge: defaultDeleteBranchAfterMerge,
+		DefaultMergeStyle:             string(defaultMergeStyle),
+		DefaultUpdateStyle:            string(defaultUpdateStyle),
+		SquashMergeCommitMessage:      string(defaultSquashMergeMessage),
+		DefaultAllowMaintainerEdit:    defaultAllowMaintainerEdit,
+		DefaultTargetBranch:           defaultTargetBranch,
+		AvatarURL:                     repo.AvatarLink(ctx),
+		Internal:                      !repo.IsPrivate && repo.Owner.Visibility == api.VisibleTypePrivate,
+		MirrorLastSyncAt:              lastSync,
+		MirrorInterval:                mirrorInterval,
+		MirrorUpdated:                 mirrorUpdated,
+		RepoTransfer:                  transfer,
+		Topics:                        util.SliceNilAsEmpty(repo.Topics),
+		ObjectFormatName:              api.ObjectFormatName(repo.ObjectFormatName),
+		Licenses:                      util.SliceNilAsEmpty(repoLicenses.StringList()),
+	}
+}
+
+// ToRepoTransfer convert a models.RepoTransfer to a structs.RepeTransfer
+func ToRepoTransfer(ctx context.Context, t *repo_model.RepoTransfer) *api.RepoTransfer {
+	teams, _ := ToTeams(ctx, t.Teams, false)
+
+	return &api.RepoTransfer{
+		Doer:      ToUser(ctx, t.Doer, nil),
+		Recipient: ToUser(ctx, t.Recipient, nil),
+		Teams:     teams,
+	}
+}

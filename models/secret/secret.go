@@ -1,0 +1,253 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package secret
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	actions_module "gitea.dev/modules/actions"
+	"gitea.dev/modules/actions/jobparser"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	secret_module "gitea.dev/modules/secret"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+
+	"xorm.io/builder"
+)
+
+// Secret represents a secret
+//
+// It can be:
+//  1. org/user level secret, OwnerID is org/user ID and RepoID is 0
+//  2. repo level secret, OwnerID is 0 and RepoID is repo ID
+//
+// Please note that it's not acceptable to have both OwnerID and RepoID to be non-zero,
+// or it will be complicated to find secrets belonging to a specific owner.
+// For example, conditions like `OwnerID = 1` will also return secret {OwnerID: 1, RepoID: 1},
+// but it's a repo level secret, not an org/user level secret.
+// To avoid this, make it clear with {OwnerID: 0, RepoID: 1} for repo level secrets.
+//
+// Please note that it's not acceptable to have both OwnerID and RepoID to zero, global secrets are not supported.
+// It's for security reasons, admin may be not aware of that the secrets could be stolen by any user when setting them as global.
+type Secret struct {
+	ID          int64
+	OwnerID     int64              `xorm:"INDEX UNIQUE(owner_repo_name) NOT NULL"`
+	RepoID      int64              `xorm:"INDEX UNIQUE(owner_repo_name) NOT NULL DEFAULT 0"`
+	Name        string             `xorm:"UNIQUE(owner_repo_name) NOT NULL"`
+	Data        string             `xorm:"LONGTEXT"` // encrypted data
+	Description string             `xorm:"TEXT"`
+	CreatedUnix timeutil.TimeStamp `xorm:"created NOT NULL"`
+}
+
+const (
+	SecretDataMaxLength        = 65536
+	SecretDescriptionMaxLength = 4096
+)
+
+// ErrSecretNotFound represents a "secret not found" error.
+type ErrSecretNotFound struct {
+	Name string
+}
+
+func (err ErrSecretNotFound) Error() string {
+	return fmt.Sprintf("secret was not found [name: %s]", err.Name)
+}
+
+func (err ErrSecretNotFound) Unwrap() error {
+	return util.ErrNotExist
+}
+
+// InsertEncryptedSecret Creates, encrypts, and validates a new secret with yet unencrypted data and insert into database
+func InsertEncryptedSecret(ctx context.Context, scope actions_model.BelongingScope, name, data, description string) (*Secret, error) {
+	if len(data) > SecretDataMaxLength {
+		return nil, util.NewInvalidArgumentErrorf("data too long")
+	}
+
+	ownerID, repoID := scope.GetOwnerRepoIDs()
+	if ownerID == 0 && repoID == 0 {
+		return nil, fmt.Errorf("%w: ownerID and repoID cannot be both zero, global secrets are not supported", util.ErrInvalidArgument)
+	}
+	description = util.TruncateRunes(description, SecretDescriptionMaxLength)
+
+	encrypted, err := secret_module.EncryptSecret(setting.SecretKey, data)
+	if err != nil {
+		return nil, err
+	}
+
+	secret := &Secret{
+		OwnerID:     ownerID,
+		RepoID:      repoID,
+		Name:        strings.ToUpper(name),
+		Data:        encrypted,
+		Description: description,
+	}
+	return secret, db.Insert(ctx, secret)
+}
+
+func init() {
+	db.RegisterModel(new(Secret))
+}
+
+type FindSecretsOptions struct {
+	db.ListOptions
+	SecretID int64
+	Name     string
+
+	BelongingScope actions_model.BelongingScope
+}
+
+func (opts FindSecretsOptions) ToOrders() string {
+	return "name"
+}
+
+func (opts FindSecretsOptions) ToConds() builder.Cond {
+	cond := builder.NewCond()
+	ownerID, repoID := opts.BelongingScope.GetOwnerRepoIDs()
+	cond = cond.And(builder.Eq{"repo_id": repoID})
+	if repoID != 0 { // if RepoID is set
+		// ignore OwnerID and treat it as 0
+		cond = cond.And(builder.Eq{"owner_id": 0})
+	} else {
+		cond = cond.And(builder.Eq{"owner_id": ownerID})
+	}
+
+	if opts.SecretID != 0 {
+		cond = cond.And(builder.Eq{"id": opts.SecretID})
+	}
+	if opts.Name != "" {
+		cond = cond.And(builder.Eq{"name": strings.ToUpper(opts.Name)})
+	}
+
+	return cond
+}
+
+// UpdateSecret changes org or user reop secret.
+func UpdateSecret(ctx context.Context, secretID int64, data, description string) error {
+	if len(data) > SecretDataMaxLength {
+		return util.NewInvalidArgumentErrorf("data too long")
+	}
+
+	description = util.TruncateRunes(description, SecretDescriptionMaxLength)
+
+	encrypted, err := secret_module.EncryptSecret(setting.SecretKey, data)
+	if err != nil {
+		return err
+	}
+
+	s := &Secret{
+		Data:        encrypted,
+		Description: description,
+	}
+	affected, err := db.GetEngine(ctx).ID(secretID).Cols("data", "description").Update(s)
+	if affected != 1 {
+		return ErrSecretNotFound{}
+	}
+	return err
+}
+
+func GetSecretsOfTask(ctx context.Context, task *actions_model.ActionTask) (map[string]string, error) {
+	baseSecrets := map[string]string{}
+
+	baseSecrets["GITHUB_TOKEN"] = task.Token
+	baseSecrets["GITEA_TOKEN"] = task.Token
+
+	if task.Job.Run.IsForkPullRequest && task.Job.Run.TriggerEvent != actions_module.GithubEventPullRequestTarget {
+		// ignore secrets for fork pull request, except GITHUB_TOKEN and GITEA_TOKEN which are automatically generated.
+		// for the tasks triggered by pull_request_target event, they could access the secrets because they will run in the context of the base branch
+		// see the documentation: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request_target
+		return baseSecrets, nil
+	}
+
+	ownerSecrets, err := db.Find[Secret](ctx, FindSecretsOptions{BelongingScope: actions_model.BelongingScopeOwner(task.Job.Run.Repo.OwnerID)})
+	if err != nil {
+		log.Error("find secrets of owner %v: %v", task.Job.Run.Repo.OwnerID, err)
+		return nil, err
+	}
+	repoSecrets, err := db.Find[Secret](ctx, FindSecretsOptions{BelongingScope: actions_model.BelongingScopeRepo(task.Job.Run.RepoID)})
+	if err != nil {
+		log.Error("find secrets of repo %v: %v", task.Job.Run.RepoID, err)
+		return nil, err
+	}
+
+	for _, secret := range append(ownerSecrets, repoSecrets...) {
+		v, err := secret_module.DecryptSecret(setting.SecretKey, secret.Data)
+		if err != nil {
+			log.Error("Unable to decrypt Actions secret %v %q, maybe SECRET_KEY is wrong: %v", secret.ID, secret.Name, err)
+			continue
+		}
+		baseSecrets[secret.Name] = v
+	}
+
+	return getScopedSecretsForJob(ctx, task.Job, baseSecrets)
+}
+
+// getScopedSecretsForJob walks up the caller chain (ParentJobID) and applies
+// each caller's secrets policy:
+//   - "secrets: inherit" passes the parent scope's secrets through unchanged.
+//   - explicit mapping {alias: SOURCE} only forwards the named secrets, plus the auto-generated tokens.
+//
+// For top-level jobs (ParentJobID == 0) the base secrets are returned as-is.
+func getScopedSecretsForJob(ctx context.Context, job *actions_model.ActionRunJob, baseSecrets map[string]string) (map[string]string, error) {
+	if job.ParentJobID == 0 {
+		return baseSecrets, nil
+	}
+
+	caller, err := actions_model.GetRunJobByRunAndID(ctx, job.RunID, job.ParentJobID)
+	if err != nil {
+		return nil, fmt.Errorf("load caller job %d: %w", job.ParentJobID, err)
+	}
+
+	parentScope, err := getScopedSecretsForJob(ctx, caller, baseSecrets)
+	if err != nil {
+		return nil, err
+	}
+
+	if caller.CallSecrets == jobparser.SecretsInherit {
+		return parentScope, nil
+	}
+
+	// Empty or explicit-mapping path: only auto-tokens + (any) mapped aliases are exposed.
+	scoped := map[string]string{
+		"GITHUB_TOKEN": baseSecrets["GITHUB_TOKEN"],
+		"GITEA_TOKEN":  baseSecrets["GITEA_TOKEN"],
+	}
+	if caller.CallSecrets == "" {
+		return scoped, nil
+	}
+	var mapping map[string]string
+	if err := json.Unmarshal([]byte(caller.CallSecrets), &mapping); err != nil {
+		return nil, fmt.Errorf("decode caller %d secret map: %w", caller.ID, err)
+	}
+	for alias, source := range mapping {
+		if v, ok := parentScope[source]; ok {
+			scoped[alias] = v
+			continue
+		}
+		// Secret names are case-insensitive in storage (uppercased).
+		if v, ok := parentScope[strings.ToUpper(source)]; ok {
+			scoped[alias] = v
+		}
+	}
+	return scoped, nil
+}
+
+func CountWrongRepoLevelSecrets(ctx context.Context) (int64, error) {
+	var result int64
+	_, err := db.GetEngine(ctx).SQL("SELECT count(`id`) FROM `secret` WHERE `repo_id` > 0 AND `owner_id` > 0").Get(&result)
+	return result, err
+}
+
+func UpdateWrongRepoLevelSecrets(ctx context.Context) (int64, error) {
+	result, err := db.GetEngine(ctx).Exec("UPDATE `secret` SET `owner_id` = 0 WHERE `repo_id` > 0 AND `owner_id` > 0")
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}

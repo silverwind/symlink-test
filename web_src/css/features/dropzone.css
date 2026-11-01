@@ -1,0 +1,104 @@
+/* because dropzone css is imported after our css, so use double class selector to override dropzone styles */
+.dropzone.dropzone {
+  border: 2px dashed var(--color-secondary);
+  background: none;
+  box-shadow: none;
+  padding: 0;
+  border-radius: var(--border-radius-medium);
+  min-height: 0;
+}
+
+.dropzone.dropzone .dz-message {
+  margin: 10px 0;
+}
+
+.dropzone.dropzone .dz-preview .dz-success-mark svg,
+.dropzone.dropzone .dz-preview .dz-error-mark svg {
+  fill: currentcolor;
+}
+
+.dropzone.dropzone .dz-preview .dz-progress {
+  /* by default the progress-bar is vertically centered (top: 50%), it's better to put it after the "details (size, filename)",
+  then the layout from top to bottom is: size, filename, progress */
+  top: 7em;
+}
+
+.dropzone .dz-default.dz-message .dz-button {
+  color: var(--color-text-light);
+}
+
+.dropzone .dz-default.dz-message .dz-button:hover {
+  color: var(--color-text);
+}
+
+.dz-custom-buttons {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--gap-block);
+  margin-top: var(--gap-block);
+}
+
+.dz-custom-buttons button {
+  background: transparent;
+  color: var(--color-text-light);
+  border: none;
+}
+
+.dz-custom-buttons button:hover {
+  color: var(--color-primary);
+}
+
+.dropzone a.dz-filename,
+.dropzone a.dz-filename *,
+.dz-custom-buttons button {
+  cursor: pointer !important; /* override ".dz-clickable *" */
+}
+
+.dropzone .dz-filename span[data-dz-name] {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dropzone .dz-filename span[data-dz-name]:hover {
+  display: inline-block;
+  overflow: visible;
+}
+
+.dropzone .dz-error-message {
+  top: 145px !important;
+}
+
+.dropzone .dz-image {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  border-radius: var(--border-radius) !important;
+}
+
+.dropzone .dz-file-preview .dz-image {
+  background: var(--color-secondary-bg) !important;
+}
+
+.dropzone .dz-image img {
+  max-width: 100% !important;
+  max-height: 100% !important;
+  object-fit: contain !important;
+}
+
+.dropzone .dz-preview.dz-image-preview,
+.dropzone-attachments .thumbnails img {
+  background: transparent !important;
+}
+
+.dropzone-attachments .thumbnails img {
+  height: 120px !important;
+  width: 120px !important;
+  object-fit: contain !important;
+  margin-bottom: 0 !important;
+}
+
+.dropzone .dz-preview:hover .dz-image img {
+  filter: opacity(0.5) !important;
+}

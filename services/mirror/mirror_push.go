@@ -1,0 +1,260 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package mirror
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"time"
+
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitrepo"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/migrations"
+	repo_service "gitea.dev/services/repository"
+)
+
+var stripExitStatus = regexp.MustCompile(`exit status \d+ - `)
+
+// AddPushMirrorRemote registers the push mirror remote.
+func AddPushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, addr string) error {
+	addRemoteAndConfig := func(storageRepo git.RepositoryFacade, addr string) error {
+		if err := git.ManagedRemoteAdd(ctx, storageRepo, m.RemoteName, addr, git.RemoteOptionMirrorPush); err != nil {
+			return err
+		}
+		if err := git.ManagedConfigAdd(ctx, storageRepo, "remote."+m.RemoteName+".push", "+refs/heads/*:refs/heads/*"); err != nil {
+			return err
+		}
+		return git.ManagedConfigAdd(ctx, storageRepo, "remote."+m.RemoteName+".push", "+refs/tags/*:refs/tags/*")
+	}
+
+	if err := addRemoteAndConfig(m.Repo.CodeStorageRepo(), addr); err != nil {
+		return err
+	}
+
+	if repo_service.HasWiki(ctx, m.Repo) {
+		wikiRemoteURL := repository.WikiRemoteURL(ctx, addr)
+		if len(wikiRemoteURL) > 0 {
+			if err := addRemoteAndConfig(m.Repo.WikiStorageRepo(), wikiRemoteURL); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// RemovePushMirrorRemote removes the push mirror remote.
+func RemovePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror) error {
+	_ = m.GetRepository(ctx)
+	if err := git.ManagedRemoteRemove(ctx, m.Repo, m.RemoteName); err != nil {
+		return err
+	}
+
+	if repo_service.HasWiki(ctx, m.Repo) {
+		if err := git.ManagedRemoteRemove(ctx, m.Repo.WikiStorageRepo(), m.RemoteName); err != nil {
+			// The wiki remote may not exist
+			log.Warn("Wiki Remote[%d] could not be removed: %v", m.ID, err)
+		}
+	}
+
+	return nil
+}
+
+// SyncPushMirror starts the sync of the push mirror and schedules the next run.
+func SyncPushMirror(ctx context.Context, mirrorID int64) bool {
+	log.Trace("SyncPushMirror [mirror: %d]", mirrorID)
+	defer func() {
+		err := recover()
+		if err == nil {
+			return
+		}
+		// There was a panic whilst syncPushMirror...
+		log.Error("PANIC whilst syncPushMirror[%d] Panic: %v\nStacktrace: %s", mirrorID, err, log.Stack(2))
+	}()
+
+	// TODO: Handle "!exist" better
+	m, exist, err := db.GetByID[repo_model.PushMirror](ctx, mirrorID)
+	if err != nil || !exist {
+		log.Error("GetPushMirrorByID [%d]: %v", mirrorID, err)
+		return false
+	}
+
+	_ = m.GetRepository(ctx)
+
+	m.LastError = ""
+
+	ctx, _, finished := process.GetManager().AddContext(ctx, fmt.Sprintf("Syncing PushMirror %s/%s to %s", m.Repo.OwnerName, m.Repo.Name, m.RemoteName))
+	defer finished()
+
+	log.Trace("SyncPushMirror [mirror: %d][repo: %-v]: Running Sync", m.ID, m.Repo)
+	err = runPushSync(ctx, m)
+	if err != nil {
+		err = util.SanitizeErrorCredentialURLs(err)
+		log.Error("SyncPushMirror [mirror: %d][repo: %-v]: %v", m.ID, m.Repo, err)
+		m.LastError = stripExitStatus.ReplaceAllLiteralString(err.Error(), "")
+	}
+
+	m.LastUpdateUnix = timeutil.TimeStampNow()
+
+	if err := repo_model.UpdatePushMirrorSyncStatus(ctx, m); err != nil {
+		log.Error("UpdatePushMirrorSyncStatus [%d]: %v", m.ID, err)
+		return false
+	}
+
+	log.Trace("SyncPushMirror [mirror: %d][repo: %-v]: Finished", m.ID, m.Repo)
+
+	return err == nil
+}
+
+func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
+	timeout := time.Duration(setting.Git.Timeout.Mirror) * time.Second
+
+	performPush := func(storageRepo gitrepo.RepositoryFacade) error {
+		remoteURL, err := git.ParseRemoteAddressURL(ctx, storageRepo, m.RemoteName)
+		if err != nil {
+			return fmt.Errorf("ParseRemoteAddressURL failed: %w", err)
+		}
+		// re-validate every sync, the allow/block lists may have changed since the mirror was added
+		switch remoteURL.URL.Scheme {
+		case "http", "https", "git":
+			if err := migrations.IsMigrateURLAllowed(remoteURL.String(), nil); err != nil {
+				return fmt.Errorf("remote address is not allowed: %w", err)
+			}
+		}
+
+		if setting.LFS.StartServer {
+			log.Trace("SyncMirrors [repo: %-v]: syncing LFS objects...", m.Repo)
+
+			gitRepo, err := git.OpenRepository(ctx, storageRepo)
+			if err != nil {
+				return fmt.Errorf("OpenRepository failed: %w", err)
+			}
+			defer gitRepo.Close()
+
+			lfsClient, err := lfs.NewClientFromEndpoint(remoteURL.String(), "", migrations.NewMigrationHTTPTransport())
+			if err != nil {
+				return fmt.Errorf("NewClientFromEndpoint failed: %w", err)
+			}
+			if err := pushAllLFSObjects(ctx, gitRepo, lfsClient); err != nil {
+				return fmt.Errorf("pushAllLFSObjects failed: %w", err)
+			}
+		}
+
+		log.Trace("Pushing mirror %d repo %s to remote %s", m.ID, storageRepo.LogString(), m.RemoteName)
+
+		if err := git.PushToExternal(ctx, storageRepo, git.PushOptions{
+			Remote:  m.RemoteName,
+			Force:   true,
+			Mirror:  true,
+			Timeout: timeout,
+		}); err != nil {
+			return fmt.Errorf("PushToExternal failed: %w", err)
+		}
+
+		return nil
+	}
+
+	err := performPush(m.Repo.CodeStorageRepo())
+	if err != nil {
+		return fmt.Errorf("performPush(code) failed: %w", err)
+	}
+
+	if repo_service.HasWiki(ctx, m.Repo) {
+		err := performPush(m.Repo.WikiStorageRepo())
+		if err != nil && !errors.Is(err, util.ErrNotExist) {
+			return fmt.Errorf("performPush(wiki) failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func pushAllLFSObjects(ctx context.Context, gitRepo *git.Repository, lfsClient lfs.Client) error {
+	contentStore := lfs.NewContentStore()
+
+	pointerChan := make(chan lfs.PointerBlob)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- lfs.SearchPointerBlobs(ctx, gitRepo, pointerChan)
+	}()
+
+	uploadObjects := func(pointers []lfs.Pointer) error {
+		err := lfsClient.Upload(ctx, pointers, func(p lfs.Pointer, objectError error) (io.ReadCloser, error) {
+			if objectError != nil {
+				return nil, objectError
+			}
+
+			content, err := contentStore.Get(p)
+			if err != nil {
+				log.Error("Error reading LFS object %v: %v", p, err)
+			}
+			return content, err
+		})
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		}
+		return err
+	}
+
+	var batch []lfs.Pointer
+	for pointerBlob := range pointerChan {
+		exists, err := contentStore.Exists(pointerBlob.Pointer)
+		if err != nil {
+			log.Error("Error checking if LFS object %v exists: %v", pointerBlob.Pointer, err)
+			return err
+		}
+		if !exists {
+			log.Trace("Skipping missing LFS object %v", pointerBlob.Pointer)
+			continue
+		}
+
+		batch = append(batch, pointerBlob.Pointer)
+		if len(batch) >= lfsClient.BatchSize() {
+			if err := uploadObjects(batch); err != nil {
+				return err
+			}
+			batch = nil
+		}
+	}
+	if len(batch) > 0 {
+		if err := uploadObjects(batch); err != nil {
+			return err
+		}
+	}
+
+	err := <-errChan
+	if err != nil {
+		log.Error("Error enumerating LFS objects for repository: %v", err)
+	}
+
+	return err
+}
+
+func syncPushMirrorWithSyncOnCommit(ctx context.Context, repoID int64) {
+	pushMirrors, err := repo_model.GetPushMirrorsSyncedOnCommit(ctx, repoID)
+	if err != nil {
+		log.Error("repo_model.GetPushMirrorsSyncedOnCommit failed: %v", err)
+		return
+	}
+
+	for _, mirror := range pushMirrors {
+		AddPushMirrorToQueue(mirror.ID)
+	}
+}

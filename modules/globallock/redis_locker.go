@@ -1,0 +1,141 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package globallock
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"gitea.dev/modules/nosql"
+
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/redis/go-redis/v9"
+)
+
+const redisLockKeyPrefix = "gitea:globallock:"
+
+// redisLockExpiry is the default expiry time for a lock.
+// Define it as a variable to make it possible to change it in tests.
+var redisLockExpiry = 30 * time.Second
+
+type redisLocker struct {
+	conn redis.UniversalClient
+	rs   *redsync.Redsync
+
+	mutexM      sync.Map
+	closeCtx    context.Context
+	closeCancel context.CancelFunc
+	extendWg    sync.WaitGroup
+}
+
+var _ Locker = &redisLocker{}
+
+func NewRedisLocker(connection string) Locker {
+	conn := nosql.GetManager().GetRedisClient(connection)
+	l := &redisLocker{
+		conn: conn,
+		rs:   redsync.New(goredis.NewPool(conn)),
+	}
+	l.closeCtx, l.closeCancel = context.WithCancel(context.Background())
+	l.startExtend()
+	return l
+}
+
+func (l *redisLocker) Lock(ctx context.Context, key string) (ReleaseFunc, error) {
+	return l.lock(ctx, key, 0)
+}
+
+func (l *redisLocker) TryLock(ctx context.Context, key string) (bool, ReleaseFunc, error) {
+	f, err := l.lock(ctx, key, 1)
+
+	if _, taken := errors.AsType[*redsync.ErrTaken](err); taken {
+		return false, f, nil
+	}
+	if _, nodeTaken := errors.AsType[*redsync.ErrNodeTaken](err); nodeTaken {
+		return false, f, nil
+	}
+	return err == nil, f, err
+}
+
+// Close closes the locker.
+// It will stop extending the locks and refuse to acquire new locks.
+// In actual use, it is not necessary to call this function.
+// But it's useful in tests to release resources.
+func (l *redisLocker) Close() error {
+	l.closeCancel()
+	l.extendWg.Wait()
+	return nil
+}
+
+func (l *redisLocker) lock(ctx context.Context, key string, tries int) (ReleaseFunc, error) {
+	if l.closeCtx.Err() != nil {
+		return func() {}, errors.New("locker is closed")
+	}
+
+	options := []redsync.Option{
+		redsync.WithExpiry(redisLockExpiry),
+	}
+	if tries > 0 {
+		options = append(options, redsync.WithTries(tries))
+	}
+	mutex := l.rs.NewMutex(redisLockKeyPrefix+key, options...)
+	if err := mutex.LockContext(ctx); err != nil {
+		return func() {}, err
+	}
+
+	l.mutexM.Store(key, mutex)
+
+	releaseOnce := sync.Once{}
+	return func() {
+		releaseOnce.Do(func() {
+			l.mutexM.Delete(key)
+
+			// It's safe to ignore the error here,
+			// if it failed to unlock, it will be released automatically after the lock expires.
+			// Do not call mutex.UnlockContext(ctx) here, or it will fail to release when ctx has timed out.
+			_, _ = mutex.Unlock()
+		})
+	}, nil
+}
+
+func (l *redisLocker) startExtend() {
+	timer := time.NewTimer(redisLockExpiry / 2)
+	l.extendWg.Go(func() {
+		defer timer.Stop()
+		for {
+			select {
+			case <-l.closeCtx.Done():
+				return
+			case <-timer.C:
+				l.extendLocks()
+				timer.Reset(redisLockExpiry / 2)
+			}
+		}
+	})
+}
+
+func (l *redisLocker) extendLocks() {
+	toExtend := make([]*redsync.Mutex, 0)
+	l.mutexM.Range(func(_, value any) bool {
+		m := value.(*redsync.Mutex) //nolint:forcetypeassert // mutexM only ever holds *redsync.Mutex
+
+		// Extend the lock if it is not expired.
+		// Although the mutex will be removed from the map before it is released,
+		// it still can be expired because of a failed extension.
+		// If it happens, it does not need to be extended anymore.
+		if time.Now().After(m.Until()) {
+			return true
+		}
+
+		toExtend = append(toExtend, m)
+		return true
+	})
+	for _, v := range toExtend {
+		// If it failed to extend, it will be released automatically after the lock expires.
+		_, _ = v.ExtendContext(l.closeCtx)
+	}
+}

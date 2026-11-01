@@ -1,0 +1,246 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package rubygems
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"io"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+
+	"gitea.dev/modules/packages"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/validation"
+
+	"go.yaml.in/yaml/v4"
+)
+
+var (
+	// ErrMissingMetadataFile indicates a missing metadata.gz file
+	ErrMissingMetadataFile = util.NewInvalidArgumentErrorf("metadata.gz file is missing")
+	// ErrInvalidName indicates an invalid id in the metadata.gz file
+	ErrInvalidName = util.NewInvalidArgumentErrorf("package name is invalid")
+	// ErrInvalidVersion indicates an invalid version in the metadata.gz file
+	ErrInvalidVersion = util.NewInvalidArgumentErrorf("package version is invalid")
+	// ErrInvalidMetadata indicates metadata that would corrupt the generated index
+	ErrInvalidMetadata = util.NewInvalidArgumentErrorf("package metadata is invalid")
+)
+
+var globalVars = sync.OnceValue(func() (ret struct {
+	nameMatcher, versionMatcher *regexp.Regexp
+},
+) {
+	// https://github.com/rubygems/rubygems/blob/master/lib/rubygems/specification.rb (VALID_NAME_PATTERN)
+	ret.nameMatcher = regexp.MustCompile(`\A[\w.-]+\z`)
+	ret.versionMatcher = regexp.MustCompile(`\A[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z`)
+	return ret
+})
+
+// Package represents a RubyGems package
+type Package struct {
+	Name     string
+	Version  string
+	Metadata *Metadata
+}
+
+// Metadata represents the metadata of a RubyGems package
+type Metadata struct {
+	Platform                string               `json:"platform,omitempty"`
+	Description             string               `json:"description,omitempty"`
+	Summary                 string               `json:"summary,omitempty"`
+	Authors                 []string             `json:"authors,omitempty"`
+	Licenses                []string             `json:"licenses,omitempty"`
+	RequiredRubyVersion     []VersionRequirement `json:"required_ruby_version,omitempty"`
+	RequiredRubygemsVersion []VersionRequirement `json:"required_rubygems_version,omitempty"`
+	ProjectURL              string               `json:"project_url,omitempty"`
+	RuntimeDependencies     []Dependency         `json:"runtime_dependencies,omitempty"`
+	DevelopmentDependencies []Dependency         `json:"development_dependencies,omitempty"`
+}
+
+// VersionRequirement represents a version restriction
+type VersionRequirement struct {
+	Restriction string `json:"restriction"`
+	Version     string `json:"version"`
+}
+
+// Dependency represents a dependency of a RubyGems package
+type Dependency struct {
+	Name    string               `json:"name"`
+	Version []VersionRequirement `json:"version"`
+}
+
+type gemspec struct {
+	Name    string `yaml:"name"`
+	Version struct {
+		Version string `yaml:"version"`
+	} `yaml:"version"`
+	Platform     string   `yaml:"platform"`
+	Authors      []string `yaml:"authors"`
+	Autorequire  any      `yaml:"autorequire"`
+	Bindir       string   `yaml:"bindir"`
+	CertChain    []any    `yaml:"cert_chain"`
+	Date         string   `yaml:"date"`
+	Dependencies []struct {
+		Name                string      `yaml:"name"`
+		Requirement         requirement `yaml:"requirement"`
+		Type                string      `yaml:"type"`
+		Prerelease          bool        `yaml:"prerelease"`
+		VersionRequirements requirement `yaml:"version_requirements"`
+	} `yaml:"dependencies"`
+	Description    string   `yaml:"description"`
+	Executables    []string `yaml:"executables"`
+	Extensions     []any    `yaml:"extensions"`
+	ExtraRdocFiles []string `yaml:"extra_rdoc_files"`
+	Files          []string `yaml:"files"`
+	Homepage       string   `yaml:"homepage"`
+	Licenses       []string `yaml:"licenses"`
+	Metadata       struct {
+		BugTrackerURI    string `yaml:"bug_tracker_uri"`
+		ChangelogURI     string `yaml:"changelog_uri"`
+		DocumentationURI string `yaml:"documentation_uri"`
+		SourceCodeURI    string `yaml:"source_code_uri"`
+	} `yaml:"metadata"`
+	PostInstallMessage      any         `yaml:"post_install_message"`
+	RdocOptions             []any       `yaml:"rdoc_options"`
+	RequirePaths            []string    `yaml:"require_paths"`
+	RequiredRubyVersion     requirement `yaml:"required_ruby_version"`
+	RequiredRubygemsVersion requirement `yaml:"required_rubygems_version"`
+	Requirements            []any       `yaml:"requirements"`
+	RubygemsVersion         string      `yaml:"rubygems_version"`
+	SigningKey              any         `yaml:"signing_key"`
+	SpecificationVersion    int         `yaml:"specification_version"`
+	Summary                 string      `yaml:"summary"`
+	TestFiles               []any       `yaml:"test_files"`
+}
+
+type requirement struct {
+	Requirements [][]any `yaml:"requirements"`
+}
+
+// AsVersionRequirement converts into []VersionRequirement
+func (r requirement) AsVersionRequirement() []VersionRequirement {
+	requirements := make([]VersionRequirement, 0, len(r.Requirements))
+	for _, req := range r.Requirements {
+		if len(req) != 2 {
+			continue
+		}
+		restriction, ok := req[0].(string)
+		if !ok {
+			continue
+		}
+		vm, ok := req[1].(map[string]any)
+		if !ok {
+			continue
+		}
+		versionInt, ok := vm["version"]
+		if !ok {
+			continue
+		}
+		version, ok := versionInt.(string)
+		if !ok || (version == "0" && restriction == ">=") {
+			continue
+		}
+
+		requirements = append(requirements, VersionRequirement{
+			Restriction: restriction,
+			Version:     version,
+		})
+	}
+	return requirements
+}
+
+// ParsePackageMetaData parses the metadata of a Gem package file
+func ParsePackageMetaData(r io.Reader) (*Package, error) {
+	archive := tar.NewReader(r)
+	for {
+		hdr, err := archive.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if hdr.Name == "metadata.gz" {
+			return parseMetadataFile(archive)
+		}
+	}
+
+	return nil, ErrMissingMetadataFile
+}
+
+func parseMetadataFile(r io.Reader) (*Package, error) {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	var spec gemspec
+	if err := yaml.NewDecoder(packages.NewLimitedReader(zr, packages.MaxMetadataSize)).Decode(&spec); err != nil {
+		return nil, err
+	}
+
+	if !globalVars().nameMatcher.MatchString(spec.Name) {
+		return nil, ErrInvalidName
+	}
+
+	if !globalVars().versionMatcher.MatchString(spec.Version.Version) {
+		return nil, ErrInvalidVersion
+	}
+
+	if !validation.IsValidURL(spec.Homepage) {
+		spec.Homepage = ""
+	}
+	if !validation.IsValidURL(spec.Metadata.SourceCodeURI) {
+		spec.Metadata.SourceCodeURI = ""
+	}
+
+	m := &Metadata{
+		Platform:                spec.Platform,
+		Description:             spec.Description,
+		Summary:                 spec.Summary,
+		Authors:                 spec.Authors,
+		Licenses:                spec.Licenses,
+		ProjectURL:              spec.Homepage,
+		RequiredRubyVersion:     spec.RequiredRubyVersion.AsVersionRequirement(),
+		RequiredRubygemsVersion: spec.RequiredRubygemsVersion.AsVersionRequirement(),
+		DevelopmentDependencies: make([]Dependency, 0, 5),
+		RuntimeDependencies:     make([]Dependency, 0, 5),
+	}
+
+	for _, gemdep := range spec.Dependencies {
+		dep := Dependency{
+			Name:    gemdep.Name,
+			Version: gemdep.Requirement.AsVersionRequirement(),
+		}
+		if gemdep.Type == ":runtime" {
+			m.RuntimeDependencies = append(m.RuntimeDependencies, dep)
+		} else {
+			m.DevelopmentDependencies = append(m.DevelopmentDependencies, dep)
+		}
+	}
+
+	values := []string{m.Platform}
+	reqs := slices.Concat(m.RequiredRubyVersion, m.RequiredRubygemsVersion)
+	for _, dep := range slices.Concat(m.RuntimeDependencies, m.DevelopmentDependencies) {
+		values = append(values, dep.Name)
+		reqs = append(reqs, dep.Version...)
+	}
+	for _, req := range reqs {
+		values = append(values, req.Restriction, req.Version)
+	}
+	if slices.ContainsFunc(values, func(s string) bool { return strings.ContainsAny(s, "\r\n") }) {
+		return nil, ErrInvalidMetadata // the compact index is line-based, a line break would forge entries
+	}
+
+	return &Package{
+		Name:     spec.Name,
+		Version:  spec.Version.Version,
+		Metadata: m,
+	}, nil
+}

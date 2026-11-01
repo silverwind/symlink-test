@@ -1,0 +1,56 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package feed
+
+import (
+	"time"
+
+	"gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/services/context"
+
+	"github.com/gorilla/feeds"
+)
+
+func showBranchFeed(ctx *context.Context, repo *repo.Repository, formatType string) {
+	if !checkRepoFeedTokenScope(ctx) {
+		return
+	}
+	var commits []*git.Commit
+	var err error
+	if ctx.Repo.Commit != nil {
+		commits, err = ctx.Repo.Commit.CommitsByRange(ctx, ctx.Repo.GitRepo, 0, 10, "", "", "")
+		if err != nil {
+			ctx.ServerError("ShowBranchFeed", err)
+			return
+		}
+	}
+
+	title := "Latest commits for branch " + ctx.Repo.BranchName
+	link := &feeds.Link{Href: repo.HTMLURL() + "/" + ctx.Repo.RefTypeNameSubURL()}
+
+	feed := &feeds.Feed{
+		Title:       title,
+		Link:        link,
+		Description: repo.Description,
+		Created:     time.Now(),
+	}
+
+	for _, commit := range commits {
+		feed.Items = append(feed.Items, &feeds.Item{
+			Id:    commit.ID.String(),
+			Title: commit.MessageTitle(),
+			Link:  &feeds.Link{Href: repo.HTMLURL() + "/commit/" + commit.ID.String()},
+			Author: &feeds.Author{
+				Name:  commit.Author.Name,
+				Email: commit.Author.Email,
+			},
+			Description: commit.MessageUTF8(), // TODO: description can be shorten content
+			Content:     commit.MessageUTF8(),
+			Created:     commit.Committer.When,
+		})
+	}
+
+	writeFeed(ctx, feed, formatType)
+}

@@ -1,0 +1,378 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"context"
+	"fmt"
+
+	"gitea.dev/models/db"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/unit"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+
+	"xorm.io/xorm"
+	"xorm.io/xorm/convert"
+)
+
+// ErrUnitTypeNotExist represents a "UnitTypeNotExist" kind of error.
+type ErrUnitTypeNotExist struct {
+	UT unit.Type
+}
+
+// IsErrUnitTypeNotExist checks if an error is a ErrUnitNotExist.
+func IsErrUnitTypeNotExist(err error) bool {
+	_, ok := err.(ErrUnitTypeNotExist)
+	return ok
+}
+
+func (err ErrUnitTypeNotExist) Error() string {
+	return "Unit type does not exist: " + err.UT.LogString()
+}
+
+func (err ErrUnitTypeNotExist) Unwrap() error {
+	return util.ErrNotExist
+}
+
+// RepoUnit describes all units of a repository
+type RepoUnit struct { //revive:disable-line:exported
+	ID                  int64
+	RepoID              int64              `xorm:"INDEX(s)"`
+	Type                unit.Type          `xorm:"INDEX(s)"`
+	Config              convert.Conversion `xorm:"TEXT"`
+	CreatedUnix         timeutil.TimeStamp `xorm:"INDEX CREATED"`
+	AnonymousAccessMode perm.AccessMode    `xorm:"NOT NULL DEFAULT 0"`
+	EveryoneAccessMode  perm.AccessMode    `xorm:"NOT NULL DEFAULT 0"`
+}
+
+func init() {
+	db.RegisterModel(new(RepoUnit))
+}
+
+// UnitConfig describes common unit config
+type UnitConfig struct{}
+
+// FromDB fills up a UnitConfig from serialized format.
+func (cfg *UnitConfig) FromDB(bs []byte) error {
+	return json.UnmarshalHandleDoubleEncode(bs, &cfg)
+}
+
+// ToDB exports a UnitConfig to a serialized format.
+func (cfg *UnitConfig) ToDB() ([]byte, error) {
+	return json.Marshal(cfg)
+}
+
+// ExternalWikiConfig describes external wiki config
+type ExternalWikiConfig struct {
+	ExternalWikiURL string
+}
+
+// FromDB fills up a ExternalWikiConfig from serialized format.
+func (cfg *ExternalWikiConfig) FromDB(bs []byte) error {
+	return json.UnmarshalHandleDoubleEncode(bs, &cfg)
+}
+
+// ToDB exports a ExternalWikiConfig to a serialized format.
+func (cfg *ExternalWikiConfig) ToDB() ([]byte, error) {
+	return json.Marshal(cfg)
+}
+
+// ExternalTrackerConfig describes external tracker config
+type ExternalTrackerConfig struct {
+	ExternalTrackerURL           string
+	ExternalTrackerFormat        string
+	ExternalTrackerStyle         string
+	ExternalTrackerRegexpPattern string
+}
+
+// FromDB fills up a ExternalTrackerConfig from serialized format.
+func (cfg *ExternalTrackerConfig) FromDB(bs []byte) error {
+	return json.UnmarshalHandleDoubleEncode(bs, &cfg)
+}
+
+// ToDB exports a ExternalTrackerConfig to a serialized format.
+func (cfg *ExternalTrackerConfig) ToDB() ([]byte, error) {
+	return json.Marshal(cfg)
+}
+
+// IssuesConfig describes issues config
+type IssuesConfig struct {
+	EnableTimetracker                bool
+	AllowOnlyContributorsToTrackTime bool
+	EnableDependencies               bool
+}
+
+// FromDB fills up a IssuesConfig from serialized format.
+func (cfg *IssuesConfig) FromDB(bs []byte) error {
+	return json.UnmarshalHandleDoubleEncode(bs, &cfg)
+}
+
+// ToDB exports a IssuesConfig to a serialized format.
+func (cfg *IssuesConfig) ToDB() ([]byte, error) {
+	return json.Marshal(cfg)
+}
+
+// PullRequestsConfig describes pull requests config
+type PullRequestsConfig struct {
+	IgnoreWhitespaceConflicts     bool
+	AllowMerge                    bool
+	AllowRebase                   bool
+	AllowRebaseMerge              bool
+	AllowSquash                   bool
+	AllowFastForwardOnly          bool
+	AllowManualMerge              bool
+	AutodetectManualMerge         bool
+	AllowMergeUpdate              bool
+	AllowRebaseUpdate             bool
+	DefaultUpdateStyle            UpdateStyle
+	DefaultDeleteBranchAfterMerge bool
+	DefaultMergeStyle             MergeStyle
+	DefaultSquashMergeMessage     SquashMergeMessage
+	DefaultAllowMaintainerEdit    bool
+	DefaultTargetBranch           string
+}
+
+func DefaultPullRequestsConfig() *PullRequestsConfig {
+	cfg := &PullRequestsConfig{
+		AllowMerge:                 true,
+		AllowRebase:                true,
+		AllowRebaseMerge:           true,
+		AllowSquash:                true,
+		AllowFastForwardOnly:       true,
+		AllowMergeUpdate:           true,
+		AllowRebaseUpdate:          true,
+		DefaultUpdateStyle:         UpdateStyleMerge,
+		DefaultAllowMaintainerEdit: true,
+	}
+	cfg.DefaultDeleteBranchAfterMerge = setting.Repository.PullRequest.DefaultDeleteBranchAfterMerge
+	cfg.DefaultMergeStyle = MergeStyle(setting.Repository.PullRequest.DefaultMergeStyle)
+	cfg.DefaultMergeStyle = util.IfZero(cfg.DefaultMergeStyle, MergeStyleMerge)
+	cfg.DefaultSquashMergeMessage = SquashMergeMessage(setting.Repository.PullRequest.DefaultSquashMergeMessage)
+	return cfg
+}
+
+// FromDB fills up a PullRequestsConfig from serialized format.
+func (cfg *PullRequestsConfig) FromDB(bs []byte) error {
+	// set default values for existing PullRequestConfig in DB
+	*cfg = *DefaultPullRequestsConfig()
+	_ = json.UnmarshalHandleDoubleEncode(bs, &cfg) // don't let corrupted database value cause unnecessary 500 error
+	cfg.DefaultUpdateStyle = util.IfZero(cfg.DefaultUpdateStyle, UpdateStyleMerge)
+	return nil
+}
+
+// ToDB exports a PullRequestsConfig to a serialized format.
+func (cfg *PullRequestsConfig) ToDB() ([]byte, error) {
+	return json.Marshal(cfg)
+}
+
+// IsMergeStyleAllowed returns if merge style is allowed
+func (cfg *PullRequestsConfig) IsMergeStyleAllowed(mergeStyle MergeStyle) bool {
+	return mergeStyle == MergeStyleMerge && cfg.AllowMerge ||
+		mergeStyle == MergeStyleRebase && cfg.AllowRebase ||
+		mergeStyle == MergeStyleRebaseMerge && cfg.AllowRebaseMerge ||
+		mergeStyle == MergeStyleSquash && cfg.AllowSquash ||
+		mergeStyle == MergeStyleFastForwardOnly && cfg.AllowFastForwardOnly ||
+		mergeStyle == MergeStyleManuallyMerged && cfg.AllowManualMerge
+}
+
+// IsUpdateStyleAllowed returns if a pull request branch update style is allowed
+func (cfg *PullRequestsConfig) IsUpdateStyleAllowed(updateStyle UpdateStyle) bool {
+	switch updateStyle {
+	case UpdateStyleMerge:
+		return cfg.AllowMergeUpdate
+	case UpdateStyleRebase:
+		return cfg.AllowRebaseUpdate
+	default:
+		return false
+	}
+}
+
+// ValidateUpdateSettings checks that the AllowMerge/RebaseUpdate flags and DefaultUpdateStyle are mutually consistent.
+func (cfg *PullRequestsConfig) ValidateUpdateSettings() error {
+	if cfg.DefaultUpdateStyle != UpdateStyleMerge && cfg.DefaultUpdateStyle != UpdateStyleRebase {
+		return util.NewInvalidArgumentErrorf("default update style must be merge or rebase")
+	}
+	if !cfg.AllowMergeUpdate && !cfg.AllowRebaseUpdate {
+		return util.NewInvalidArgumentErrorf("at least one pull request branch update style must be enabled")
+	}
+	if !cfg.IsUpdateStyleAllowed(cfg.DefaultUpdateStyle) {
+		return util.NewInvalidArgumentErrorf("default update style must be enabled")
+	}
+	return nil
+}
+
+func DefaultPullRequestsUnit(repoID int64) RepoUnit {
+	return RepoUnit{RepoID: repoID, Type: unit.TypePullRequests, Config: DefaultPullRequestsConfig()}
+}
+
+// ProjectsMode represents the projects enabled for a repository
+type ProjectsMode string
+
+const (
+	// ProjectsModeRepo allows only repo-level projects
+	ProjectsModeRepo ProjectsMode = "repo"
+	// ProjectsModeOwner allows only owner-level projects
+	ProjectsModeOwner ProjectsMode = "owner"
+	// ProjectsModeAll allows both kinds of projects
+	ProjectsModeAll ProjectsMode = "all"
+	// ProjectsModeNone doesn't allow projects
+	ProjectsModeNone ProjectsMode = "none"
+)
+
+// ProjectsConfig describes projects config
+type ProjectsConfig struct {
+	ProjectsMode ProjectsMode
+}
+
+// FromDB fills up a ProjectsConfig from serialized format.
+func (cfg *ProjectsConfig) FromDB(bs []byte) error {
+	// TODO: remove GetProjectsMode, only use ProjectsMode
+	cfg.ProjectsMode = ProjectsModeAll
+	return json.UnmarshalHandleDoubleEncode(bs, &cfg)
+}
+
+// ToDB exports a ProjectsConfig to a serialized format.
+func (cfg *ProjectsConfig) ToDB() ([]byte, error) {
+	return json.Marshal(cfg)
+}
+
+func (cfg *ProjectsConfig) GetProjectsMode() ProjectsMode {
+	if cfg.ProjectsMode != "" {
+		return cfg.ProjectsMode
+	}
+
+	return ProjectsModeAll
+}
+
+func (cfg *ProjectsConfig) IsProjectsAllowed(m ProjectsMode) bool {
+	projectsMode := cfg.GetProjectsMode()
+
+	if m == ProjectsModeNone {
+		return true
+	}
+
+	return projectsMode == m || projectsMode == ProjectsModeAll
+}
+
+// BeforeSet is invoked from XORM before setting the value of a field of this object.
+func (r *RepoUnit) BeforeSet(colName string, val xorm.Cell) {
+	switch colName {
+	case "type":
+		var err error
+		r.Type, _, err = db.CellToInt(val, unit.TypeInvalid)
+		if err != nil {
+			setting.PanicInDevOrTesting("Unable to convert repo unit (id=%d) type: %v", r.ID, err)
+		}
+		switch r.Type {
+		case unit.TypeExternalWiki:
+			r.Config = new(ExternalWikiConfig)
+		case unit.TypeExternalTracker:
+			r.Config = new(ExternalTrackerConfig)
+		case unit.TypePullRequests:
+			r.Config = new(PullRequestsConfig)
+		case unit.TypeIssues:
+			r.Config = new(IssuesConfig)
+		case unit.TypeActions:
+			r.Config = new(ActionsConfig)
+		case unit.TypeProjects:
+			r.Config = new(ProjectsConfig)
+		case unit.TypeCode, unit.TypeReleases, unit.TypeWiki, unit.TypePackages:
+			fallthrough
+		default:
+			r.Config = new(UnitConfig)
+		}
+	case "config":
+		if *val == nil {
+			// XROM doesn't call FromDB if the value is nil, but we need to set default values for the config fields
+			_ = r.Config.FromDB(nil)
+		}
+	}
+}
+
+// Unit returns Unit
+func (r *RepoUnit) Unit() unit.Unit {
+	return unit.Units[r.Type]
+}
+
+// unitConfig returns the unit's config, which BeforeSet has created from the unit type
+func unitConfig[T interface {
+	*E
+	convert.Conversion
+}, E any](r *RepoUnit) T {
+	config, ok := r.Config.(T)
+	if !ok {
+		panic(fmt.Errorf("repo unit %d of type %s has config type %T instead of %T", r.ID, r.Type.LogString(), r.Config, config))
+	}
+	return config
+}
+
+// CodeConfig returns config for unit.TypeCode
+func (r *RepoUnit) CodeConfig() *UnitConfig {
+	return unitConfig[*UnitConfig](r)
+}
+
+// PullRequestsConfig returns config for unit.TypePullRequests
+func (r *RepoUnit) PullRequestsConfig() *PullRequestsConfig {
+	return unitConfig[*PullRequestsConfig](r)
+}
+
+// ReleasesConfig returns config for unit.TypeReleases
+func (r *RepoUnit) ReleasesConfig() *UnitConfig {
+	return unitConfig[*UnitConfig](r)
+}
+
+// ExternalWikiConfig returns config for unit.TypeExternalWiki
+func (r *RepoUnit) ExternalWikiConfig() *ExternalWikiConfig {
+	return unitConfig[*ExternalWikiConfig](r)
+}
+
+// IssuesConfig returns config for unit.TypeIssues
+func (r *RepoUnit) IssuesConfig() *IssuesConfig {
+	return unitConfig[*IssuesConfig](r)
+}
+
+// ExternalTrackerConfig returns config for unit.TypeExternalTracker
+func (r *RepoUnit) ExternalTrackerConfig() *ExternalTrackerConfig {
+	return unitConfig[*ExternalTrackerConfig](r)
+}
+
+// ActionsConfig returns config for unit.ActionsConfig
+func (r *RepoUnit) ActionsConfig() *ActionsConfig {
+	return unitConfig[*ActionsConfig](r)
+}
+
+// ProjectsConfig returns config for unit.ProjectsConfig
+func (r *RepoUnit) ProjectsConfig() *ProjectsConfig {
+	return unitConfig[*ProjectsConfig](r)
+}
+
+func getUnitsByRepoID(ctx context.Context, repoID int64) (units []*RepoUnit, err error) {
+	var tmpUnits []*RepoUnit
+	if err := db.GetEngine(ctx).Where("repo_id = ?", repoID).Find(&tmpUnits); err != nil {
+		return nil, err
+	}
+
+	for _, u := range tmpUnits {
+		if !u.Type.UnitGlobalDisabled() {
+			units = append(units, u)
+		}
+	}
+
+	return units, nil
+}
+
+// UpdateRepoUnitConfig updates the config of the provided repo unit
+func UpdateRepoUnitConfig(ctx context.Context, unit *RepoUnit) error {
+	_, err := db.GetEngine(ctx).ID(unit.ID).Cols("config").Update(unit)
+	return err
+}
+
+func UpdateRepoUnitPublicAccess(ctx context.Context, unit *RepoUnit) error {
+	_, err := db.GetEngine(ctx).Where("repo_id=? AND `type`=?", unit.RepoID, unit.Type).
+		Cols("anonymous_access_mode", "everyone_access_mode").Update(unit)
+	return err
+}

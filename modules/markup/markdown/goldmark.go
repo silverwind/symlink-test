@@ -1,0 +1,241 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package markdown
+
+import (
+	"fmt"
+
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/highlight"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/markup/internal"
+	"gitea.dev/modules/markup/markdown/math"
+
+	"github.com/yuin/goldmark/ast"
+	east "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/renderer"
+	"github.com/yuin/goldmark/renderer/html"
+	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
+)
+
+// ASTTransformer is a default transformer of the goldmark tree.
+type ASTTransformer struct {
+	renderInternal *internal.RenderInternal
+	attentionTypes container.Set[string]
+}
+
+func NewASTTransformer(renderInternal *internal.RenderInternal) *ASTTransformer {
+	return &ASTTransformer{
+		renderInternal: renderInternal,
+		attentionTypes: container.SetOf("note", "tip", "important", "warning", "caution"),
+	}
+}
+
+func (g *ASTTransformer) applyElementDir(n ast.Node) {
+	if !markup.RenderBehaviorForTesting.DisableAdditionalAttributes {
+		n.SetAttributeString("dir", "auto")
+	}
+}
+
+// Transform transforms the given AST tree.
+func (g *ASTTransformer) Transform(node *ast.Document, reader text.Reader, pc parser.Context) {
+	firstChild := node.FirstChild()
+	ctx := pc.Get(renderContextKey).(*markup.RenderContext) //nolint:forcetypeassert // the renderer always seeds this key before parsing
+	rc := pc.Get(renderConfigKey).(*RenderConfig)           //nolint:forcetypeassert // the renderer always seeds this key before parsing
+
+	tocMode := ""
+	if rc.yamlNode != nil {
+		metaNode := rc.toMetaNode(g)
+		if metaNode != nil {
+			node.InsertBefore(node, firstChild, metaNode)
+		}
+		tocMode = rc.TOC
+	}
+	if ctx.RenderOptions.FeedExcerpt {
+		filterFeedExcerpt(node)
+	}
+
+	_ = ast.Walk(node, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+
+		switch v := n.(type) {
+		case *ast.Paragraph:
+			g.applyElementDir(v)
+		case *ast.List:
+			g.transformList(ctx, v, rc)
+		case *ast.Text:
+			if v.SoftLineBreak() && !v.HardLineBreak() {
+				newLineHardBreak := ctx.RenderOptions.Metas["markdownNewLineHardBreak"] == "true"
+				v.SetHardLineBreak(newLineHardBreak)
+			}
+		case *ast.CodeSpan:
+			g.transformCodeSpan(ctx, v, reader)
+		case *ast.FencedCodeBlock:
+			g.transformFencedCodeblock(v, reader)
+		case *ast.Blockquote:
+			return g.transformBlockquote(v, reader)
+		}
+		return ast.WalkContinue, nil
+	})
+
+	if ctx.RenderOptions.EnableHeadingIDGeneration {
+		showTocInMain := tocMode == "true" /* old behavior, in main view */ || tocMode == "main"
+		showTocInSidebar := !showTocInMain && tocMode != "false" // not hidden, not main, then show it in sidebar
+		switch {
+		case showTocInMain:
+			ctx.TocShowInSection = markup.TocShowInMain
+		case showTocInSidebar:
+			ctx.TocShowInSection = markup.TocShowInSidebar
+		}
+	}
+
+	if rc.Lang != "" {
+		node.SetAttributeString("lang", []byte(rc.Lang))
+	}
+}
+
+func filterFeedExcerpt(parent ast.Node) {
+	for node := parent.FirstChild(); node != nil; {
+		next := node.NextSibling()
+		switch node.Kind() {
+		case ast.KindText, ast.KindAutoLink, math.KindInline:
+		case ast.KindParagraph, ast.KindHeading, ast.KindTextBlock, ast.KindBlockquote, ast.KindList, ast.KindListItem,
+			ast.KindEmphasis, ast.KindCodeSpan, ast.KindLink,
+			east.KindStrikethrough, east.KindDefinitionList, east.KindDefinitionTerm, east.KindDefinitionDescription:
+			filterFeedExcerpt(node)
+			if !node.HasChildren() {
+				parent.RemoveChild(parent, node)
+			}
+		default:
+			parent.RemoveChild(parent, node)
+		}
+		node = next
+	}
+}
+
+// NewHTMLRenderer creates a HTMLRenderer to render in the gitea form.
+func NewHTMLRenderer(renderInternal *internal.RenderInternal, opts ...html.Option) renderer.NodeRenderer {
+	r := &HTMLRenderer{
+		renderInternal: renderInternal,
+		Config:         html.NewConfig(),
+	}
+	for _, opt := range opts {
+		opt.SetHTMLOption(&r.Config)
+	}
+	return r
+}
+
+// HTMLRenderer is a renderer.NodeRenderer implementation that
+// renders gitea specific features.
+type HTMLRenderer struct {
+	html.Config
+	renderInternal *internal.RenderInternal
+}
+
+// RegisterFuncs implements renderer.NodeRenderer.RegisterFuncs.
+func (r *HTMLRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
+	reg.Register(ast.KindDocument, r.renderDocument)
+	reg.Register(KindDetails, r.renderDetails)
+	reg.Register(KindSummary, r.renderSummary)
+	reg.Register(ast.KindCodeSpan, r.renderCodeSpan)
+	reg.Register(ast.KindCodeBlock, r.renderCodeBlock)
+	reg.Register(KindAttention, r.renderAttention)
+	reg.Register(east.KindTaskCheckBox, r.renderTaskCheckBox)
+	reg.Register(KindRawHTML, r.renderRawHTML)
+}
+
+// renderCodeBlock wraps indented code blocks like the fenced renderer
+func (r *HTMLRenderer) renderCodeBlock(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if entering {
+		preAttrs, codeAttrs := highlight.CodeBlockAttributes("") // no language
+		opening := r.renderInternal.ProtectSafeAttrs(htmlutil.HTMLFormat(`<div class="code-block-container code-overflow-scroll"><pre %s><code %s>`, preAttrs, codeAttrs))
+		if _, err := w.WriteString(string(opening)); err != nil {
+			return ast.WalkStop, err
+		}
+		lines := n.Lines()
+		for i := 0; i < lines.Len(); i++ {
+			line := lines.At(i)
+			r.Writer.RawWrite(w, line.Value(source))
+		}
+	} else {
+		if _, err := w.WriteString("</code></pre></div>"); err != nil {
+			return ast.WalkStop, err
+		}
+	}
+	return ast.WalkContinue, nil
+}
+
+func (r *HTMLRenderer) renderDocument(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	if val, has := node.AttributeString("lang"); has {
+		var err error
+		if entering {
+			_, err = w.WriteString("<div")
+			if err == nil {
+				_, err = fmt.Fprintf(w, ` lang=%q`, val)
+			}
+			if err == nil {
+				_, err = w.WriteRune('>')
+			}
+		} else {
+			_, err = w.WriteString("</div>")
+		}
+
+		if err != nil {
+			return ast.WalkStop, err
+		}
+	}
+
+	return ast.WalkContinue, nil
+}
+
+func (r *HTMLRenderer) renderDetails(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	var err error
+	if entering {
+		if _, err = w.WriteString("<details"); err != nil {
+			return ast.WalkStop, err
+		}
+		html.RenderAttributes(w, node, nil)
+		_, err = w.WriteString(">")
+	} else {
+		_, err = w.WriteString("</details>")
+	}
+
+	if err != nil {
+		return ast.WalkStop, err
+	}
+
+	return ast.WalkContinue, nil
+}
+
+func (r *HTMLRenderer) renderSummary(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	var err error
+	if entering {
+		_, err = w.WriteString("<summary>")
+	} else {
+		_, err = w.WriteString("</summary>")
+	}
+
+	if err != nil {
+		return ast.WalkStop, err
+	}
+
+	return ast.WalkContinue, nil
+}
+
+func (r *HTMLRenderer) renderRawHTML(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		return ast.WalkContinue, nil
+	}
+	n := node.(*RawHTML) //nolint:forcetypeassert // registered for KindRawHTML only
+	_, err := w.WriteString(string(r.renderInternal.ProtectSafeAttrs(n.rawHTML)))
+	if err != nil {
+		return ast.WalkStop, err
+	}
+	return ast.WalkContinue, nil
+}

@@ -1,0 +1,333 @@
+// Copyright 2015 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package user
+
+import (
+	"net/http"
+
+	activities_model "gitea.dev/models/activities"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/renderhelper"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/routers/web/org"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
+	feed_service "gitea.dev/services/feed"
+)
+
+const (
+	tplProfileBigAvatar templates.TplName = "shared/user/profile_big_avatar"
+	tplFollowUnfollow   templates.TplName = "org/follow_unfollow"
+)
+
+// OwnerProfile render profile page for a user or a organization (aka, repo owner)
+func OwnerProfile(ctx *context.Context) {
+	// HINT: USER-TYPE-GLOSSARY: in the future it needs to handle more user types correctly
+	if ctx.ContextUser.IsOrganization() {
+		org.Home(ctx)
+	} else {
+		userProfile(ctx)
+	}
+}
+
+func userProfile(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.ContextUser.DisplayName()
+	ctx.Data["PageIsUserProfile"] = true
+
+	profileDbRepo, profileReadmeBlob := shared_user.FindOwnerProfileReadme(ctx, ctx.Doer)
+
+	prepareUserProfileTabData(ctx, profileDbRepo, profileReadmeBlob)
+
+	// prepare the user nav header data after "prepareUserProfileTabData" to avoid re-querying the NumFollowers & NumFollowing
+	// because ctx.Data["NumFollowers"] and "NumFollowing" logic duplicates in both of them
+	// and the "profile readme" related logic also duplicates in both of FindOwnerProfileReadme and RenderUserOrgHeader
+	// TODO: it is a bad design and should be refactored later,
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+	ctx.HTML(http.StatusOK, tplProfile)
+}
+
+func prepareUserProfileTabData(ctx *context.Context, profileDbRepo *repo_model.Repository, profileReadme *git.Blob) {
+	// if there is a profile readme, default to "overview" page, otherwise, default to "repositories" page
+	// if there is not a profile readme, the overview tab should be treated as the repositories tab
+	tab := ctx.FormString("tab")
+	if tab == "" || tab == "overview" {
+		if profileReadme != nil {
+			tab = "overview"
+		} else {
+			tab = "repositories"
+		}
+	}
+	ctx.Data["TabName"] = tab
+	ctx.Data["HasUserProfileReadme"] = profileReadme != nil
+
+	page := ctx.FormInt("page")
+	if page <= 0 {
+		page = 1
+	}
+
+	pagingNum := setting.UI.User.RepoPagingNum
+	topicOnly := ctx.FormBool("topic")
+	var (
+		repos   []*repo_model.Repository
+		count   int64
+		total   int64
+		curRows int
+		orderBy db.SearchOrderBy
+	)
+
+	sortOrder := ctx.FormString("sort")
+	if _, ok := repo_model.OrderByFlatMap[sortOrder]; !ok {
+		sortOrder = setting.UI.ExploreDefaultSort // TODO: add new default sort order for user home?
+	}
+	ctx.Data["SortType"] = sortOrder
+	orderBy = repo_model.OrderByFlatMap[sortOrder]
+
+	keyword := ctx.FormTrim("q")
+	ctx.Data["Keyword"] = keyword
+
+	language := ctx.FormTrim("language")
+	ctx.Data["Language"] = language
+
+	followers, numFollowers, err := user_model.GetUserFollowers(ctx, ctx.ContextUser, ctx.Doer, db.ListOptions{
+		PageSize: pagingNum,
+		Page:     page,
+	})
+	if err != nil {
+		ctx.ServerError("GetUserFollowers", err)
+		return
+	}
+	ctx.Data["NumFollowers"] = numFollowers
+	following, numFollowing, err := user_model.GetUserFollowing(ctx, ctx.ContextUser, ctx.Doer, db.ListOptions{
+		PageSize: pagingNum,
+		Page:     page,
+	})
+	if err != nil {
+		ctx.ServerError("GetUserFollowing", err)
+		return
+	}
+	ctx.Data["NumFollowing"] = numFollowing
+
+	archived := ctx.FormOptionalBool("archived")
+	ctx.Data["IsArchived"] = archived
+
+	fork := ctx.FormOptionalBool("fork")
+	ctx.Data["IsFork"] = fork
+
+	mirror := ctx.FormOptionalBool("mirror")
+	ctx.Data["IsMirror"] = mirror
+
+	template := ctx.FormOptionalBool("template")
+	ctx.Data["IsTemplate"] = template
+
+	private := ctx.FormOptionalBool("private")
+	ctx.Data["IsPrivate"] = private
+
+	switch tab {
+	case "followers":
+		ctx.Data["Cards"] = followers
+		total = numFollowers
+	case "following":
+		ctx.Data["Cards"] = following
+		total = numFollowing
+	case "activity":
+		if setting.Service.EnableUserHeatmap && activities_model.ActivityReadable(ctx.ContextUser, ctx.Doer) {
+			ctx.Data["EnableHeatmap"] = true
+			ctx.Data["HeatmapURL"] = ctx.ContextUser.HomeLink() + "/-/heatmap"
+		}
+
+		date := ctx.FormString("date")
+		pagingNum = setting.UI.FeedPagingNum
+		showPrivate := ctx.IsSigned && (ctx.Doer.IsAdmin || ctx.Doer.ID == ctx.ContextUser.ID)
+		items, feedCount, err := feed_service.GetFeedsForDashboard(ctx, activities_model.GetFeedsOptions{
+			RequestedUser:   ctx.ContextUser,
+			Actor:           ctx.Doer,
+			IncludePrivate:  showPrivate,
+			OnlyPerformedBy: true,
+			IncludeDeleted:  false,
+			Date:            date,
+			ListOptions: db.ListOptions{
+				PageSize: pagingNum,
+				Page:     page,
+			},
+		})
+		if err != nil {
+			ctx.ServerError("GetFeeds", err)
+			return
+		}
+		ctx.Data["Feeds"] = items
+		ctx.Data["Date"] = date
+		curRows = len(items)
+		total = feedCount
+	case "stars":
+		ctx.Data["PageIsProfileStarList"] = true
+		ctx.Data["ShowRepoOwnerOnList"] = true
+		repos, count, err = repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
+			ListOptions: db.ListOptions{
+				PageSize: pagingNum,
+				Page:     page,
+			},
+			Actor:              ctx.Doer,
+			Keyword:            keyword,
+			OrderBy:            orderBy,
+			Private:            ctx.IsSigned,
+			StarredByID:        ctx.ContextUser.ID,
+			Collaborate:        optional.Some(false),
+			TopicOnly:          topicOnly,
+			Language:           language,
+			IncludeDescription: setting.UI.SearchRepoDescription,
+			Archived:           archived,
+			Fork:               fork,
+			Mirror:             mirror,
+			Template:           template,
+			IsPrivate:          private,
+		})
+		if err != nil {
+			ctx.ServerError("SearchRepository", err)
+			return
+		}
+
+		total = count
+	case "watching":
+		repos, count, err = repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
+			ListOptions: db.ListOptions{
+				PageSize: pagingNum,
+				Page:     page,
+			},
+			Actor:              ctx.Doer,
+			Keyword:            keyword,
+			OrderBy:            orderBy,
+			Private:            ctx.IsSigned,
+			WatchedByID:        ctx.ContextUser.ID,
+			Collaborate:        optional.Some(false),
+			TopicOnly:          topicOnly,
+			Language:           language,
+			IncludeDescription: setting.UI.SearchRepoDescription,
+			Archived:           archived,
+			Fork:               fork,
+			Mirror:             mirror,
+			Template:           template,
+			IsPrivate:          private,
+		})
+		if err != nil {
+			ctx.ServerError("SearchRepository", err)
+			return
+		}
+
+		total = count
+	case "overview":
+		if bytes, err := profileReadme.GetBlobContent(ctx, setting.UI.MaxDisplayFileSize); err != nil {
+			log.Error("failed to GetBlobContent: %v", err)
+		} else {
+			rctx := renderhelper.NewRenderContextRepoFile(ctx, profileDbRepo, renderhelper.RepoFileOptions{
+				CurrentRefSubURL: git.RefNameFromBranch(profileDbRepo.DefaultBranch).RefWebLinkPath(),
+			})
+			if profileContent, err := markdown.RenderString(rctx, bytes); err != nil {
+				log.Error("failed to RenderString: %v", err)
+			} else {
+				ctx.Data["ProfileReadmeContent"] = profileContent
+			}
+		}
+	case "organizations":
+		orgs, count, err := db.FindAndCount[organization.Organization](ctx, organization.FindOrgOptions{
+			UserID:            ctx.ContextUser.ID,
+			IncludeVisibility: organization.DoerViewOtherVisibility(ctx.Doer, ctx.ContextUser),
+			ListOptions: db.ListOptions{
+				Page:     page,
+				PageSize: pagingNum,
+			},
+		})
+		if err != nil {
+			ctx.ServerError("GetUserOrganizations", err)
+			return
+		}
+		cards := make([]*user_model.User, 0, len(orgs))
+		for _, org := range orgs {
+			cards = append(cards, org.AsUser())
+		}
+		ctx.Data["Cards"] = cards // user_cards needs User-only methods
+		total = count
+	default: // default to "repositories"
+		repos, count, err = repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
+			ListOptions: db.ListOptions{
+				PageSize: pagingNum,
+				Page:     page,
+			},
+			Actor:              ctx.Doer,
+			Keyword:            keyword,
+			OwnerID:            ctx.ContextUser.ID,
+			OrderBy:            orderBy,
+			Private:            ctx.IsSigned,
+			Collaborate:        optional.Some(false),
+			TopicOnly:          topicOnly,
+			Language:           language,
+			IncludeDescription: setting.UI.SearchRepoDescription,
+			Archived:           archived,
+			Fork:               fork,
+			Mirror:             mirror,
+			Template:           template,
+			IsPrivate:          private,
+		})
+		if err != nil {
+			ctx.ServerError("SearchRepository", err)
+			return
+		}
+
+		total = count
+	}
+	ctx.Data["Repos"] = repos
+	ctx.Data["Total"] = total
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(pagingNum).CurPage(page).Build()
+	if tab == "activity" {
+		// FIXME: UNLIMITE-PAGING-ONE-MORE-ROW: see another comment
+		pager.WithUnlimitedPaging(curRows, curRows == pagingNum)
+	}
+	ctx.Data["Page"] = pager
+}
+
+// ActionUserFollow is for follow/unfollow user request
+func ActionUserFollow(ctx *context.Context) {
+	var err error
+	switch ctx.FormString("action") {
+	case "follow":
+		err = user_model.FollowUser(ctx, ctx.Doer, ctx.ContextUser)
+	case "unfollow":
+		err = user_model.UnfollowUser(ctx, ctx.Doer.ID, ctx.ContextUser.ID)
+	}
+	if err != nil {
+		ctx.ServerError("ActionUserFollow", err)
+		return
+	}
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	// HINT: USER-TYPE-GLOSSARY: follow the logic in OwnerProfile
+	if ctx.ContextUser.IsOrganization() {
+		ctx.Data["Org"] = ctx.ContextUser
+		ctx.Data["IsFollowing"] = user_model.IsFollowing(ctx, ctx.Doer.ID, ctx.ContextUser.ID)
+		ctx.HTML(http.StatusOK, tplFollowUnfollow)
+	} else {
+		ctx.HTML(http.StatusOK, tplProfileBigAvatar)
+	}
+}

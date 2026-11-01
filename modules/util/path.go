@@ -1,0 +1,368 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package util
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+
+	"gitea.dev/modules/consts"
+)
+
+var PathNameValidator = sync.OnceValue(func() (ret struct {
+	InvalidChars *regexp.Regexp
+	InvalidNames *regexp.Regexp
+},
+) {
+	ret.InvalidChars = regexp.MustCompile(`(?i)[<>:"/\\|?*\x{0000}-\x{001F}]`)
+	// invalid filename contents, based on https://github.com/sindresorhus/filename-reserved-regex
+	// "COM10" needs to be opened with UNC "\\.\COM10" on Windows, so itself is valid
+	ret.InvalidNames = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com\d|lpt\d)$`)
+	return ret
+})
+
+func PathBaseStem(s string) string {
+	return strings.TrimSuffix(path.Base(s), path.Ext(s))
+}
+
+// PathJoinRel joins the path elements into a single path, each element is cleaned by path.Clean separately.
+// It only returns the following values (like path.Join), any redundant part (empty, relative dots, slashes) is removed.
+// It's caller's duty to make every element not bypass its own directly level, to avoid security issues.
+//
+//	empty => ``
+//	`` => ``
+//	`..` => `.`
+//	`dir` => `dir`
+//	`/dir/` => `dir`
+//	`foo\..\bar` => `foo\..\bar`
+//	{`foo`, ``, `bar`} => `foo/bar`
+//	{`foo`, `..`, `bar`} => `foo/bar`
+func PathJoinRel(elem ...string) string {
+	elems := make([]string, len(elem))
+	for i, e := range elem {
+		if e == "" {
+			continue
+		}
+		elems[i] = path.Clean("/" + e)
+	}
+	p := path.Join(elems...)
+	switch p {
+	case "":
+		return ""
+	case "/":
+		return "."
+	}
+	return p[1:]
+}
+
+// PathJoinRelX joins the path elements into a single path like PathJoinRel,
+// and covert all backslashes to slashes. (X means "extended", also means the combination of `\` and `/`).
+// It's caller's duty to make every element not bypass its own directly level, to avoid security issues.
+// It returns similar results as PathJoinRel except:
+//
+//	`foo\..\bar` => `bar`  (because it's processed as `foo/../bar`)
+//
+// All backslashes are handled as slashes, the result only contains slashes.
+func PathJoinRelX(elem ...string) string {
+	elems := make([]string, len(elem))
+	for i, e := range elem {
+		if e == "" {
+			continue
+		}
+		elems[i] = path.Clean("/" + strings.ReplaceAll(e, "\\", "/"))
+	}
+	return PathJoinRel(elems...)
+}
+
+const filepathSeparator = string(os.PathSeparator)
+
+// FilePathJoinAbs joins the path elements into a single file path, each element is cleaned by filepath.Clean separately.
+// All slashes/backslashes are converted to path separators before cleaning, the result only contains path separators.
+// The first element must be an absolute path, caller should prepare the base path.
+// It's caller's duty to make every element not bypass its own directly level, to avoid security issues.
+// Like PathJoinRel, any redundant part (empty, relative dots, slashes) is removed.
+//
+//	{`/foo`, ``, `bar`} => `/foo/bar`
+//	{`/foo`, `..`, `bar`} => `/foo/bar`
+func FilePathJoinAbs(base string, sub ...string) string {
+	// POSIX filesystem can have `\` in file names. Windows: `\` and `/` are both used for path separators
+	// to keep the behavior consistent, we do not allow `\` in file names, replace all `\` with `/`
+	if !consts.IsWindows {
+		base = strings.ReplaceAll(base, "\\", filepathSeparator)
+	}
+	if !filepath.IsAbs(base) {
+		// This shouldn't happen. If it is really necessary to handle relative paths, use filepath.Abs() to get absolute paths first
+		panic(fmt.Sprintf("FilePathJoinAbs: %q (for path %v) is not absolute, do not guess a relative path based on current working directory", base, sub))
+	}
+	if len(sub) == 0 {
+		return filepath.Clean(base)
+	}
+
+	elems := make([]string, 1, len(sub)+1)
+	elems[0] = base
+	for _, s := range sub {
+		if s == "" {
+			continue
+		}
+		if consts.IsWindows {
+			elems = append(elems, filepath.Clean(filepathSeparator+s))
+		} else {
+			elems = append(elems, filepath.Clean(filepathSeparator+strings.ReplaceAll(s, "\\", filepathSeparator)))
+		}
+	}
+	// the elems[0] must be an absolute path, just join them together, and Join will also do Clean
+	return filepath.Join(elems...)
+}
+
+// IsDir returns true if given path is a directory,
+// or returns false when it's a file or does not exist.
+func IsDir(dir string) (bool, error) {
+	f, err := os.Stat(dir)
+	if err == nil {
+		return f.IsDir(), nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+var ErrNotRegularPathFile = errors.New("not a regular file")
+
+// ReadRegularPathFile reads a file with given sub path in root dir.
+// It returns error when the path is not a regular file, or any parent path is not a regular directory.
+func ReadRegularPathFile(root, filePathIn string, limit int) ([]byte, error) {
+	pathFields := strings.Split(PathJoinRelX(filePathIn), "/")
+
+	targetPathBuilder := strings.Builder{}
+	targetPathBuilder.Grow(len(root) + len(filePathIn) + 2)
+	targetPathBuilder.WriteString(root)
+	targetPathString := root
+	for i, subPath := range pathFields {
+		targetPathBuilder.WriteByte(filepath.Separator)
+		targetPathBuilder.WriteString(subPath)
+		targetPathString = targetPathBuilder.String()
+
+		expectFile := i == len(pathFields)-1
+		st, err := os.Lstat(targetPathString)
+		if err != nil {
+			return nil, err
+		}
+		if expectFile && !st.Mode().IsRegular() || !expectFile && !st.Mode().IsDir() {
+			return nil, fmt.Errorf("%w: %s", ErrNotRegularPathFile, filePathIn)
+		}
+	}
+	f, err := os.Open(targetPathString)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return ReadWithLimit(f, limit)
+}
+
+// WriteRegularPathFile writes data to a file with given sub path in root dir, it creates parent directories if necessary.
+// The file is created with fileMode, and the directories are created with dirMode.
+// It returns error when the path already exists but is not a regular file, or any parent path is not a regular directory.
+func WriteRegularPathFile(root, filePathIn string, data []byte, dirMode, fileMode os.FileMode) error {
+	pathFields := strings.Split(PathJoinRelX(filePathIn), "/")
+
+	targetPathBuilder := strings.Builder{}
+	targetPathBuilder.Grow(len(root) + len(filePathIn) + 2)
+	targetPathBuilder.WriteString(root)
+	targetPathString := root
+	for i, subPath := range pathFields {
+		targetPathBuilder.WriteByte(filepath.Separator)
+		targetPathBuilder.WriteString(subPath)
+		targetPathString = targetPathBuilder.String()
+
+		expectFile := i == len(pathFields)-1
+		st, err := os.Lstat(targetPathString)
+		if err == nil {
+			if expectFile && !st.Mode().IsRegular() || !expectFile && !st.Mode().IsDir() {
+				return fmt.Errorf("%w: %s", ErrNotRegularPathFile, filePathIn)
+			}
+			continue
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if !expectFile {
+			if err = os.Mkdir(targetPathString, dirMode); err != nil {
+				return err
+			}
+		}
+	}
+	return os.WriteFile(targetPathString, data, fileMode)
+}
+
+// IsExist checks whether a file or directory exists.
+// It returns false when the file or directory does not exist.
+func IsExist(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil || os.IsExist(err) {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func listDirRecursively(result *[]string, fsDir, recordParentPath string, opts *ListDirOptions) error {
+	dir, err := os.Open(fsDir)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	fis, err := dir.ReadDir(0)
+	if err != nil {
+		return err
+	}
+
+	for _, fi := range fis {
+		if opts.SkipCommonHiddenNames && IsCommonHiddenFileName(fi.Name()) {
+			continue
+		}
+		relPath := path.Join(recordParentPath, fi.Name())
+		curPath := filepath.Join(fsDir, fi.Name())
+		if fi.IsDir() {
+			if opts.IncludeDir {
+				*result = append(*result, relPath+"/")
+			}
+			if err = listDirRecursively(result, curPath, relPath, opts); err != nil {
+				return err
+			}
+		} else {
+			*result = append(*result, relPath)
+		}
+	}
+	return nil
+}
+
+type ListDirOptions struct {
+	IncludeDir            bool // subdirectories are also included with suffix slash
+	SkipCommonHiddenNames bool
+}
+
+// ListDirRecursively gathers information of given directory by depth-first.
+// The paths are always in "dir/slash/file" format (not "\\" even in Windows)
+// Slice does not include given path itself.
+func ListDirRecursively(rootDir string, opts *ListDirOptions) (res []string, err error) {
+	if err = listDirRecursively(&res, rootDir, "", opts); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func fileURLToPathInternal(u *url.URL, isWindows bool) (string, error) {
+	if u.Scheme != "file" {
+		return "", errors.New("URL scheme is not 'file': " + u.String())
+	}
+	if !isWindows {
+		return u.Path, nil
+	}
+
+	// If it is a Windows absolute path with drive letter "/C:/dir", strip off the leading slash.
+	if !strings.HasPrefix(u.Path, "/") || len(u.Path) < 3 {
+		return u.Path, nil
+	}
+	winPath := u.Path[1:]
+	first := winPath[0]
+	if ('a' <= first && first <= 'z' || 'A' <= first && first <= 'Z') && winPath[1] == ':' {
+		return winPath, nil
+	}
+	return u.Path, nil
+}
+
+// FileURLToPath extracts the path information from a file://... url.
+// It returns an error only if the URL is not a file URL.
+func FileURLToPath(u *url.URL) (string, error) {
+	return fileURLToPathInternal(u, consts.IsWindows)
+}
+
+// HomeDir returns path of '~'(in Linux) on Windows,
+// it returns error when the variable does not exist.
+func HomeDir() (home string, err error) {
+	// TODO: some users run Gitea with mismatched uid  and "HOME=xxx" (they set HOME=xxx by environment manually)
+	// TODO: when running gitea as a sub command inside git, the HOME directory is not the user's home directory
+	// so at the moment we can not use `user.Current().HomeDir`
+	if consts.IsWindows {
+		home = os.Getenv("USERPROFILE")
+		if home == "" {
+			home = os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
+		}
+	} else {
+		home = os.Getenv("HOME")
+	}
+
+	if home == "" {
+		return "", errors.New("cannot get home directory")
+	}
+
+	return home, nil
+}
+
+// IsCommonHiddenFileName will check a provided name to see if it represents file or directory that should not be watched
+func IsCommonHiddenFileName(name string) bool {
+	if name == "" {
+		return true
+	}
+
+	switch name[0] {
+	case '.':
+		return true
+	case 't', 'T':
+		return name[1:] == "humbs.db" // macOS
+	case 'd', 'D':
+		return name[1:] == "esktop.ini" // Windows
+	}
+
+	return false
+}
+
+// IsReadmeFileName reports whether name looks like a README file
+// based on its name.
+func IsReadmeFileName(name string) bool {
+	name = strings.ToLower(name)
+	if len(name) < 6 {
+		return false
+	} else if len(name) == 6 {
+		return name == "readme"
+	}
+	return name[:7] == "readme."
+}
+
+// IsReadmeFileExtension reports whether name looks like a README file
+// based on its name. It will look through the provided extensions and check if the file matches
+// one of the extensions and provide the index in the extension list.
+// If the filename is `readme.` with an unmatched extension it will match with the index equaling
+// the length of the provided extension list.
+// Note that the '.' should be provided in ext, e.g ".md"
+func IsReadmeFileExtension(name string, ext ...string) (int, bool) {
+	name = strings.ToLower(name)
+	if len(name) < 6 || name[:6] != "readme" {
+		return 0, false
+	}
+
+	for i, extension := range ext {
+		extension = strings.ToLower(extension)
+		if name[6:] == extension {
+			return i, true
+		}
+	}
+
+	if len(name) > 6 && name[6] == '.' {
+		return len(ext), true
+	}
+
+	return 0, false
+}

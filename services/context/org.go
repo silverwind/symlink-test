@@ -1,0 +1,270 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors.
+// SPDX-License-Identifier: MIT
+
+package context
+
+import (
+	"strings"
+
+	"gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+)
+
+// Organization contains organization context
+type Organization struct {
+	IsOwner      bool
+	IsMember     bool
+	IsTeamMember bool // Is member of team.
+
+	Organization     *organization.Organization
+	OrgLink          string
+	CanCreateOrgRepo bool
+
+	Team  *organization.Team
+	Teams []*organization.Team
+}
+
+func (org *Organization) CanWriteAnyRepoUnit(ctx *Context, unitType unit.Type) bool {
+	return org.Organization.AnyRepoUnitPermission(ctx, ctx.Doer, unitType) >= perm.AccessModeWrite
+}
+
+func (org *Organization) CanReadAnyRepoUnit(ctx *Context, unitType unit.Type) bool {
+	return org.Organization.AnyRepoUnitPermission(ctx, ctx.Doer, unitType) >= perm.AccessModeRead
+}
+
+func GetOrganizationByParams(ctx *Context) {
+	orgName := ctx.PathParam("org")
+
+	var err error
+
+	ctx.Org.Organization, err = organization.GetOrgByName(ctx, orgName)
+	if err != nil {
+		if organization.IsErrOrgNotExist(err) {
+			redirectUserID, err := user_model.LookupUserRedirect(ctx, orgName)
+			if err == nil {
+				RedirectToUser(ctx.Base, ctx.Doer, orgName, redirectUserID)
+			} else if user_model.IsErrUserRedirectNotExist(err) {
+				ctx.NotFound(err)
+			} else {
+				ctx.ServerError("LookupUserRedirect", err)
+			}
+		} else {
+			ctx.ServerError("GetUserByName", err)
+		}
+		return
+	}
+}
+
+type OrgAssignmentOptions struct {
+	RequireMember     bool
+	RequireOwner      bool
+	RequireTeamMember bool
+}
+
+// OrgAssignment returns a middleware to handle organization assignment
+func OrgAssignment(orgAssignmentOpts OrgAssignmentOptions) func(ctx *Context) {
+	return func(ctx *Context) {
+		opts := orgAssignmentOpts // it must be a copy, because the values will be changed
+		var err error
+		if ctx.ContextUser == nil {
+			// if Organization is not defined, get it from params
+			if ctx.Org.Organization == nil {
+				GetOrganizationByParams(ctx)
+				if ctx.Written() {
+					return
+				}
+			}
+		} else if ctx.ContextUser.IsOrganization() {
+			ctx.Org.Organization = (*organization.Organization)(ctx.ContextUser)
+		} else {
+			// ContextUser is an individual User
+			return
+		}
+
+		org := ctx.Org.Organization
+
+		// Handle Visibility
+		if org.Visibility != structs.VisibleTypePublic && !user_model.DoerCanViewPrivate(ctx.Doer) {
+			// We must be signed in to see limited or private organizations
+			ctx.NotFound(err)
+			return
+		}
+
+		if org.Visibility == structs.VisibleTypePrivate {
+			opts.RequireMember = true
+		} else if ctx.IsSigned && ctx.Doer.IsRestricted {
+			opts.RequireMember = true
+		}
+
+		ctx.ContextUser = org.AsUser()
+		ctx.Data["Org"] = org
+
+		// Admin has super access.
+		if ctx.IsSigned && ctx.Doer.IsAdmin {
+			ctx.Org.IsOwner = true
+			ctx.Org.IsMember = true
+			ctx.Org.IsTeamMember = true
+			ctx.Org.CanCreateOrgRepo = true
+		} else if ctx.IsSigned {
+			ctx.Org.IsOwner, err = org.IsOwnedBy(ctx, ctx.Doer.ID)
+			if err != nil {
+				ctx.ServerError("IsOwnedBy", err)
+				return
+			}
+
+			if ctx.Org.IsOwner {
+				ctx.Org.IsMember = true
+				ctx.Org.IsTeamMember = true
+				ctx.Org.CanCreateOrgRepo = true
+			} else {
+				ctx.Org.IsMember, err = org.IsOrgMember(ctx, ctx.Doer.ID)
+				if err != nil {
+					ctx.ServerError("IsOrgMember", err)
+					return
+				}
+				if ctx.Org.IsMember {
+					ctx.Org.CanCreateOrgRepo, err = org.CanCreateOrgRepo(ctx, ctx.Doer.ID)
+					if err != nil {
+						ctx.ServerError("CanCreateOrgRepo", err)
+						return
+					}
+				}
+			}
+		} else {
+			// Fake data.
+			ctx.Data["SignedUser"] = &user_model.User{}
+		}
+		if (opts.RequireMember && !ctx.Org.IsMember) || (opts.RequireOwner && !ctx.Org.IsOwner) {
+			ctx.NotFound(err)
+			return
+		}
+		ctx.Data["IsOrganizationOwner"] = ctx.Org.IsOwner
+		ctx.Data["IsOrganizationMember"] = ctx.Org.IsMember
+		ctx.Data["IsPackageEnabled"] = setting.Packages.Enabled
+		ctx.Data["IsRepoIndexerEnabled"] = setting.Indexer.RepoIndexerEnabled
+		ctx.Data["IsPublicMember"] = func(uid int64) bool {
+			is, _ := organization.IsPublicMembership(ctx, ctx.Org.Organization.ID, uid)
+			return is
+		}
+		ctx.Data["CanCreateOrgRepo"] = ctx.Org.CanCreateOrgRepo
+
+		ctx.Org.OrgLink = org.AsUser().OrganisationLink()
+		ctx.Data["OrgLink"] = ctx.Org.OrgLink
+
+		// Member
+		findMembersOpts := &organization.FindOrgMembersOpts{
+			Doer:         ctx.Doer,
+			OrgID:        org.ID,
+			IsDoerMember: ctx.Org.IsMember,
+		}
+		ctx.Data["NumMembers"], err = organization.CountOrgMembers(ctx, findMembersOpts)
+		if err != nil {
+			ctx.ServerError("CountOrgMembers", err)
+			return
+		}
+
+		// Team.
+		shouldSeeAllTeams, err := UserShouldSeeAllOrgTeams(ctx)
+		if err != nil {
+			ctx.ServerError("UserShouldSeeAllOrgTeams", err)
+			return
+		}
+		switch {
+		case shouldSeeAllTeams:
+			ctx.Org.Teams, err = org.LoadTeams(ctx)
+			if err != nil {
+				ctx.ServerError("LoadTeams", err)
+				return
+			}
+		case ctx.IsSigned:
+			// Signed-in non-members still see teams whose visibility tier
+			// includes them (public for any signed-in user, plus limited
+			// for org members), and any team they directly belong to.
+			ctx.Org.Teams, _, err = organization.SearchTeam(ctx, &organization.SearchTeamOptions{
+				OrgID:               org.ID,
+				UserID:              ctx.Doer.ID,
+				IncludeVisibilities: organization.VisibleTeamVisibilitiesFor(ctx.Org.IsMember, true),
+			})
+			if err != nil {
+				ctx.ServerError("SearchTeam", err)
+				return
+			}
+		}
+		if ctx.Org.IsMember {
+			ctx.Data["NumTeams"] = len(ctx.Org.Teams)
+		}
+
+		teamName := ctx.PathParam("team")
+		if len(teamName) > 0 {
+			teamExists := false
+			for _, team := range ctx.Org.Teams {
+				if strings.EqualFold(team.LowerName, teamName) {
+					teamExists = true
+					ctx.Org.Team = team
+					ctx.Data["Team"] = ctx.Org.Team
+					break
+				}
+			}
+
+			if !teamExists {
+				ctx.NotFound(err)
+				return
+			}
+
+			// Membership in a visible team is not implied by its presence in
+			// ctx.Org.Teams; admins/org owners keep the privileged flag set
+			// earlier in this function.
+			if !ctx.Org.IsOwner {
+				ctx.Org.IsTeamMember, err = organization.IsTeamMember(ctx, org.ID, ctx.Org.Team.ID, ctx.Doer.ID)
+				if err != nil {
+					ctx.ServerError("IsTeamMember", err)
+					return
+				}
+			}
+			ctx.Data["IsTeamMember"] = ctx.Org.IsTeamMember
+			if opts.RequireTeamMember && !ctx.Org.IsTeamMember {
+				ctx.NotFound(err)
+				return
+			}
+		}
+		ctx.Data["ContextUser"] = ctx.ContextUser
+
+		ctx.Data["CanReadProjects"] = ctx.Org.CanReadAnyRepoUnit(ctx, unit.TypeProjects)
+		ctx.Data["CanReadPackages"] = ctx.Org.CanReadAnyRepoUnit(ctx, unit.TypePackages)
+		ctx.Data["CanReadCode"] = ctx.Org.CanReadAnyRepoUnit(ctx, unit.TypeCode)
+
+		ctx.Data["IsFollowing"] = ctx.Doer != nil && user_model.IsFollowing(ctx, ctx.Doer.ID, ctx.ContextUser.ID)
+		if len(ctx.ContextUser.Description) != 0 {
+			content, err := markdown.RenderString(markup.NewRenderContext(ctx), ctx.ContextUser.Description)
+			if err != nil {
+				ctx.ServerError("RenderString", err)
+				return
+			}
+			ctx.Data["RenderedDescription"] = content
+		}
+	}
+}
+
+// UserShouldSeeAllOrgTeams tells if a user has permission to view all teams in the org.
+func UserShouldSeeAllOrgTeams(ctx *Context) (bool, error) {
+	if !ctx.Org.IsMember {
+		return false, nil
+	}
+
+	if ctx.Org.IsOwner {
+		return true, nil
+	}
+
+	teams, err := ctx.Org.Organization.GetUserTeams(ctx, ctx.Doer.ID)
+	if err != nil {
+		return false, err
+	}
+	return teams.HasAllRepoAdminAccess(), nil
+}

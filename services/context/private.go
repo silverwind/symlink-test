@@ -1,0 +1,102 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package context
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/private"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/web"
+	web_types "gitea.dev/modules/web/types"
+)
+
+// PrivateContext represents a context for private routes
+type PrivateContext struct {
+	*Base
+	Override context.Context
+
+	Doer *user_model.User
+	Repo *Repository
+}
+
+func init() {
+	web.RegisterResponseStatusProvider[*PrivateContext](func(req *http.Request) web_types.ResponseStatusProvider {
+		return GetPrivateContext(req)
+	})
+}
+
+func (ctx *PrivateContext) Deadline() (deadline time.Time, ok bool) {
+	if ctx.Override != nil {
+		return ctx.Override.Deadline()
+	}
+	return ctx.Base.Deadline()
+}
+
+func (ctx *PrivateContext) Done() <-chan struct{} {
+	if ctx.Override != nil {
+		return ctx.Override.Done()
+	}
+	return ctx.Base.Done()
+}
+
+func (ctx *PrivateContext) Err() error {
+	if ctx.Override != nil {
+		return ctx.Override.Err()
+	}
+	return ctx.Base.Err()
+}
+
+func (ctx *PrivateContext) PrivateInternalErrorf(format string, args ...any) {
+	s := fmt.Sprintf(format, args...)
+	log.ErrorWithSkip(1, "Internal error: %s", s)
+	ctx.JSON(http.StatusInternalServerError, private.Response{Err: s})
+}
+
+func (ctx *PrivateContext) PrivateUserErrorf(status int, format string, args ...any) {
+	ctx.JSON(status, private.Response{UserMsg: fmt.Sprintf(format, args...)})
+}
+
+type privateContextKeyType struct{}
+
+var privateContextKey privateContextKeyType
+
+func GetPrivateContext(req *http.Request) *PrivateContext {
+	return reqctx.MustContextValue[*PrivateContext](req.Context(), privateContextKey)
+}
+
+func PrivateContexter() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			base := NewBaseContext(w, req)
+			ctx := &PrivateContext{Base: base}
+			ctx.SetContextValue(privateContextKey, ctx)
+			next.ServeHTTP(ctx.Resp, ctx.Req)
+		})
+	}
+}
+
+// OverrideContext overrides the underlying request context for Done() etc.
+// This function should be used when there is a need for work to continue even if the request has been cancelled.
+// Primarily this affects hook/post-receive and hook/proc-receive both of which need to continue working even if
+// the underlying request has timed out from the ssh/http push
+func OverrideContext() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// We now need to override the request context as the base for our work because even if the request is cancelled we have to continue this work
+			ctx := GetPrivateContext(req)
+			var finished func()
+			ctx.Override, _, finished = process.GetManager().AddTypedContext(graceful.GetManager().HammerContext(), "PrivateContext: "+ctx.Req.RequestURI, process.RequestProcessType, true)
+			defer finished()
+			next.ServeHTTP(ctx.Resp, ctx.Req)
+		})
+	}
+}

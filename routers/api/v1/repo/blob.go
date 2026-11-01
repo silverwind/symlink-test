@@ -1,0 +1,53 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"net/http"
+
+	"gitea.dev/services/context"
+	files_service "gitea.dev/services/repository/files"
+)
+
+// GetBlob get the blob of a repository file.
+func GetBlob(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/git/blobs/{sha} repository GetBlob
+	// ---
+	// summary: Gets the blob of a repository.
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: sha
+	//   in: path
+	//   description: sha of the commit
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/GitBlobResponse"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	sha := ctx.PathParam("sha")
+	if len(sha) == 0 {
+		ctx.APIError(http.StatusBadRequest, "sha not provided")
+		return
+	}
+
+	if blob, err := files_service.GetBlobBySHA(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, sha); err != nil {
+		ctx.APIError(http.StatusBadRequest, err.Error())
+	} else {
+		ctx.JSON(http.StatusOK, blob)
+	}
+}

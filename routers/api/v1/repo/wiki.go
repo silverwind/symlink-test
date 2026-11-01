@@ -1,0 +1,492 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/url"
+
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	notify_service "gitea.dev/services/notify"
+	wiki_service "gitea.dev/services/wiki"
+)
+
+// NewWikiPage response for wiki create request
+func NewWikiPage(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/wiki/new repository repoCreateWikiPage
+	// ---
+	// summary: Create a wiki page
+	// consumes:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateWikiPageOptions"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/WikiPage"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.CreateWikiPageOptions](ctx)
+	wikiName := wiki_service.UserTitleToWebPath("", form.Title)
+
+	if len(form.Message) == 0 {
+		form.Message = fmt.Sprintf("Add %q", form.Title)
+	}
+
+	content, err := base64.StdEncoding.DecodeString(form.ContentBase64)
+	if err != nil {
+		ctx.APIError(http.StatusBadRequest, err.Error())
+		return
+	}
+	form.ContentBase64 = string(content)
+
+	if err := wiki_service.AddWikiPage(ctx, ctx.Doer, ctx.Repo.Repository, wikiName, form.ContentBase64, form.Message); err != nil {
+		if repo_model.IsErrWikiReservedName(err) {
+			ctx.APIError(http.StatusBadRequest, err.Error())
+		} else if repo_model.IsErrWikiAlreadyExist(err) {
+			ctx.APIError(http.StatusBadRequest, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	wikiPage := getWikiPage(ctx, wikiName)
+
+	if !ctx.Written() {
+		notify_service.NewWikiPage(ctx, ctx.Doer, ctx.Repo.Repository, string(wikiName), form.Message)
+		ctx.JSON(http.StatusCreated, wikiPage)
+	}
+}
+
+// EditWikiPage response for wiki modify request
+func EditWikiPage(ctx *context.APIContext) {
+	// swagger:operation PATCH /repos/{owner}/{repo}/wiki/page/{pageName} repository repoEditWikiPage
+	// ---
+	// summary: Edit a wiki page
+	// consumes:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: pageName
+	//   in: path
+	//   description: name of the page
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/CreateWikiPageOptions"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WikiPage"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.CreateWikiPageOptions](ctx)
+
+	oldWikiName := wiki_service.WebPathFromRequest(ctx.PathParamRaw("pageName"))
+	newWikiName := wiki_service.UserTitleToWebPath("", form.Title)
+
+	if len(newWikiName) == 0 {
+		newWikiName = oldWikiName
+	}
+
+	if len(form.Message) == 0 {
+		form.Message = fmt.Sprintf("Update %q", newWikiName)
+	}
+
+	content, err := base64.StdEncoding.DecodeString(form.ContentBase64)
+	if err != nil {
+		ctx.APIError(http.StatusBadRequest, err.Error())
+		return
+	}
+	form.ContentBase64 = string(content)
+
+	if err := wiki_service.EditWikiPage(ctx, ctx.Doer, ctx.Repo.Repository, oldWikiName, newWikiName, form.ContentBase64, form.Message); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	wikiPage := getWikiPage(ctx, newWikiName)
+
+	if !ctx.Written() {
+		notify_service.EditWikiPage(ctx, ctx.Doer, ctx.Repo.Repository, string(newWikiName), form.Message)
+		ctx.JSON(http.StatusOK, wikiPage)
+	}
+}
+
+func getWikiPage(ctx *context.APIContext, wikiName wiki_service.WebPath) *api.WikiPage {
+	wikiRepo, commit := findWikiRepoCommit(ctx)
+	if wikiRepo != nil {
+		defer wikiRepo.Close()
+	}
+	if ctx.Written() {
+		return nil
+	}
+
+	// lookup filename in wiki - get filecontent, real filename
+	content, pageFilename := wikiContentsByName(ctx, wikiRepo, commit, wikiName, false)
+	if ctx.Written() {
+		return nil
+	}
+
+	sidebarContent, _ := wikiContentsByName(ctx, wikiRepo, commit, "_Sidebar", true)
+	if ctx.Written() {
+		return nil
+	}
+
+	footerContent, _ := wikiContentsByName(ctx, wikiRepo, commit, "_Footer", true)
+	if ctx.Written() {
+		return nil
+	}
+
+	// get commit count - wiki revisions
+	commitsCount, _ := git.FileCommitsCount(ctx, ctx.Repo.Repository.WikiStorageRepo(), ctx.Repo.Repository.DefaultWikiBranch, pageFilename)
+
+	// Get last change information.
+	lastCommit, err := wikiRepo.GetCommitByPath(ctx, pageFilename)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return nil
+	}
+
+	return &api.WikiPage{
+		WikiPageMetaData: wiki_service.ToWikiPageMetaData(wikiName, lastCommit, ctx.Repo.Repository),
+		ContentBase64:    content,
+		CommitCount:      commitsCount,
+		Sidebar:          sidebarContent,
+		Footer:           footerContent,
+	}
+}
+
+// DeleteWikiPage delete wiki page
+func DeleteWikiPage(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/wiki/page/{pageName} repository repoDeleteWikiPage
+	// ---
+	// summary: Delete a wiki page
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: pageName
+	//   in: path
+	//   description: name of the page
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	wikiName := wiki_service.WebPathFromRequest(ctx.PathParamRaw("pageName"))
+
+	if err := wiki_service.DeleteWikiPage(ctx, ctx.Doer, ctx.Repo.Repository, wikiName); err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	notify_service.DeleteWikiPage(ctx, ctx.Doer, ctx.Repo.Repository, string(wikiName))
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// ListWikiPages get wiki pages list
+func ListWikiPages(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/wiki/pages repository repoGetWikiPages
+	// ---
+	// summary: Get all wiki pages
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WikiPageList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	wikiRepo, commit := findWikiRepoCommit(ctx)
+	if wikiRepo != nil {
+		defer wikiRepo.Close()
+	}
+	if ctx.Written() {
+		return
+	}
+
+	page := max(ctx.FormInt("page"), 1)
+	limit := ctx.FormInt("limit")
+	if limit <= 1 {
+		limit = setting.API.DefaultPagingNum
+	}
+
+	skip := (page - 1) * limit
+	maxNum := page * limit
+
+	entries, err := commit.Tree().ListEntries(ctx, wikiRepo)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	pages := make([]*api.WikiPageMetaData, 0, len(entries))
+	for i, entry := range entries {
+		if i < skip || i >= maxNum || !entry.IsRegular() {
+			continue
+		}
+		c, err := wikiRepo.GetCommitByPath(ctx, entry.Name())
+		if err != nil {
+			ctx.APIErrorInternal(err)
+			return
+		}
+		wikiName, err := wiki_service.GitPathToWebPath(entry.Name())
+		if err != nil {
+			if repo_model.IsErrWikiInvalidFileName(err) {
+				continue
+			}
+			ctx.APIErrorInternal(err)
+			return
+		}
+		pages = append(pages, wiki_service.ToWikiPageMetaData(wikiName, c, ctx.Repo.Repository))
+	}
+
+	ctx.SetLinkHeader(int64(len(entries)), limit)
+	ctx.SetTotalCountHeader(int64(len(entries)))
+	ctx.JSON(http.StatusOK, pages)
+}
+
+// GetWikiPage get single wiki page
+func GetWikiPage(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/wiki/page/{pageName} repository repoGetWikiPage
+	// ---
+	// summary: Get a wiki page
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: pageName
+	//   in: path
+	//   description: name of the page
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WikiPage"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	// get requested pagename
+	pageName := wiki_service.WebPathFromRequest(ctx.PathParamRaw("pageName"))
+
+	wikiPage := getWikiPage(ctx, pageName)
+	if !ctx.Written() {
+		ctx.JSON(http.StatusOK, wikiPage)
+	}
+}
+
+// ListPageRevisions renders file revision list of wiki page
+func ListPageRevisions(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/wiki/revisions/{pageName} repository repoGetWikiPageRevisions
+	// ---
+	// summary: Get revisions of a wiki page
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: pageName
+	//   in: path
+	//   description: name of the page
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WikiCommitList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	wikiRepo, commit := findWikiRepoCommit(ctx)
+	if wikiRepo != nil {
+		defer wikiRepo.Close()
+	}
+	if ctx.Written() {
+		return
+	}
+
+	// get requested pagename
+	pageName := wiki_service.WebPathFromRequest(ctx.PathParamRaw("pageName"))
+	if len(pageName) == 0 {
+		pageName = "Home"
+	}
+
+	// lookup filename in wiki - get filecontent, gitTree entry , real filename
+	_, pageFilename := wikiContentsByName(ctx, wikiRepo, commit, pageName, false)
+	if ctx.Written() {
+		return
+	}
+
+	// get commit count - wiki revisions
+	commitsCount, _ := git.FileCommitsCount(ctx, ctx.Repo.Repository.WikiStorageRepo(), ctx.Repo.Repository.DefaultWikiBranch, pageFilename)
+
+	page := max(ctx.FormInt("page"), 1)
+
+	// get Commit Count
+	commitsHistory, _, err := wikiRepo.CommitsByFileAndRange(ctx,
+		git.CommitsByFileAndRangeOptions{
+			Revision: ctx.Repo.Repository.DefaultWikiBranch,
+			File:     pageFilename,
+			Page:     page,
+		})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	// FIXME: SetLinkHeader missing
+	ctx.SetTotalCountHeader(commitsCount)
+	ctx.JSON(http.StatusOK, convert.ToWikiCommitList(commitsHistory, commitsCount))
+}
+
+// findEntryForFile finds the tree entry for a target filepath.
+func findEntryForFile(ctx *context.APIContext, wikiRepo *git.Repository, commit *git.Commit, target string) (*git.TreeEntry, error) {
+	entry, err := commit.GetTreeEntryByPath(ctx, wikiRepo, target)
+	if err != nil {
+		return nil, err
+	}
+	if entry != nil {
+		return entry, nil
+	}
+
+	// Then the unescaped, shortest alternative
+	var unescapedTarget string
+	if unescapedTarget, err = url.QueryUnescape(target); err != nil {
+		return nil, err
+	}
+	return commit.GetTreeEntryByPath(ctx, wikiRepo, unescapedTarget)
+}
+
+// findWikiRepoCommit opens the wiki repo and returns the latest commit, writing to context on error.
+// The caller is responsible for closing the returned repo again
+func findWikiRepoCommit(ctx *context.APIContext) (*git.Repository, *git.Commit) {
+	wikiRepo, err := git.OpenRepository(ctx, ctx.Repo.Repository.WikiStorageRepo())
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return nil, nil
+	}
+
+	commit, err := wikiRepo.GetBranchCommit(ctx, ctx.Repo.Repository.DefaultWikiBranch)
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return wikiRepo, nil
+	}
+	return wikiRepo, commit
+}
+
+// wikiContentsByEntry returns the contents of the wiki page referenced by the
+// given tree entry, encoded with base64. Writes to ctx if an error occurs.
+func wikiContentsByEntry(ctx *context.APIContext, wikiRepo *git.Repository, entry *git.TreeEntry) string {
+	blob := entry.Blob(wikiRepo)
+	if blob.Size(ctx) > setting.API.DefaultMaxBlobSize {
+		return ""
+	}
+	content, err := blob.GetBlobContentBase64(ctx, nil)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return ""
+	}
+	return content
+}
+
+// wikiContentsByName returns the contents of a wiki page, along with a boolean
+// indicating whether the page exists. Writes to ctx if an error occurs.
+func wikiContentsByName(ctx *context.APIContext, wikiRepo *git.Repository, commit *git.Commit, wikiName wiki_service.WebPath, isSidebarOrFooter bool) (string, string) {
+	gitFilename := wiki_service.WebPathToGitPath(wikiName)
+	entry, err := findEntryForFile(ctx, wikiRepo, commit, gitFilename)
+	if err != nil {
+		if git.IsErrNotExist(err) {
+			if !isSidebarOrFooter {
+				ctx.APIErrorNotFound()
+			}
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return "", ""
+	}
+	return wikiContentsByEntry(ctx, wikiRepo, entry), gitFilename
+}

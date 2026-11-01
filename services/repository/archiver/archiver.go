@@ -1,0 +1,410 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package archiver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/queue"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	"gitea.dev/modules/util"
+	gitea_context "gitea.dev/services/context"
+)
+
+// ArchiveRequest defines the parameters of an archive request, which notably
+// includes the specific repository being archived as well as the commit, the
+// name by which it was requested, and the kind of archive being requested.
+// This is entirely opaque to external entities, though, and mostly used as a
+// handle elsewhere.
+type ArchiveRequest struct {
+	Repo     *repo_model.Repository
+	Type     repo_model.ArchiveType
+	CommitID string
+	Paths    []string
+
+	archiveRefShortName string // the ref short name to download the archive, for example: "master", "v1.0.0", "commit id"
+}
+
+type archiveQueueItem struct {
+	RepoID              int64                  `json:"RepoID"`
+	Type                repo_model.ArchiveType `json:"Type"`
+	CommitID            string                 `json:"CommitID"`
+	Paths               []string               `json:"Paths,omitempty"`
+	ArchiveRefShortName string                 `json:"ArchiveRefShortName,omitempty"`
+}
+
+func (aReq *ArchiveRequest) toQueueItem() *archiveQueueItem {
+	return &archiveQueueItem{
+		RepoID:              aReq.Repo.ID,
+		Type:                aReq.Type,
+		CommitID:            aReq.CommitID,
+		Paths:               aReq.Paths,
+		ArchiveRefShortName: aReq.archiveRefShortName,
+	}
+}
+
+func (item *archiveQueueItem) toArchiveRequest(ctx context.Context) (*ArchiveRequest, error) {
+	repo, err := repo_model.GetRepositoryByID(ctx, item.RepoID)
+	if err != nil {
+		return nil, err
+	}
+	return &ArchiveRequest{
+		Repo:                repo,
+		Type:                item.Type,
+		CommitID:            item.CommitID,
+		Paths:               item.Paths,
+		archiveRefShortName: item.ArchiveRefShortName,
+	}, nil
+}
+
+// NewRequest creates an archival request, based on the URI.  The
+// resulting ArchiveRequest is suitable for being passed to Await()
+// if it's determined that the request still needs to be satisfied.
+func NewRequest(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, archiveRefExt string, paths []string) (*ArchiveRequest, error) {
+	// here the archiveRefShortName is not a clear ref, it could be a tag, branch or commit id
+	archiveRefShortName, archiveType := repo_model.SplitArchiveNameType(archiveRefExt)
+	if archiveType == repo_model.ArchiveUnknown {
+		return nil, util.NewInvalidArgumentErrorf("unknown format: %s", archiveRefExt)
+	}
+	if archiveType == repo_model.ArchiveBundle && len(paths) != 0 {
+		return nil, util.NewInvalidArgumentErrorf("cannot specify paths when requesting a bundle")
+	}
+
+	// Get corresponding commit.
+	commit, err := gitRepo.GetCommit(ctx, archiveRefShortName)
+	if err != nil {
+		return nil, util.NewNotExistErrorf("unrecognized repository reference: %s", archiveRefShortName)
+	}
+
+	r := &ArchiveRequest{Repo: repo, archiveRefShortName: archiveRefShortName, Type: archiveType, Paths: paths}
+	r.CommitID = commit.ID.String()
+	return r, nil
+}
+
+// GetArchiveName returns the name of the caller, based on the ref used by the
+// caller to create this request.
+func (aReq *ArchiveRequest) GetArchiveName() string {
+	return strings.ReplaceAll(aReq.archiveRefShortName, "/", "-") + "." + aReq.Type.String()
+}
+
+// Await awaits the completion of an ArchiveRequest. If the archive has
+// already been prepared the method returns immediately. Otherwise, an archiver
+// process will be started and its completion awaited. On success the returned
+// RepoArchiver may be used to download the archive. Note that even if the
+// context is cancelled/times out a started archiver will still continue to run
+// in the background.
+func (aReq *ArchiveRequest) Await(ctx context.Context) (*repo_model.RepoArchiver, error) {
+	archiver, err := repo_model.GetRepoArchiver(ctx, aReq.Repo.ID, aReq.Type, aReq.CommitID)
+	if err != nil {
+		return nil, fmt.Errorf("models.GetRepoArchiver: %w", err)
+	}
+
+	if archiver != nil && archiver.Status == repo_model.ArchiverReady {
+		// Archive already generated, we're done.
+		return archiver, nil
+	}
+
+	if err := StartArchive(aReq); err != nil {
+		return nil, fmt.Errorf("archiver.StartArchive: %w", err)
+	}
+
+	poll := time.NewTicker(time.Second * 1)
+	defer poll.Stop()
+
+	for {
+		select {
+		case <-graceful.GetManager().HammerContext().Done():
+			// System stopped.
+			return nil, graceful.GetManager().HammerContext().Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-poll.C:
+			archiver, err = repo_model.GetRepoArchiver(ctx, aReq.Repo.ID, aReq.Type, aReq.CommitID)
+			if err != nil {
+				return nil, fmt.Errorf("repo_model.GetRepoArchiver: %w", err)
+			}
+			if archiver != nil && archiver.Status == repo_model.ArchiverReady {
+				return archiver, nil
+			}
+		}
+	}
+}
+
+// Stream satisfies the ArchiveRequest being passed in.  Processing
+// will occur directly in this routine.
+func (aReq *ArchiveRequest) Stream(ctx context.Context, w io.Writer) error {
+	if aReq.Type == repo_model.ArchiveBundle {
+		return git.CreateBundle(
+			ctx,
+			aReq.Repo,
+			aReq.CommitID,
+			w,
+		)
+	}
+	return git.CreateArchive(
+		ctx,
+		aReq.Repo,
+		aReq.Repo.Name,
+		aReq.Type.String(),
+		w,
+		aReq.CommitID,
+		aReq.Paths,
+	)
+}
+
+// doArchive satisfies the ArchiveRequest being passed in.  Processing
+// will occur in a separate goroutine, as this phase may take a while to
+// complete.  If the archive already exists, doArchive will not do
+// anything.  In all cases, the caller should be examining the *ArchiveRequest
+// being returned for completion, as it may be different than the one they passed
+// in.
+func doArchive(ctx context.Context, r *ArchiveRequest) (*repo_model.RepoArchiver, error) {
+	ctx, _, finished := process.GetManager().AddContext(ctx, fmt.Sprintf("ArchiveRequest[%s]: %s", r.Repo.FullName(), r.GetArchiveName()))
+	defer finished()
+
+	archiver, err := repo_model.GetRepoArchiver(ctx, r.Repo.ID, r.Type, r.CommitID)
+	if err != nil {
+		return nil, err
+	}
+
+	if archiver != nil {
+		// FIXME: If another process are generating it, we think it's not ready and just return
+		// Or we should wait until the archive generated.
+		if archiver.Status == repo_model.ArchiverGenerating {
+			return nil, nil //nolint:nilnil // return nil because the archive is still being generated
+		}
+	} else {
+		archiver = &repo_model.RepoArchiver{
+			RepoID:   r.Repo.ID,
+			Type:     r.Type,
+			CommitID: r.CommitID,
+			Status:   repo_model.ArchiverGenerating,
+		}
+		if err := db.Insert(ctx, archiver); err != nil {
+			return nil, err
+		}
+	}
+
+	rPath := archiver.RelativePath()
+	_, err = storage.RepoArchives.Stat(rPath)
+	if err == nil {
+		if archiver.Status == repo_model.ArchiverGenerating {
+			archiver.Status = repo_model.ArchiverReady
+			if err = repo_model.UpdateRepoArchiverStatus(ctx, archiver); err != nil {
+				return nil, err
+			}
+		}
+		return archiver, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("unable to stat archive: %w", err)
+	}
+
+	rd, w := io.Pipe()
+	defer func() {
+		_ = w.Close()
+		_ = rd.Close()
+	}()
+	done := make(chan error, 1) // Ensure that there is some capacity which will ensure that the goroutine below can always finish
+
+	go func(done chan error, w *io.PipeWriter, archiveReq *ArchiveRequest) {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("%v", r)
+			}
+		}()
+
+		err := archiveReq.Stream(ctx, w)
+		_ = w.CloseWithError(err)
+		done <- err
+	}(done, w, r)
+
+	// TODO: add lfs data to zip
+	// TODO: add submodule data to zip
+
+	if _, err := storage.RepoArchives.Save(rPath, rd, -1); err != nil {
+		return nil, fmt.Errorf("unable to write archive: %w", err)
+	}
+
+	err = <-done
+	if err != nil {
+		return nil, err
+	}
+
+	if archiver.Status == repo_model.ArchiverGenerating {
+		archiver.Status = repo_model.ArchiverReady
+		if err = repo_model.UpdateRepoArchiverStatus(ctx, archiver); err != nil {
+			return nil, err
+		}
+	}
+
+	return archiver, nil
+}
+
+var archiverQueue *queue.WorkerPoolQueue[*archiveQueueItem]
+
+// Init initializes archiver
+func Init(ctx context.Context) error {
+	handler := func(items ...*archiveQueueItem) []*archiveQueueItem {
+		for _, item := range items {
+			log.Trace("ArchiverData Process: %#v", item)
+			archiveReq, err := item.toArchiveRequest(ctx)
+			if err != nil {
+				log.Error("Archive repo %d: %v", item.RepoID, err)
+				continue
+			}
+			if archiver, err := doArchive(ctx, archiveReq); err != nil {
+				log.Error("Archive %v failed: %v", archiveReq, err)
+			} else {
+				log.Trace("ArchiverData Success: %#v", archiver)
+			}
+		}
+		return nil
+	}
+
+	archiverQueue = queue.CreateUniqueQueue(graceful.GetManager().ShutdownContext(), "repo-archive", handler)
+	if archiverQueue == nil {
+		return errors.New("unable to create repo-archive queue")
+	}
+	go graceful.GetManager().RunWithCancel(archiverQueue)
+
+	return nil
+}
+
+// StartArchive push the archive request to the queue
+func StartArchive(request *ArchiveRequest) error {
+	item := request.toQueueItem()
+	has, err := archiverQueue.Has(item)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	return archiverQueue.Push(item)
+}
+
+func deleteOldRepoArchiver(ctx context.Context, archiver *repo_model.RepoArchiver) error {
+	if _, err := db.DeleteByID[repo_model.RepoArchiver](ctx, archiver.ID); err != nil {
+		return err
+	}
+	p := archiver.RelativePath()
+	if err := storage.RepoArchives.Delete(p); err != nil {
+		log.Error("delete repo archive file failed: %v", err)
+	}
+	return nil
+}
+
+// DeleteOldRepositoryArchives deletes old repository archives.
+func DeleteOldRepositoryArchives(ctx context.Context, olderThan time.Duration) error {
+	log.Trace("Doing: ArchiveCleanup")
+
+	for {
+		archivers, err := db.Find[repo_model.RepoArchiver](ctx, repo_model.FindRepoArchiversOption{
+			ListOptions: db.ListOptions{
+				PageSize: 100,
+				Page:     1,
+			},
+			OlderThan: olderThan,
+		})
+		if err != nil {
+			log.Trace("Error: ArchiveClean: %v", err)
+			return err
+		}
+
+		for _, archiver := range archivers {
+			if err := deleteOldRepoArchiver(ctx, archiver); err != nil {
+				return err
+			}
+		}
+		if len(archivers) < 100 {
+			break
+		}
+	}
+
+	log.Trace("Finished: ArchiveCleanup")
+	return nil
+}
+
+// DeleteRepositoryArchives deletes all repositories' archives.
+func DeleteRepositoryArchives(ctx context.Context) error {
+	if err := repo_model.DeleteAllRepoArchives(ctx); err != nil {
+		return err
+	}
+	return storage.Clean(storage.RepoArchives)
+}
+
+func ServeRepoArchive(ctx *gitea_context.Base, archiveReq *ArchiveRequest) error {
+	// Add nix format link header so tarballs lock correctly:
+	// https://github.com/nixos/nix/blob/56763ff918eb308db23080e560ed2ea3e00c80a7/doc/manual/src/protocols/tarball-fetcher.md
+	ctx.Resp.Header().Add("Link", fmt.Sprintf(`<%s/archive/%s.%s?rev=%s>; rel="immutable"`,
+		archiveReq.Repo.APIURL(),
+		archiveReq.CommitID,
+		archiveReq.Type.String(),
+		archiveReq.CommitID,
+	))
+	downloadName := archiveReq.Repo.Name + "-" + archiveReq.GetArchiveName()
+
+	if setting.Repository.StreamArchives || len(archiveReq.Paths) > 0 {
+		// Use weak ETag because the bytes also depend on the git version, compression level and repo config
+		etag := fmt.Sprintf(`W/"%s-%s-%t"`, archiveReq.CommitID, archiveReq.Type.String(), setting.Repository.PrefixArchiveFiles)
+		if len(archiveReq.Paths) == 0 && httpcache.HandleGenericETagPrivateCache(ctx.Req, ctx.Resp, etag, nil) {
+			return nil
+		}
+		// the header must be set before starting streaming even an error would occur,
+		// because errors may happen in git command and such cases aren't in our control.
+		httplib.ServeSetHeaders(ctx.Resp, httplib.ServeHeaderOptions{Filename: downloadName})
+		if err := archiveReq.Stream(ctx, ctx.Resp); err != nil && !ctx.Written() {
+			if gitcmd.IsStderr(err, gitcmd.StderrPathSpec) || gitcmd.IsStderr(err, gitcmd.StderrNotTreeObject) {
+				return util.NewInvalidArgumentErrorf("path doesn't exist or is invalid")
+			}
+			return fmt.Errorf("archive repo %s: failed to stream: %w", archiveReq.Repo.FullName(), err)
+		}
+		return nil
+	}
+
+	archiver, err := archiveReq.Await(ctx)
+	if err != nil {
+		return fmt.Errorf("archive repo %s: failed to await: %w", archiveReq.Repo.FullName(), err)
+	}
+
+	rPath := archiver.RelativePath()
+	if setting.RepoArchive.Storage.ServeDirect() {
+		// If we have a signed url (S3, object storage), redirect to this directly.
+		u, err := storage.RepoArchives.ServeDirectURL(rPath, downloadName, ctx.Req.Method, nil)
+		if u != nil && err == nil {
+			ctx.Redirect(u.String())
+			return nil
+		}
+	}
+
+	fr, err := storage.RepoArchives.Open(rPath)
+	if err != nil {
+		return fmt.Errorf("archive repo %s: failed to open archive file: %w", archiveReq.Repo.FullName(), err)
+	}
+	defer fr.Close()
+
+	ctx.ServeContent(fr, gitea_context.ServeHeaderOptions{
+		Filename:     downloadName,
+		LastModified: archiver.CreatedUnix.AsLocalTime(),
+	})
+	return nil
+}

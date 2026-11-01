@@ -1,0 +1,68 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package secrets
+
+import (
+	"context"
+
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	secret_model "gitea.dev/models/secret"
+)
+
+func CreateOrUpdateSecret(ctx context.Context, scope actions_model.BelongingScope, name, data, description string) (*secret_model.Secret, bool, error) {
+	if err := ValidateName(name); err != nil {
+		return nil, false, err
+	}
+
+	s, err := db.Find[secret_model.Secret](ctx, secret_model.FindSecretsOptions{BelongingScope: scope, Name: name})
+	if err != nil {
+		return nil, false, err
+	}
+
+	if len(s) == 0 {
+		s, err := secret_model.InsertEncryptedSecret(ctx, scope, name, data, description)
+		if err != nil {
+			return nil, false, err
+		}
+		return s, true, nil
+	}
+
+	if err := secret_model.UpdateSecret(ctx, s[0].ID, data, description); err != nil {
+		return nil, false, err
+	}
+
+	return s[0], false, nil
+}
+
+func DeleteSecretByID(ctx context.Context, scope actions_model.BelongingScope, secretID int64) (*secret_model.Secret, error) {
+	s, err := db.Find[secret_model.Secret](ctx, secret_model.FindSecretsOptions{BelongingScope: scope, SecretID: secretID})
+	if err != nil {
+		return nil, err
+	}
+	if len(s) != 1 {
+		return nil, secret_model.ErrSecretNotFound{}
+	}
+
+	return s[0], deleteSecret(ctx, s[0])
+}
+
+func DeleteSecretByName(ctx context.Context, scope actions_model.BelongingScope, name string) (*secret_model.Secret, error) {
+	s, err := db.Find[secret_model.Secret](ctx, secret_model.FindSecretsOptions{BelongingScope: scope, Name: name})
+	if err != nil {
+		return nil, err
+	}
+	if len(s) != 1 {
+		return nil, secret_model.ErrSecretNotFound{}
+	}
+
+	return s[0], deleteSecret(ctx, s[0])
+}
+
+func deleteSecret(ctx context.Context, s *secret_model.Secret) error {
+	if _, err := db.DeleteByID[secret_model.Secret](ctx, s.ID); err != nil {
+		return err
+	}
+	return nil
+}

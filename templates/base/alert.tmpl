@@ -1,0 +1,9 @@
+{{- if .Flash.ErrorMsg}}{{ctx.RenderUtils.RenderFlashMessage "error" .Flash.ErrorMsg}}{{end -}}
+{{- if .Flash.WarningMsg}}{{ctx.RenderUtils.RenderFlashMessage "warning" .Flash.WarningMsg}}{{end -}}
+{{- if .Flash.InfoMsg}}{{ctx.RenderUtils.RenderFlashMessage "info" .Flash.InfoMsg}}{{end -}}
+{{- if .Flash.SuccessMsg}}{{ctx.RenderUtils.RenderFlashMessage "success" .Flash.SuccessMsg}}{{end -}}
+{{- if .ShowTwoFactorRequiredMessage -}}
+<div class="ui error message flash-message flash-error">
+	<a href="{{AppSubUrl}}/user/settings/security/two_factor/enroll">{{ctx.Locale.Tr "auth.twofa_required"}}</a>
+</div>
+{{- end -}}

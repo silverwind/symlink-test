@@ -1,0 +1,21 @@
+-
+  id: 1
+  uid: 2
+  repo_id: 2
+
+-
+  id: 2
+  uid: 2
+  repo_id: 4
+
+-
+  id: 3
+  uid: 10
+  repo_id: 21
+
+-
+  id: 4
+  uid: 10
+  repo_id: 32
+
+# DO NOT add more test data in the fixtures, test case should prepare their own test data separately and clearly

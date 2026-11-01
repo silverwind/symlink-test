@@ -1,0 +1,102 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package user
+
+import (
+	"context"
+	"fmt"
+	"image/png"
+	"io"
+
+	"gitea.dev/models/avatars"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/avatar"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	"gitea.dev/modules/util"
+)
+
+// CustomAvatarRelativePath returns user custom avatar relative path.
+func (u *User) CustomAvatarRelativePath() string {
+	return u.Avatar
+}
+
+// GenerateRandomAvatar generates a random avatar for user.
+func GenerateRandomAvatar(ctx context.Context, u *User) error {
+	seed := []byte(util.IfZero(u.Email, u.Name))
+	u.Avatar = avatar.HashAvatar(u.ID, seed)
+
+	// a failed Stat usually means the file is not there yet
+	if _, err := storage.Avatars.Stat(u.CustomAvatarRelativePath()); err != nil {
+		if err := storage.SaveFrom(storage.Avatars, u.CustomAvatarRelativePath(), func(w io.Writer) error {
+			return png.Encode(w, avatar.RandomImageDefaultSize(seed))
+		}); err != nil {
+			return fmt.Errorf("failed to save avatar %s: %w", u.CustomAvatarRelativePath(), err)
+		}
+	}
+
+	if _, err := db.GetEngine(ctx).ID(u.ID).Cols("avatar").Update(u); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// AvatarLinkWithSize returns a link to the user's avatar with size. size <= 0 means default size
+func (u *User) AvatarLinkWithSize(ctx context.Context, size int) string {
+	if u.ID <= 0 {
+		return avatars.DefaultAvatarLink()
+	}
+
+	useLocalAvatar := false
+	autoGenerateAvatar := false
+
+	disableGravatar := setting.Config().Picture.DisableGravatar.Value(ctx)
+
+	switch {
+	case u.UseCustomAvatar:
+		useLocalAvatar = true
+	case disableGravatar:
+		useLocalAvatar = true
+		autoGenerateAvatar = true
+	}
+
+	if useLocalAvatar {
+		if u.Avatar == "" && autoGenerateAvatar {
+			if err := GenerateRandomAvatar(ctx, u); err != nil {
+				log.Error("GenerateRandomAvatar: %v", err)
+			}
+		}
+		if u.Avatar == "" {
+			return avatars.DefaultAvatarLink()
+		}
+		return avatars.GenerateUserAvatarImageLink(u.Avatar, size)
+	}
+	return avatars.GenerateEmailAvatarFastLink(ctx, u.AvatarEmail, size)
+}
+
+// AvatarLink returns the full avatar url with http host.
+// TODO: refactor it to a relative URL, but it is still used in API response at the moment
+func (u *User) AvatarLink(ctx context.Context) string {
+	relLink := u.AvatarLinkWithSize(ctx, 0) // it can't be empty
+	return httplib.MakeAbsoluteURL(ctx, relLink)
+}
+
+// IsUploadAvatarChanged returns true if the current user's avatar would be changed with the provided data
+func (u *User) IsUploadAvatarChanged(data []byte) bool {
+	if !u.UseCustomAvatar || len(u.Avatar) == 0 {
+		return true
+	}
+	avatarID := avatar.HashAvatar(u.ID, data)
+	return u.Avatar != avatarID
+}
+
+// ExistsWithAvatarAtStoragePath returns true if there is a user with this Avatar
+func ExistsWithAvatarAtStoragePath(ctx context.Context, storagePath string) (bool, error) {
+	// See func (u *User) CustomAvatarRelativePath()
+	// u.Avatar is used directly as the storage path - therefore we can check for existence directly using the path
+	return db.GetEngine(ctx).Where("`avatar`=?", storagePath).Exist(new(User))
+}

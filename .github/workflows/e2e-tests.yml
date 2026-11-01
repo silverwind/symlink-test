@@ -1,0 +1,29 @@
+name: e2e-tests
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/go-setup
+      - uses: ./.github/actions/node-setup
+      - run: make deps-frontend
+      - run: make frontend
+      - run: make deps-backend
+      - run: make backend
+        env:
+          TAGS: bindata
+      - run: make playwright
+      - run: make test-e2e
+        timeout-minutes: 10
+        env:
+          TAGS: bindata
+          FORCE_COLOR: 1
+          GITEA_TEST_E2E_DEBUG: 1

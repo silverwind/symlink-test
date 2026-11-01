@@ -1,0 +1,237 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package context
+
+import (
+	"errors"
+	"fmt"
+	"html/template"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/translation"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web/middleware"
+)
+
+type BaseContextKeyType struct{}
+
+var BaseContextKey BaseContextKeyType
+
+// Base is the base context for all web handlers
+// ATTENTION: This struct should never be manually constructed in routes/services,
+// it has many internal details which should be carefully prepared by the framework.
+// If it is abused, it would cause strange bugs like panic/resource-leak.
+type Base struct {
+	reqctx.RequestContext
+
+	Resp ResponseWriter
+	Req  *http.Request
+
+	// Data is prepared by ContextDataStore middleware, this field only refers to the pre-created/prepared ContextData.
+	// Although it's mainly used for MVC templates, sometimes it's also used to pass data between middlewares/handler
+	Data reqctx.ContextData
+
+	// Locale is mainly for Web context, although the API context also uses it in some cases: message response, form validation
+	Locale translation.Locale
+}
+
+var ParseMultipartFormMaxMemory = int64(32 << 20)
+
+func (b *Base) ParseMultipartForm() bool {
+	err := b.Req.ParseMultipartForm(ParseMultipartFormMaxMemory)
+	if err != nil {
+		// TODO: all errors caused by client side should be ignored (connection closed).
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			// Errors caused by server side (disk full) should be logged.
+			log.Error("Failed to parse request multipart form for %s: %v", b.Req.RequestURI, err)
+		}
+		b.HTTPError(http.StatusInternalServerError, "failed to parse request multipart form")
+		return false
+	}
+	return true
+}
+
+// AppendAccessControlExposeHeaders append headers by name to "Access-Control-Expose-Headers" header
+func (b *Base) AppendAccessControlExposeHeaders(names ...string) {
+	val := b.RespHeader().Get("Access-Control-Expose-Headers")
+	if len(val) != 0 {
+		b.RespHeader().Set("Access-Control-Expose-Headers", fmt.Sprintf("%s, %s", val, strings.Join(names, ", ")))
+	} else {
+		b.RespHeader().Set("Access-Control-Expose-Headers", strings.Join(names, ", "))
+	}
+}
+
+// SetTotalCountHeader set "X-Total-Count" header
+func (b *Base) SetTotalCountHeader(total int64) {
+	b.RespHeader().Set("X-Total-Count", strconv.FormatInt(total, 10))
+	b.AppendAccessControlExposeHeaders("X-Total-Count")
+}
+
+// Written returns true if there are something sent to web browser
+func (b *Base) Written() bool {
+	return b.Resp.WrittenStatus() != 0
+}
+
+func (b *Base) WrittenStatus() int {
+	return b.Resp.WrittenStatus()
+}
+
+// Status writes status code
+func (b *Base) Status(status int) {
+	b.Resp.WriteHeader(status)
+}
+
+// Write writes data to web browser
+func (b *Base) Write(bs []byte) (int, error) {
+	return b.Resp.Write(bs)
+}
+
+// RespHeader returns the response header
+func (b *Base) RespHeader() http.Header {
+	return b.Resp.Header()
+}
+
+// HTTPError returned an error to web browser
+// FIXME: many calls to this HTTPError are not right: it shouldn't expose err.Error() directly, it doesn't accept more than one content
+func (b *Base) HTTPError(status int, contents ...string) {
+	v := http.StatusText(status)
+	if len(contents) > 0 {
+		v = contents[0]
+	}
+	http.Error(b.Resp, v, status)
+}
+
+// JSON render content as JSON
+func (b *Base) JSON(status int, content any) {
+	b.Resp.Header().Set("Content-Type", "application/json;charset=utf-8")
+	b.Resp.WriteHeader(status)
+	if err := json.MarshalWriteRelaxed(b.Resp, content); err != nil {
+		log.Error("Render JSON failed: %v", err)
+	}
+}
+
+// RemoteAddr returns the client machine ip address
+func (b *Base) RemoteAddr() string {
+	return b.Req.RemoteAddr
+}
+
+// PlainTextBytes renders bytes as plain text
+func (b *Base) plainTextInternal(skip, status int, bs []byte) {
+	statusPrefix := status / 100
+	if statusPrefix == 4 || statusPrefix == 5 {
+		log.Log(skip, log.TRACE, "plainTextInternal (status=%d): %s", status, string(bs))
+	}
+	b.Resp.Header().Set("Content-Type", "text/plain;charset=utf-8")
+	b.Resp.Header().Set("X-Content-Type-Options", "nosniff")
+	b.Resp.WriteHeader(status)
+	_, _ = b.Resp.Write(bs)
+}
+
+// PlainTextBytes renders bytes as plain text
+func (b *Base) PlainTextBytes(status int, bs []byte) {
+	b.plainTextInternal(2, status, bs)
+}
+
+// PlainText renders content as plain text
+func (b *Base) PlainText(status int, text string) {
+	b.plainTextInternal(2, status, []byte(text))
+}
+
+// Redirect redirects the request
+func (b *Base) Redirect(location string, status ...int) {
+	// In case the request is made by "fetch-action" module, make JS redirect to the new location
+	// Otherwise, the JS fetch will follow the redirection and read a "login" page, embed it to the current page, which is not expected.
+	if httplib.IsGiteaFetchActionRequest(b.Req) {
+		b.JSON(http.StatusOK, map[string]any{"redirect": location})
+		return
+	}
+	code := util.OptionalArg(status, http.StatusSeeOther)
+	http.Redirect(b.Resp, b.Req, location, code)
+}
+
+func (b *Base) RedirectForLogin(location string) {
+	if httplib.IsGiteaFetchActionRequest(b.Req) {
+		// let fetch-action handles the redirect automatically
+		b.JSON(http.StatusUnauthorized, map[string]any{"redirect": location})
+	} else {
+		// keep the old behaivor, use 303 to redirect to login page
+		http.Redirect(b.Resp, b.Req, location, http.StatusSeeOther)
+	}
+}
+
+type ServeHeaderOptions = httplib.ServeHeaderOptions
+
+func (b *Base) SetServeHeaders(opts ServeHeaderOptions) {
+	httplib.ServeSetHeaders(b.Resp, opts)
+}
+
+// ServeContent serves content to http request
+func (b *Base) ServeContent(r io.ReadSeeker, opts ServeHeaderOptions) {
+	httplib.ServeSetHeaders(b.Resp, opts)
+	http.ServeContent(b.Resp, b.Req, opts.Filename, opts.LastModified, r)
+}
+
+func (b *Base) Tr(msg string, args ...any) template.HTML {
+	return b.Locale.Tr(msg, args...)
+}
+
+func (b *Base) TrN(cnt any, key1, keyN string, args ...any) template.HTML {
+	return b.Locale.TrN(cnt, key1, keyN, args...)
+}
+
+func CspScriptNonce(ctx reqctx.RequestContext) (ret string) {
+	// Generate a random nonce for each request and cache it in the context to make it usable during the whole rendering process.
+	//
+	// Some "<script>" tags are not in the CSP context, so they don't need nonce,
+	// these tags are written as "<script nonce>" to help developers to know that "no script nonce attribute is missing"
+	// (e.g.: when they grep the codebase for "script" tags)
+	ret, _ = ctx.Value("_cspScriptNonce").(string)
+	if ret == "" {
+		ret = util.FastCryptoRandomHex(32) // 16 bytes / 128 bits entropy
+		ctx.SetContextValue("_cspScriptNonce", ret)
+	}
+	return ret
+}
+
+func (b *Base) SetHeaderContentSecurityPolicyGeneral() {
+	if csp := WebContentSecurityPolicy(CspScriptNonce(b)); csp != "" {
+		b.Resp.Header().Set("Content-Security-Policy", csp)
+	}
+}
+
+func NewBaseContext(resp http.ResponseWriter, req *http.Request) *Base {
+	reqCtx := reqctx.FromContext(req.Context())
+	if reqCtx.Value(BaseContextKey) != nil {
+		panic("Base context already exists in request context")
+	}
+	b := &Base{
+		RequestContext: reqCtx,
+
+		Req:    req,
+		Resp:   WrapResponseWriter(resp),
+		Locale: middleware.Locale(resp, req),
+		Data:   reqCtx.GetData(),
+	}
+	b.Req = httplib.RequestWithContext(b.Req, reqCtx)
+	reqCtx.SetContextValue(BaseContextKey, b)
+	reqCtx.SetContextValue(translation.ContextKey, b.Locale)
+	return b
+}
+
+func NewBaseContextForTest(t reqctx.TestingT, resp http.ResponseWriter, req *http.Request) *Base {
+	if !setting.IsInTesting {
+		panic("This function is only for testing")
+	}
+	ctx := reqctx.NewRequestContextForTest(t)
+	*req = *req.WithContext(ctx)
+	return NewBaseContext(resp, req)
+}

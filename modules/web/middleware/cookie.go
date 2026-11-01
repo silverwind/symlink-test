@@ -1,0 +1,108 @@
+// Copyright 2020 The Macaron Authors
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package middleware
+
+import (
+	"net/http"
+	"net/url"
+	"strings"
+
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+)
+
+const (
+	CookieWebBannerDismissed = "gitea_disbnr"
+	CookieTheme              = "gitea_theme"
+	cookieRedirectTo         = "redirect_to"
+)
+
+func GetRedirectToCookie(req *http.Request) string {
+	return GetSiteCookie(req, cookieRedirectTo)
+}
+
+// SetRedirectToCookie convenience function to set the RedirectTo cookie consistently
+func SetRedirectToCookie(resp http.ResponseWriter, value string) {
+	SetSiteCookie(resp, cookieRedirectTo, value, 0)
+}
+
+// DeleteRedirectToCookie convenience function to delete most cookies consistently
+func DeleteRedirectToCookie(resp http.ResponseWriter) {
+	SetSiteCookie(resp, cookieRedirectTo, "", -1)
+}
+
+func RedirectLinkUserLogin(req *http.Request) string {
+	if httplib.IsGiteaFetchActionRequest(req) {
+		// when building the redirect link for a fetch request, the current link might be a partial page,
+		// so we only redirect to the login page without redirect_to parameter
+		return setting.AppSubURL + "/user/login"
+	}
+	return setting.AppSubURL + "/user/login?redirect_to=" + url.QueryEscape(setting.AppSubURL+req.URL.RequestURI())
+}
+
+// GetSiteCookie returns given cookie value from request header.
+func GetSiteCookie(req *http.Request, name string) string {
+	cookie, err := req.Cookie(name)
+	if err != nil {
+		return ""
+	}
+	val, _ := url.QueryUnescape(cookie.Value)
+	return val
+}
+
+// SetSiteCookie returns given cookie value from request header.
+func SetSiteCookie(resp http.ResponseWriter, name, value string, maxAge int) {
+	// Previous versions would use a cookie path with a trailing /.
+	// These are more specific than cookies without a trailing /, so
+	// we need to delete these if they exist.
+	deleteLegacySiteCookie(resp, name)
+
+	// HINT: INSTALL-PAGE-COOKIE-INIT: the cookie system is not properly initialized on the Install page, so there is no CookiePath
+	cookie := &http.Cookie{
+		Name:     name,
+		Value:    url.QueryEscape(value),
+		MaxAge:   maxAge,
+		Path:     util.IfZero(setting.SessionConfig.CookiePath, "/"),
+		Domain:   setting.SessionConfig.Domain,
+		Secure:   setting.SessionConfig.Secure,
+		HttpOnly: true,
+		SameSite: setting.SessionConfig.SameSite,
+	}
+	resp.Header().Add("Set-Cookie", cookie.String())
+}
+
+// deleteLegacySiteCookie deletes the cookie with the given name at the cookie
+// path with a trailing /, which would unintentionally override the cookie.
+func deleteLegacySiteCookie(resp http.ResponseWriter, name string) {
+	if setting.SessionConfig.CookiePath == "" || strings.HasSuffix(setting.SessionConfig.CookiePath, "/") {
+		// If the cookie path ends with /, no legacy cookies will take
+		// precedence, so do nothing.  The exception is that cookies with no
+		// path could override other cookies, but it's complicated and we don't
+		// currently handle that.
+		return
+	}
+
+	cookie := &http.Cookie{
+		Name:     name,
+		Value:    "",
+		MaxAge:   -1,
+		Path:     setting.SessionConfig.CookiePath + "/",
+		Domain:   setting.SessionConfig.Domain,
+		Secure:   setting.SessionConfig.Secure,
+		HttpOnly: true,
+		SameSite: setting.SessionConfig.SameSite,
+	}
+	resp.Header().Add("Set-Cookie", cookie.String())
+}
+
+func init() {
+	session.BeforeRegenerateSession = append(session.BeforeRegenerateSession, func(resp http.ResponseWriter, _ *http.Request) {
+		// Ensure that a cookie with a trailing slash does not take precedence over
+		// the cookie written by the middleware.
+		deleteLegacySiteCookie(resp, setting.SessionConfig.CookieName)
+	})
+}

@@ -1,0 +1,373 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"net/http"
+
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	attachment_service "gitea.dev/services/attachment"
+	"gitea.dev/services/context"
+	"gitea.dev/services/context/upload"
+	"gitea.dev/services/convert"
+	issue_service "gitea.dev/services/issue"
+)
+
+// GetIssueAttachment gets a single attachment of the issue
+func GetIssueAttachment(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/assets/{attachment_id} issue issueGetIssueAttachment
+	// ---
+	// summary: Get an issue attachment
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: attachment_id
+	//   in: path
+	//   description: id of the attachment to get
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Attachment"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	attach := getIssueAttachmentSafeRead(ctx, issue)
+	if attach == nil {
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attach))
+}
+
+// ListIssueAttachments lists all attachments of the issue
+func ListIssueAttachments(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/assets issue issueListIssueAttachments
+	// ---
+	// summary: List issue's attachments
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/AttachmentList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	if err := issue.LoadAttributes(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToAPIIssue(ctx, ctx.Doer, issue).Attachments)
+}
+
+// CreateIssueAttachment creates an attachment and saves the given file
+func CreateIssueAttachment(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/issues/{index}/assets issue issueCreateIssueAttachment
+	// ---
+	// summary: Create an issue attachment
+	// produces:
+	// - application/json
+	// consumes:
+	// - multipart/form-data
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: name
+	//   in: query
+	//   description: name of the attachment
+	//   type: string
+	//   required: false
+	// - name: attachment
+	//   in: formData
+	//   description: attachment to upload
+	//   type: file
+	//   required: true
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Attachment"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	if !canUserWriteIssueAttachment(ctx, issue) {
+		return
+	}
+
+	// Get uploaded file from request
+	file, header, err := ctx.Req.FormFile("attachment")
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	defer file.Close()
+
+	filename := header.Filename
+	if query := ctx.FormString("name"); query != "" {
+		filename = query
+	}
+
+	uploaderFile := attachment_service.NewLimitedUploaderKnownSize(file, header.Size)
+	attachment, err := attachment_service.UploadAttachmentForIssue(ctx, uploaderFile, &repo_model.Attachment{
+		Name:       filename,
+		UploaderID: ctx.Doer.ID,
+		RepoID:     ctx.Repo.Repository.ID,
+		IssueID:    issue.ID,
+	})
+	if err != nil {
+		if upload.IsErrFileTypeForbidden(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else if errors.Is(err, util.ErrContentTooLarge) {
+			ctx.APIError(http.StatusRequestEntityTooLarge, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	issue.Attachments = append(issue.Attachments, attachment)
+
+	if err := issue_service.ChangeContent(ctx, issue, ctx.Doer, issue.Content, issue.ContentVersion); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attachment))
+}
+
+// EditIssueAttachment updates the given attachment
+func EditIssueAttachment(ctx *context.APIContext) {
+	// swagger:operation PATCH /repos/{owner}/{repo}/issues/{index}/assets/{attachment_id} issue issueEditIssueAttachment
+	// ---
+	// summary: Edit an issue attachment
+	// produces:
+	// - application/json
+	// consumes:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: attachment_id
+	//   in: path
+	//   description: id of the attachment to edit
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/EditAttachmentOptions"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Attachment"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	attachment := getIssueAttachmentSafeWrite(ctx)
+	if attachment == nil {
+		return
+	}
+
+	// do changes to attachment. only meaningful change is name.
+	form := web.GetForm[*api.EditAttachmentOptions](ctx)
+	if form.Name != "" {
+		attachment.Name = form.Name
+	}
+
+	if err := attachment_service.UpdateAttachment(ctx, setting.Attachment.AllowedTypes, attachment); err != nil {
+		if upload.IsErrFileTypeForbidden(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attachment))
+}
+
+// DeleteIssueAttachment delete a given attachment
+func DeleteIssueAttachment(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/{index}/assets/{attachment_id} issue issueDeleteIssueAttachment
+	// ---
+	// summary: Delete an issue attachment
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// - name: attachment_id
+	//   in: path
+	//   description: id of the attachment to delete
+	//   type: integer
+	//   format: int64
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	attachment := getIssueAttachmentSafeWrite(ctx)
+	if attachment == nil {
+		return
+	}
+
+	if err := repo_model.DeleteAttachment(ctx, attachment, true); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+func getIssueAttachmentSafeWrite(ctx *context.APIContext) *repo_model.Attachment {
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return nil
+	}
+
+	if !canUserWriteIssueAttachment(ctx, issue) {
+		return nil
+	}
+
+	return getIssueAttachmentSafeRead(ctx, issue)
+}
+
+func getIssueAttachmentSafeRead(ctx *context.APIContext, issue *issues_model.Issue) *repo_model.Attachment {
+	attachment, err := repo_model.GetAttachmentByID(ctx, ctx.PathParamInt64("attachment_id"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return nil
+	}
+	if !attachmentBelongsToRepoOrIssue(ctx, attachment, issue) {
+		return nil
+	}
+	return attachment
+}
+
+func canUserWriteIssueAttachment(ctx *context.APIContext, issue *issues_model.Issue) bool {
+	canEditIssue := ctx.IsSigned && (ctx.Doer.ID == issue.PosterID || ctx.IsUserRepoAdmin() || ctx.IsUserSiteAdmin() || ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull))
+	if !canEditIssue {
+		ctx.APIError(http.StatusForbidden, "user should have permission to write issue")
+		return false
+	}
+
+	return true
+}
+
+func attachmentBelongsToRepoOrIssue(ctx *context.APIContext, attachment *repo_model.Attachment, issue *issues_model.Issue) bool {
+	if attachment.RepoID != ctx.Repo.Repository.ID {
+		log.Debug("Requested attachment[%d] does not belong to repo[%-v].", attachment.ID, ctx.Repo.Repository)
+		ctx.APIErrorNotFound("no such attachment in repo")
+		return false
+	}
+	if attachment.IssueID == 0 || attachment.CommentID != 0 {
+		log.Debug("Requested attachment[%d] is not an issue attachment.", attachment.ID)
+		ctx.APIErrorNotFound("no such attachment in issue")
+		return false
+	} else if issue != nil && attachment.IssueID != issue.ID {
+		log.Debug("Requested attachment[%d] does not belong to issue[%d, #%d].", attachment.ID, issue.ID, issue.Index)
+		ctx.APIErrorNotFound("no such attachment in issue")
+		return false
+	}
+	return true
+}

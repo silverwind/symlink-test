@@ -1,0 +1,288 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repository
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/migration"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+)
+
+func cloneWiki(ctx context.Context, repo *repo_model.Repository, opts migration.MigrateOptions, migrateTimeout time.Duration) (string, error) {
+	wikiRemoteURL := repo_module.WikiRemoteURL(ctx, opts.CloneAddr)
+	if wikiRemoteURL == "" {
+		return "", nil
+	}
+
+	storageRepo := repo.WikiStorageRepo()
+
+	if err := git.DeleteRepository(ctx, storageRepo); err != nil {
+		return "", fmt.Errorf("failed to remove existing wiki for repo %q, err: %w", repo.FullName(), err)
+	}
+
+	cleanIncompleteWikiPath := func() {
+		if err := git.DeleteRepository(ctx, storageRepo); err != nil {
+			log.Error("Failed to remove incomplete wiki for repo %q, err: %v", repo.FullName(), err)
+		}
+	}
+	if err := git.CloneExternalRepo(ctx, wikiRemoteURL, storageRepo, git.CloneRepoOptions{
+		Mirror:        true,
+		Quiet:         true,
+		Timeout:       migrateTimeout,
+		SkipTLSVerify: setting.Migrations.SkipTLSVerify,
+	}); err != nil {
+		log.Error("Clone wiki failed, err: %v", err)
+		cleanIncompleteWikiPath()
+		return "", err
+	}
+
+	if err := git.WriteCommitGraph(ctx, storageRepo); err != nil {
+		cleanIncompleteWikiPath()
+		return "", err
+	}
+
+	defaultBranch, err := git.GetDefaultBranch(ctx, storageRepo)
+	if err != nil {
+		cleanIncompleteWikiPath()
+		return "", fmt.Errorf("failed to get wiki repo default branch for %q, err: %w", repo.FullName(), err)
+	}
+
+	return defaultBranch, nil
+}
+
+// MigrateRepositoryGitData starts migrating git related data after created migrating repository
+func MigrateRepositoryGitData(ctx context.Context, u *user_model.User,
+	repo *repo_model.Repository, opts migration.MigrateOptions,
+	httpTransport http.RoundTripper,
+) (*repo_model.Repository, error) {
+	if u.IsOrganization() {
+		t, err := organization.OrgFromUser(u).GetOwnerTeam(ctx)
+		if err != nil {
+			return nil, err
+		}
+		repo.NumWatches = t.NumMembers
+	} else {
+		repo.NumWatches = 1
+	}
+
+	migrateTimeout := time.Duration(setting.Git.Timeout.Migrate) * time.Second
+
+	if err := git.DeleteRepository(ctx, repo); err != nil {
+		return repo, fmt.Errorf("failed to remove existing repo dir %q, err: %w", repo.FullName(), err)
+	}
+
+	if err := git.CloneExternalRepo(ctx, opts.CloneAddr, repo, git.CloneRepoOptions{
+		Mirror:        true,
+		Quiet:         true,
+		Timeout:       migrateTimeout,
+		SkipTLSVerify: setting.Migrations.SkipTLSVerify,
+	}); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return repo, fmt.Errorf("clone timed out, consider increasing [git.timeout] MIGRATE in app.ini, underlying err: %w", err)
+		}
+		return repo, fmt.Errorf("clone error: %w", err)
+	}
+
+	if err := git.WriteCommitGraph(ctx, repo); err != nil {
+		return repo, err
+	}
+
+	if opts.Wiki {
+		defaultWikiBranch, err := cloneWiki(ctx, repo, opts, migrateTimeout)
+		if err != nil {
+			return repo, fmt.Errorf("clone wiki error: %w", err)
+		}
+		repo.DefaultWikiBranch = defaultWikiBranch
+	}
+
+	if repo.OwnerID == u.ID {
+		repo.Owner = u
+	}
+
+	if err := updateGitRepoAfterCreate(ctx, repo); err != nil {
+		return nil, fmt.Errorf("updateGitRepoAfterCreate: %w", err)
+	}
+
+	gitRepo, err := git.OpenRepository(ctx, repo)
+	if err != nil {
+		return repo, fmt.Errorf("OpenRepository: %w", err)
+	}
+	defer gitRepo.Close()
+
+	repo.IsEmpty, err = gitRepo.IsEmpty(ctx)
+	if err != nil {
+		return repo, fmt.Errorf("git.IsEmpty: %w", err)
+	}
+
+	if !repo.IsEmpty {
+		if len(repo.DefaultBranch) == 0 {
+			// Try to get HEAD branch and set it as default branch.
+			headBranchName, err := git.GetDefaultBranch(ctx, repo)
+			if err != nil {
+				return repo, fmt.Errorf("GetHEADBranch: %w", err)
+			}
+			if headBranchName != "" {
+				repo.DefaultBranch = headBranchName
+			}
+		}
+
+		if _, _, err := repo_module.SyncRepoBranchesWithRepo(ctx, repo, gitRepo, u.ID); err != nil {
+			return repo, fmt.Errorf("SyncRepoBranchesWithRepo: %w", err)
+		}
+
+		// if releases migration are not requested, we will sync all tags here
+		// otherwise, the releases sync will be done out of this function
+		if !opts.Releases {
+			repo.IsMirror = opts.Mirror
+			if _, err = repo_module.SyncReleasesWithTags(ctx, repo, gitRepo); err != nil {
+				log.Error("Failed to synchronize tags to releases for repository: %v", err)
+			}
+		}
+
+		if opts.LFS {
+			lfsClient, err := lfs.NewClientFromEndpoint(opts.CloneAddr, opts.LFSEndpoint, httpTransport)
+			if err != nil {
+				return repo, fmt.Errorf("NewClientFromEndpoint: %w", err)
+			}
+			if err = repo_module.StoreMissingLfsObjectsInRepository(ctx, repo, gitRepo, lfsClient); err != nil {
+				log.Error("Failed to store missing LFS objects for repository: %v", err)
+				return repo, fmt.Errorf("StoreMissingLfsObjectsInRepository: %w", err)
+			}
+		}
+
+		// Update repo license
+		if err := AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID}); err != nil {
+			log.Error("Failed to add repo to license updater queue: %v", err)
+		}
+	}
+
+	return db.WithTx2(ctx, func(ctx context.Context) (*repo_model.Repository, error) {
+		if opts.Mirror {
+			remoteAddress, err := util.SanitizeURL(opts.CloneAddr)
+			if err != nil {
+				return repo, err
+			}
+			mirrorModel := repo_model.Mirror{
+				RepoID:         repo.ID,
+				Interval:       setting.Mirror.DefaultInterval,
+				EnablePrune:    true,
+				NextUpdateUnix: timeutil.TimeStampNow().AddDuration(setting.Mirror.DefaultInterval),
+				LFS:            opts.LFS,
+				RemoteAddress:  remoteAddress,
+			}
+			if opts.LFS {
+				mirrorModel.LFSEndpoint = opts.LFSEndpoint
+			}
+
+			if opts.MirrorInterval != "" {
+				parsedInterval, err := time.ParseDuration(opts.MirrorInterval)
+				if err != nil {
+					log.Error("Failed to set Interval: %v", err)
+					return repo, err
+				}
+				if parsedInterval == 0 {
+					mirrorModel.Interval = 0
+					mirrorModel.NextUpdateUnix = 0
+				} else if parsedInterval < setting.Mirror.MinInterval {
+					err := fmt.Errorf("interval %s is set below Minimum Interval of %s", parsedInterval, setting.Mirror.MinInterval)
+					log.Error("Interval: %s is too frequent", opts.MirrorInterval)
+					return repo, err
+				} else {
+					mirrorModel.Interval = parsedInterval
+					mirrorModel.NextUpdateUnix = timeutil.TimeStampNow().AddDuration(parsedInterval)
+				}
+			}
+
+			if err = repo_model.InsertMirror(ctx, &mirrorModel); err != nil {
+				return repo, fmt.Errorf("InsertOne: %w", err)
+			}
+
+			repo.IsMirror = true
+			if err = repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, "num_watches", "is_empty", "default_branch", "default_wiki_branch", "is_mirror"); err != nil {
+				return nil, err
+			}
+
+			if err = repo_module.UpdateRepoSize(ctx, repo); err != nil {
+				log.Error("Failed to update size for repository: %v", err)
+			}
+
+			// this is necessary for sync local tags from remote
+			configName := fmt.Sprintf("remote.%s.fetch", mirrorModel.GetRemoteName())
+			stdout, _, err := gitcmd.NewCommand("config").
+				AddOptionValues("--add", configName, `+refs/tags/*:refs/tags/*`).
+				WithRepo(repo).RunStdString(ctx)
+			if err != nil {
+				log.Error("MigrateRepositoryGitData(git config --add <remote> +refs/tags/*:refs/tags/*) in %v: Stdout: %s\nError: %v", repo, stdout, err)
+				return repo, fmt.Errorf("error in MigrateRepositoryGitData(git config --add <remote> +refs/tags/*:refs/tags/*): %w", err)
+			}
+		} else {
+			if err = repo_module.UpdateRepoSize(ctx, repo); err != nil {
+				log.Error("Failed to update size for repository: %v", err)
+			}
+			if repo, err = CleanUpMigrateInfo(ctx, repo); err != nil {
+				return nil, err
+			}
+		}
+
+		var enableRepoUnits []repo_model.RepoUnit
+		if opts.Releases && !unit_model.TypeReleases.UnitGlobalDisabled() {
+			enableRepoUnits = append(enableRepoUnits, repo_model.RepoUnit{RepoID: repo.ID, Type: unit_model.TypeReleases})
+		}
+		if opts.Wiki && !unit_model.TypeWiki.UnitGlobalDisabled() {
+			enableRepoUnits = append(enableRepoUnits, repo_model.RepoUnit{RepoID: repo.ID, Type: unit_model.TypeWiki})
+		}
+		if len(enableRepoUnits) > 0 {
+			err = UpdateRepositoryUnits(ctx, repo, enableRepoUnits, nil)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return repo, nil
+	})
+}
+
+// CleanUpMigrateInfo finishes migrating repository and/or wiki with things that don't need to be done for mirrors.
+func CleanUpMigrateInfo(ctx context.Context, repo *repo_model.Repository) (*repo_model.Repository, error) {
+	if err := git.CreateDelegateHooks(ctx, repo); err != nil {
+		return repo, fmt.Errorf("createDelegateHooks: %w", err)
+	}
+
+	hasWiki := HasWiki(ctx, repo)
+	if hasWiki {
+		if err := git.CreateDelegateHooks(ctx, repo.WikiStorageRepo()); err != nil {
+			return repo, fmt.Errorf("createDelegateHooks.(wiki): %w", err)
+		}
+	}
+
+	err := git.ManagedRemoteRemove(ctx, repo, "origin")
+	if err != nil && !git.IsRemoteNotExistError(err) {
+		return repo, fmt.Errorf("CleanUpMigrateInfo: %w", err)
+	}
+
+	if hasWiki {
+		err = git.ManagedRemoteRemove(ctx, repo.WikiStorageRepo(), "origin")
+		if err != nil && !git.IsRemoteNotExistError(err) {
+			return repo, fmt.Errorf("cleanUpMigrateGitConfig (wiki): %w", err)
+		}
+	}
+
+	return repo, UpdateRepository(ctx, repo, false)
+}

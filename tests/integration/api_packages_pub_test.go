@@ -1,0 +1,166 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"bytes"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	pub_module "gitea.dev/modules/packages/pub"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestPackagePub(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	token := "Bearer " + getUserToken(t, user.Name, auth_model.AccessTokenScopeWritePackage)
+
+	packageName := "test_package"
+	packageVersion := "1.0.1"
+	packageVersionLatest := "1.0.2"
+	packageDescription := "Test Description"
+
+	filename := packageVersion + ".tar.gz"
+
+	buildPackage := func(version string) []byte {
+		return test.WriteTarCompression(gzip.NewWriter, map[string]string{
+			"pubspec.yaml": `name: ` + packageName + `
+version: ` + version + `
+description: ` + packageDescription,
+		}).Bytes()
+	}
+	content := buildPackage(packageVersion)
+
+	root := fmt.Sprintf("/api/packages/%s/pub", user.Name)
+
+	t.Run("Upload", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		uploadURL := root + "/api/packages/versions/new"
+
+		req := NewRequest(t, "GET", uploadURL)
+		MakeRequest(t, req, http.StatusUnauthorized)
+
+		req = NewRequest(t, "GET", uploadURL).
+			AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		type UploadRequest struct {
+			URL    string            `json:"url"`
+			Fields map[string]string `json:"fields"`
+		}
+
+		result := DecodeJSON(t, resp, &UploadRequest{})
+
+		assert.Empty(t, result.Fields)
+
+		uploadFile := func(t *testing.T, url string, content []byte, expectedStatus int) *httptest.ResponseRecorder {
+			body := &bytes.Buffer{}
+			writer := multipart.NewWriter(body)
+			part, _ := writer.CreateFormFile("file", "dummy.tar.gz")
+			_, _ = io.Copy(part, bytes.NewReader(content))
+
+			_ = writer.Close()
+
+			req := NewRequestWithBody(t, "POST", url, body).
+				SetHeader("Content-Type", writer.FormDataContentType()).
+				AddTokenAuth(token)
+			return MakeRequest(t, req, expectedStatus)
+		}
+
+		resp = uploadFile(t, result.URL, content, http.StatusNoContent)
+
+		req = NewRequest(t, "GET", resp.Header().Get("Location")).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypePub)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+		assert.NoError(t, err)
+		assert.NotNil(t, pd.SemVer)
+		assert.IsType(t, &pub_module.Metadata{}, pd.Metadata)
+		assert.Equal(t, packageName, pd.Package.Name)
+		assert.Equal(t, packageVersion, pd.Version.Version)
+
+		pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+		assert.NoError(t, err)
+		assert.Len(t, pfs, 1)
+		assert.Equal(t, filename, pfs[0].Name)
+		assert.True(t, pfs[0].IsLead)
+
+		pb, err := packages.GetBlobByID(t.Context(), pfs[0].BlobID)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(len(content)), pb.Size)
+
+		_ = uploadFile(t, result.URL, content, http.StatusConflict)
+
+		uploadFile(t, result.URL, buildPackage(packageVersionLatest), http.StatusNoContent)
+	})
+
+	type VersionMetadata struct {
+		Version    string    `json:"version"`
+		ArchiveURL string    `json:"archive_url"`
+		Published  time.Time `json:"published"`
+		Pubspec    any       `json:"pubspec,omitempty"`
+	}
+
+	t.Run("Download", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "GET", fmt.Sprintf("%s/api/packages/%s/%s", root, packageName, packageVersion))
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		result := DecodeJSON(t, resp, &VersionMetadata{})
+
+		assert.Equal(t, packageVersion, result.Version)
+		assert.NotNil(t, result.Pubspec)
+
+		req = NewRequest(t, "GET", result.ArchiveURL)
+		resp = MakeRequest(t, req, http.StatusOK)
+
+		assert.Equal(t, content, resp.Body.Bytes())
+	})
+
+	t.Run("EnumeratePackageVersions", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "GET", fmt.Sprintf("%s/api/packages/%s", root, packageName))
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		type PackageVersions struct {
+			Name     string             `json:"name"`
+			Latest   *VersionMetadata   `json:"latest"`
+			Versions []*VersionMetadata `json:"versions"`
+		}
+
+		result := DecodeJSON(t, resp, &PackageVersions{})
+
+		assert.Equal(t, packageName, result.Name)
+		assert.NotNil(t, result.Latest)
+		assert.Len(t, result.Versions, 2)
+		assert.Equal(t, packageVersion, result.Versions[0].Version)
+		assert.Equal(t, packageVersionLatest, result.Versions[1].Version)
+		assert.Equal(t, packageVersionLatest, result.Latest.Version)
+		assert.NotNil(t, result.Latest.Pubspec)
+	})
+}

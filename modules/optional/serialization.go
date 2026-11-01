@@ -1,0 +1,57 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package optional
+
+import (
+	"reflect"
+
+	"gitea.dev/modules/json"
+
+	"go.yaml.in/yaml/v4"
+)
+
+func (o *Option[T]) assignUnmarshalledValue(v *T) {
+	if reflect.TypeFor[T]().Kind() == reflect.Pointer && v == nil {
+		var zero T
+		*o = Some[T](zero)
+	} else {
+		*o = FromPtr(v)
+	}
+}
+
+func (o *Option[T]) UnmarshalJSON(data []byte) error {
+	var v *T
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	o.assignUnmarshalledValue(v)
+	return nil
+}
+
+func (o Option[T]) MarshalJSON() ([]byte, error) {
+	if !o.Has() {
+		return []byte("null"), nil
+	}
+
+	return json.Marshal(o.Value())
+}
+
+func (o *Option[T]) UnmarshalYAML(value *yaml.Node) error {
+	var v *T
+	if err := value.Decode(&v); err != nil {
+		return err
+	}
+	o.assignUnmarshalledValue(v)
+	return nil
+}
+
+func (o Option[T]) MarshalYAML() (any, error) {
+	if !o.Has() {
+		return nil, nil //nolint:nilnil // return nil to indicate no value to marshal
+	}
+
+	value := new(yaml.Node)
+	err := value.Encode(o.Value())
+	return value, err
+}

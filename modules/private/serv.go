@@ -1,0 +1,65 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package private
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/models/perm"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+)
+
+// KeyAndOwner is the response from ServNoCommand
+type KeyAndOwner struct {
+	Key   *asymkey_model.PublicKey `json:"key"`
+	Owner *user_model.User         `json:"user"`
+}
+
+// ServNoCommand returns information about the provided key
+func ServNoCommand(ctx context.Context, keyID int64) (*asymkey_model.PublicKey, *user_model.User, error) {
+	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/serv/none/%d", keyID)
+	req := newInternalRequestAPI(ctx, reqURL, "GET")
+	keyAndOwner, extra := requestJSONResp(req, &KeyAndOwner{})
+	if extra.HasError() {
+		return nil, nil, extra.Error
+	}
+	return keyAndOwner.Key, keyAndOwner.Owner, nil
+}
+
+// ServCommandResults are the results of a call to the private route serv
+type ServCommandResults struct {
+	IsWiki bool
+
+	OwnerName string
+	RepoName  string
+	RepoID    int64
+
+	PublicKeyID int64
+
+	UserName        string
+	UserEmail       string
+	UserID          int64
+	UserExtDoerData string
+
+	RepoStoragePath string
+}
+
+// ServCommand preps for a serv call
+func ServCommand(ctx context.Context, keyID int64, ownerName, repoName string, mode perm.AccessMode, verb, lfsVerb string) (*ServCommandResults, ResponseExtra) {
+	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/serv/command/%d/%s/%s?mode=%d",
+		keyID,
+		url.PathEscape(ownerName),
+		url.PathEscape(repoName),
+		mode,
+	)
+	reqURL += "&verb=" + url.QueryEscape(verb)
+	// reqURL += "&lfs_verb=" + url.QueryEscape(lfsVerb) // TODO: actually there is no use of this parameter. In the future, the URL construction should be more flexible
+	_ = lfsVerb
+	req := newInternalRequestAPI(ctx, reqURL, "GET")
+	return requestJSONResp(req, &ServCommandResults{})
+}

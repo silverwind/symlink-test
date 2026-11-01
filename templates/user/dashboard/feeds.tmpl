@@ -1,0 +1,131 @@
+<div id="activity-feed" class="flex-divided-list items-with-main" data-ref-issue-container>
+	{{range .Feeds}}
+		<div class="item">
+			<div class="item-leading">
+				{{ctx.AvatarUtils.AvatarByAction .}}
+			</div>
+			<div class="item-main tw-gap-2">
+				<div>
+					{{if gt .ActUser.ID 0}}
+						<a href="{{AppSubUrl}}/{{(.GetActUserName ctx) | PathEscape}}" title="{{.GetActDisplayNameTitle ctx}}">{{.GetActDisplayName ctx}}</a>
+					{{else}}
+						{{.ShortActUserName ctx}}
+					{{end}}
+					{{if .GetOpType.InActions "create_repo"}}
+						{{ctx.Locale.Tr "action.create_repo" (.GetRepoLink ctx) (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "rename_repo"}}
+						{{ctx.Locale.Tr "action.rename_repo" .GetContent (.GetRepoLink ctx) (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "commit_repo"}}
+						{{if .Content}}
+							{{ctx.Locale.Tr "action.commit_repo" (.GetRepoLink ctx) (.GetRefLink ctx) .GetBranch (.ShortRepoPath ctx)}}
+						{{else}}
+							{{ctx.Locale.Tr "action.create_branch" (.GetRepoLink ctx) (.GetRefLink ctx) .GetBranch (.ShortRepoPath ctx)}}
+						{{end}}
+					{{else if .GetOpType.InActions "create_issue"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.create_issue" (printf "%s/issues/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "create_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.create_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "transfer_repo"}}
+						{{ctx.Locale.Tr "action.transfer_repo" .GetContent (.GetRepoLink ctx) (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "push_tag"}}
+						{{ctx.Locale.Tr "action.push_tag" (.GetRepoLink ctx) (.GetRefLink ctx) .GetTag (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "comment_issue"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.comment_issue" (printf "%s/issues/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "merge_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.merge_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "close_issue"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.close_issue" (printf "%s/issues/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "reopen_issue"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.reopen_issue" (printf "%s/issues/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "close_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.close_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "reopen_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.reopen_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "delete_tag"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.delete_tag" (.GetRepoLink ctx) .GetTag (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "delete_branch"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.delete_branch" (.GetRepoLink ctx) .GetBranch (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "mirror_sync_push"}}
+						{{ctx.Locale.Tr "action.mirror_sync_push" (.GetRepoLink ctx) (.GetRefLink ctx) .RefName (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "mirror_sync_create"}}
+						{{ctx.Locale.Tr "action.mirror_sync_create" (.GetRepoLink ctx) (.GetRefLink ctx) .RefName (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "mirror_sync_delete"}}
+						{{ctx.Locale.Tr "action.mirror_sync_delete" (.GetRepoLink ctx) .RefName (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "approve_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.approve_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "reject_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.reject_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "comment_pull"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.comment_pull" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{else if .GetOpType.InActions "publish_release"}}
+						{{$linkText := .Content | ctx.RenderUtils.RenderEmoji}}
+						{{ctx.Locale.Tr "action.publish_release" (.GetRepoLink ctx) (printf "%s/releases/tag/%s" (.GetRepoLink ctx) .GetTag) (.ShortRepoPath ctx) $linkText}}
+					{{else if .GetOpType.InActions "pull_review_dismissed"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{$reviewer := index .GetIssueInfos 1}}
+						{{ctx.Locale.Tr "action.review_dismissed" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx) $reviewer}}
+					{{else if .GetOpType.InActions "auto_merge_pull_request"}}
+						{{$index := index .GetIssueInfos 0}}
+						{{ctx.Locale.Tr "action.auto_merge_pull_request" (printf "%s/pulls/%s" (.GetRepoLink ctx) $index) $index (.ShortRepoPath ctx)}}
+					{{end}}
+					{{DateUtils.TimeSince .GetCreate}}
+				</div>
+				{{if .GetOpType.InActions "commit_repo" "mirror_sync_push"}}
+					{{$push := ActionContent2Commits .}}
+					{{$repoLink := (.GetRepoLink ctx)}}
+					{{$repo := .Repo}}
+					<div class="tw-flex tw-flex-col tw-gap-1">
+						{{range $pushCommit := $push.Commits}}
+							{{$commitLink := printf "%s/commit/%s" $repoLink $pushCommit.Sha1}}
+							<div class="flex-text-block">
+								{{ctx.RenderUtils.AvatarStackPushCommit $pushCommit}}
+								<span class="tw-flex-1 gt-ellipsis">
+									{{ctx.RenderUtils.RenderCommitMessage $pushCommit.Message $repo}}
+								</span>
+								<a class="ui sha label" href="{{$commitLink}}">{{ShortSha $pushCommit.Sha1}}</a>
+							</div>
+						{{end}}
+					</div>
+					{{if and (gt $push.Len 1) $push.CompareURL}}
+						<a href="{{AppSubUrl}}/{{$push.CompareURL}}">{{ctx.Locale.Tr "action.compare_commits" $push.Len}} »</a>
+					{{end}}
+				{{else if .GetOpType.InActions "create_issue"}}
+					<span class="tw-inline-block tw-truncate issue title">{{index .GetIssueInfos 1 | ctx.RenderUtils.RenderIssueSimpleTitle}}</span>
+				{{else if .GetOpType.InActions "create_pull_request"}}
+					<span class="tw-inline-block tw-truncate issue title">{{index .GetIssueInfos 1 | ctx.RenderUtils.RenderIssueSimpleTitle}}</span>
+				{{else if .GetOpType.InActions "comment_issue" "approve_pull_request" "reject_pull_request" "comment_pull"}}
+					<a href="{{.GetCommentLink ctx}}" class="tw-inline-block tw-truncate tw-max-w-full tw-self-start issue title">{{(.GetIssueTitle ctx) | ctx.RenderUtils.RenderIssueSimpleTitle}}</a>
+					{{with index .GetIssueInfos 1}}
+						{{with ctx.RenderUtils.FeedExcerptToHtml .}}
+							<div class="render-content markup">{{.}}</div>
+						{{end}}
+					{{end}}
+				{{else if .GetOpType.InActions "merge_pull_request"}}
+					<div class="item-body tw-text-text">{{index .GetIssueInfos 1 | ctx.RenderUtils.RenderIssueSimpleTitle}}</div>
+				{{else if .GetOpType.InActions "close_issue" "reopen_issue" "close_pull_request" "reopen_pull_request"}}
+					<span class="tw-inline-block tw-truncate issue title">{{(.GetIssueTitle ctx) | ctx.RenderUtils.RenderIssueSimpleTitle}}</span>
+				{{else if .GetOpType.InActions "pull_review_dismissed"}}
+				<div class="item-body tw-text-text">{{ctx.Locale.Tr "action.review_dismissed_reason"}}</div>
+				<div class="item-body tw-text-text">{{index .GetIssueInfos 2 | ctx.RenderUtils.RenderEmoji}}</div>
+				{{end}}
+			</div>
+			<div class="item-trailing">
+				{{svg (printf "octicon-%s" (ActionIcon .GetOpType)) 32 "tw-text-text-light tw-mr-1"}}
+			</div>
+		</div>
+	{{end}}
+	{{template "base/paginate" .}}
+</div>

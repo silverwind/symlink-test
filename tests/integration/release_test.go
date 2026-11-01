@@ -1,0 +1,295 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"fmt"
+	"net/http"
+	"testing"
+
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/translation"
+	"gitea.dev/tests"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/stretchr/testify/assert"
+)
+
+func createNewRelease(t *testing.T, session *TestSession, repoURL, tag, title string, preRelease, draft bool) {
+	req := NewRequest(t, "GET", repoURL+"/releases/new")
+	resp := session.MakeRequest(t, req, http.StatusOK)
+	htmlDoc := NewHTMLParser(t, resp.Body)
+
+	link, exists := htmlDoc.doc.Find("form#new-release").Attr("action")
+	assert.True(t, exists, "The template has changed")
+
+	postData := map[string]string{
+		"tag_name":   tag,
+		"tag_target": "master",
+		"title":      title,
+		"content":    "",
+	}
+	if preRelease {
+		postData["prerelease"] = "on"
+	}
+	if draft {
+		postData["draft"] = "1"
+	}
+
+	req = NewRequestWithValues(t, "POST", link, postData)
+	resp = session.MakeRequest(t, req, http.StatusOK)
+	assert.NotEmpty(t, test.ParseJSONRedirect(resp.Body.Bytes()))
+}
+
+// returns the first listed title, which is not necessarily the one just created because releases are ordered by commit date
+func checkLatestReleaseAndCount(t *testing.T, session *TestSession, repoURL, version, label string, count int) string {
+	req := NewRequest(t, "GET", repoURL+"/releases")
+	resp := session.MakeRequest(t, req, http.StatusOK)
+
+	releaseList := NewHTMLParser(t, resp.Body).doc.Find("#release-list > li")
+	assert.Equal(t, count, releaseList.Length())
+
+	item := releaseList.FilterFunction(func(_ int, selection *goquery.Selection) bool {
+		return selection.Find(".detail h4 a").Text() == version
+	})
+	if assert.Equal(t, 1, item.Length(), "release %q is listed exactly once", version) {
+		assert.Equal(t, label, item.Find(".detail .label").First().Text())
+	}
+	return releaseList.Find(".detail h4 a").First().Text()
+}
+
+func TestViewReleases(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	session := loginUser(t, "user2")
+	req := NewRequest(t, "GET", "/user2/repo1/releases")
+	session.MakeRequest(t, req, http.StatusOK)
+}
+
+func TestViewReleasesNoLogin(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	req := NewRequest(t, "GET", "/user2/repo1/releases")
+	MakeRequest(t, req, http.StatusOK)
+}
+
+func TestCreateRelease(t *testing.T) {
+	for _, releaseType := range []string{"stable", "prerelease", "draft"} {
+		t.Run(releaseType, func(t *testing.T) {
+			defer tests.PrepareTestEnv(t)()
+
+			session := loginUser(t, "user2")
+			createNewRelease(t, session, "/user2/repo1", "v0.0.1", "v0.0.1", releaseType == "prerelease", releaseType == "draft")
+
+			checkLatestReleaseAndCount(t, session, "/user2/repo1", "v0.0.1", translation.NewLocale("en-US").TrString("repo.release."+releaseType), 4)
+		})
+	}
+}
+
+func TestCreateReleasePaging(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	defer test.MockVariableValue(&setting.API.DefaultPagingNum, 10)()
+	session := loginUser(t, "user2")
+	// Create enough releases to have paging
+	for i := range 12 {
+		version := fmt.Sprintf("v0.0.%d", i)
+		createNewRelease(t, session, "/user2/repo1", version, version, false, false)
+	}
+	createNewRelease(t, session, "/user2/repo1", "v0.0.12", "v0.0.12", false, true)
+
+	assert.Equal(t, "v0.0.12", checkLatestReleaseAndCount(t, session, "/user2/repo1", "v0.0.12", translation.NewLocale("en-US").TrString("repo.release.draft"), 10))
+
+	// Check that user4 does not see draft and still see 10 latest releases
+	session2 := loginUser(t, "user4")
+	assert.Equal(t, "v0.0.11", checkLatestReleaseAndCount(t, session2, "/user2/repo1", "v0.0.11", translation.NewLocale("en-US").TrString("repo.release.stable"), 10))
+}
+
+func TestViewReleaseListNoLogin(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 57, OwnerName: "user2", LowerName: "repo-release"})
+
+	link := repo.Link() + "/releases"
+
+	req := NewRequest(t, "GET", link)
+	rsp := MakeRequest(t, req, http.StatusOK)
+
+	htmlDoc := NewHTMLParser(t, rsp.Body)
+	releases := htmlDoc.Find("#release-list .release-entry")
+	assert.Equal(t, 5, releases.Length())
+
+	links := make([]string, 0, 5)
+	commitsToMain := make([]string, 0, 5)
+	releases.Each(func(i int, s *goquery.Selection) {
+		link, exist := s.Find(".release-list-title a").Attr("href")
+		if !exist {
+			return
+		}
+		links = append(links, link)
+
+		commitsToMain = append(commitsToMain, s.Find(".ahead > a").Text())
+	})
+
+	assert.Equal(t, []string{
+		"/user2/repo-release/releases/tag/empty-target-branch",
+		"/user2/repo-release/releases/tag/non-existing-target-branch",
+		"/user2/repo-release/releases/tag/v2.0",
+		"/user2/repo-release/releases/tag/v1.1",
+		"/user2/repo-release/releases/tag/v1.0",
+	}, links)
+	assert.Equal(t, []string{
+		"1 commits", // like v1.1
+		"1 commits", // like v1.1
+		"0 commits",
+		"1 commits", // should be 3 commits ahead and 2 commits behind, but not implemented yet
+		"3 commits",
+	}, commitsToMain)
+}
+
+func TestViewSingleRelease(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	t.Run("NoLogin", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/user2/repo-release/releases/tag/v1.0")
+		resp := MakeRequest(t, req, http.StatusOK)
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		// check the "number of commits to main since this release"
+		releaseList := htmlDoc.doc.Find("#release-list .ahead > a")
+		assert.Equal(t, 1, releaseList.Length())
+		assert.Equal(t, "3 commits", releaseList.First().Text())
+	})
+	t.Run("Login", func(t *testing.T) {
+		session := loginUser(t, "user1")
+		req := NewRequest(t, "GET", "/user2/repo1/releases/tag/delete-tag") // "delete-tag" is the only one with is_tag=true (although strange name)
+		resp := session.MakeRequest(t, req, http.StatusOK)
+		// the New Release button should contain the tag name
+		assert.Contains(t, resp.Body.String(), `<a class="ui small primary button" href="/user2/repo1/releases/new?tag=delete-tag">`)
+	})
+}
+
+func TestViewReleaseListLogin(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	link := repo.Link() + "/releases"
+
+	session := loginUser(t, "user1")
+	req := NewRequest(t, "GET", link)
+	rsp := session.MakeRequest(t, req, http.StatusOK)
+
+	htmlDoc := NewHTMLParser(t, rsp.Body)
+	releases := htmlDoc.Find("#release-list .release-entry")
+	assert.Equal(t, 3, releases.Length())
+
+	links := make([]string, 0, 5)
+	releases.Each(func(i int, s *goquery.Selection) {
+		link, exist := s.Find(".release-list-title a").Attr("href")
+		if !exist {
+			return
+		}
+		links = append(links, link)
+	})
+
+	assert.Equal(t, []string{
+		"/user2/repo1/releases/tag/draft-release",
+		"/user2/repo1/releases/tag/v1.0",
+		"/user2/repo1/releases/tag/v1.1",
+	}, links)
+}
+
+func TestViewTagsList(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	link := repo.Link() + "/tags"
+
+	session := loginUser(t, "user1")
+	req := NewRequest(t, "GET", link)
+	rsp := session.MakeRequest(t, req, http.StatusOK)
+
+	htmlDoc := NewHTMLParser(t, rsp.Body)
+	tags := htmlDoc.Find(".tag-list-row-link")
+	assert.Equal(t, 3, tags.Length())
+
+	tagNames := make([]string, 0, 5)
+	tags.Each(func(i int, s *goquery.Selection) {
+		tagNames = append(tagNames, s.Text())
+	})
+
+	assert.Equal(t, []string{"v1.0", "delete-tag", "v1.1"}, tagNames)
+}
+
+func TestDownloadReleaseAttachment(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	tests.PrepareAttachmentsStorage(t)
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 2})
+
+	url := repo.Link() + "/releases/download/v1.1/README.md"
+
+	req := NewRequest(t, "GET", url)
+	MakeRequest(t, req, http.StatusNotFound)
+
+	req = NewRequest(t, "GET", url)
+	session := loginUser(t, "user2")
+	session.MakeRequest(t, req, http.StatusOK)
+}
+
+func TestEditReleaseAttachmentRejectsForbiddenRename(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	defer test.MockVariableValue(&setting.Repository.Release.AllowedTypes, ".zip")()
+
+	attachment := unittest.AssertExistsAndLoadBean(t, &repo_model.Attachment{ID: 9})
+	release := unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: attachment.ReleaseID})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: attachment.RepoID})
+	repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	session := loginUser(t, repoOwner.Name)
+	req := NewRequestWithValues(t, "POST", fmt.Sprintf("%s/releases/edit/%s", repo.Link(), release.TagName), map[string]string{
+		"title":                              release.Title,
+		"content":                            release.Note,
+		"attachment-edit-" + attachment.UUID: "evil.exe",
+	})
+
+	resp := session.MakeRequest(t, req, http.StatusBadRequest)
+	errMsg := test.ParseJSONError(resp.Body.Bytes()).ErrorMessage
+	assert.Equal(t, "This file cannot be uploaded or modified due to a forbidden file extension or type.", errMsg)
+
+	attachment = unittest.AssertExistsAndLoadBean(t, &repo_model.Attachment{ID: attachment.ID})
+	assert.NotEqual(t, "evil.exe", attachment.Name)
+}
+
+func TestReleaseReaction(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	session := loginUser(t, "user2")
+	reactReq := func(releaseID int64, action, content string) *RequestWrapper {
+		return NewRequestWithValues(t, "POST", fmt.Sprintf("/user2/repo1/releases/%d/reactions/%s", releaseID, action), map[string]string{"content": content})
+	}
+
+	session.MakeRequest(t, reactReq(1, "react", "-1"), http.StatusForbidden)
+
+	session.MakeRequest(t, reactReq(1, "react", "heart"), http.StatusOK)
+	session.MakeRequest(t, reactReq(1, "react", "heart"), http.StatusOK)
+	unittest.AssertCount(t, &issues_model.Reaction{ReleaseID: 1}, 1)
+
+	resp := session.MakeRequest(t, NewRequest(t, "GET", "/user2/repo1/releases"), http.StatusOK)
+	htmlDoc := NewHTMLParser(t, resp.Body)
+	AssertHTMLElement(t, htmlDoc, `.bottom-reactions a.ui.label[data-reaction-content="heart"]`, 1)
+	AssertHTMLElement(t, htmlDoc, `.reaction-picker [data-reaction-content="-1"]`, 0)
+
+	session.MakeRequest(t, reactReq(1, "unreact", "heart"), http.StatusOK)
+	unittest.AssertCount(t, &issues_model.Reaction{ReleaseID: 1}, 0)
+
+	for _, releaseID := range []int64{2, 3, 4} {
+		session.MakeRequest(t, reactReq(releaseID, "react", "heart"), http.StatusNotFound)
+	}
+}

@@ -1,0 +1,63 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package feed
+
+import (
+	"time"
+
+	"gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+
+	"github.com/gorilla/feeds"
+)
+
+func showFileFeed(ctx *context.Context, repo *repo.Repository, formatType string) {
+	if !checkRepoFeedTokenScope(ctx) {
+		return
+	}
+	fileName := ctx.Repo.TreePath
+	if len(fileName) == 0 {
+		return
+	}
+	commits, _, err := ctx.Repo.GitRepo.CommitsByFileAndRange(ctx,
+		git.CommitsByFileAndRangeOptions{
+			Revision: ctx.Repo.RefFullName.ShortName(), // FIXME: legacy code used ShortName
+			File:     fileName,
+			Page:     1,
+		})
+	if err != nil {
+		ctx.ServerError("ShowBranchFeed", err)
+		return
+	}
+
+	title := "Latest commits for file " + ctx.Repo.TreePath
+
+	link := &feeds.Link{Href: repo.HTMLURL() + "/" + ctx.Repo.RefTypeNameSubURL() + "/" + util.PathEscapeSegments(ctx.Repo.TreePath)}
+
+	feed := &feeds.Feed{
+		Title:       title,
+		Link:        link,
+		Description: repo.Description,
+		Created:     time.Now(),
+	}
+
+	for _, commit := range commits {
+		feed.Items = append(feed.Items, &feeds.Item{
+			Id:    commit.ID.String(),
+			Title: commit.MessageTitle(),
+			Link:  &feeds.Link{Href: repo.HTMLURL() + "/commit/" + commit.ID.String()},
+			Author: &feeds.Author{
+				Name:  commit.Author.Name,
+				Email: commit.Author.Email,
+			},
+			Description: commit.MessageUTF8(), // TODO: description can be shorten content
+			Content:     commit.MessageUTF8(),
+			Created:     commit.Committer.When,
+		})
+	}
+
+	writeFeed(ctx, feed, formatType)
+}

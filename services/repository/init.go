@@ -1,0 +1,75 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repository
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/git/gitrepo"
+	"gitea.dev/modules/log"
+	asymkey_service "gitea.dev/services/asymkey"
+)
+
+// initRepoCommit temporarily changes with work directory.
+func initRepoCommit(ctx context.Context, tmpPath string, repo *repo_model.Repository, u *user_model.User) (err error) {
+	commitTimeStr := time.Now().Format(time.RFC3339)
+
+	sig := u.NewGitSig()
+	// Because this may call hooks we should pass in the environment
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME="+sig.Name,
+		"GIT_AUTHOR_EMAIL="+sig.Email,
+		"GIT_AUTHOR_DATE="+commitTimeStr,
+		"GIT_COMMITTER_DATE="+commitTimeStr,
+	)
+	committerName := sig.Name
+	committerEmail := sig.Email
+
+	if stdout, _, err := gitcmd.NewCommand("add", "--all").WithDir(tmpPath).RunStdString(ctx); err != nil {
+		log.Error("git add --all failed: Stdout: %s\nError: %v", stdout, err)
+		return fmt.Errorf("git add --all: %w", err)
+	}
+
+	cmd := gitcmd.NewCommand("commit", "--message=Initial commit").
+		AddOptionFormat("--author='%s <%s>'", sig.Name, sig.Email)
+
+	sign, key, signer, _ := asymkey_service.SignInitialCommit(ctx, u)
+	if sign {
+		if key.Format != "" {
+			cmd.AddConfig("gpg.format", key.Format)
+		}
+		cmd.AddOptionFormat("-S%s", key.KeyID)
+
+		if repo.GetTrustModel() == repo_model.CommitterTrustModel || repo.GetTrustModel() == repo_model.CollaboratorCommitterTrustModel {
+			// need to set the committer to the KeyID owner
+			committerName = signer.Name
+			committerEmail = signer.Email
+		}
+	} else {
+		cmd.AddArguments("--no-gpg-sign")
+	}
+
+	env = append(env,
+		"GIT_COMMITTER_NAME="+committerName,
+		"GIT_COMMITTER_EMAIL="+committerEmail,
+	)
+
+	if stdout, _, err := cmd.WithDir(tmpPath).WithEnv(env).RunStdString(ctx); err != nil {
+		log.Error("Failed to commit: %v: Stdout: %s\nError: %v", cmd.LogString(), stdout, err)
+		return fmt.Errorf("git commit: %w", err)
+	}
+
+	if err := git.FetchRemoteCommitUpdateRef(ctx, repo, gitrepo.RepositoryUnmanaged(tmpPath), "HEAD", git.BranchPrefix+repo.DefaultBranch); err != nil {
+		log.Error("Failed to fetch initial commit: %v", err)
+		return fmt.Errorf("git fetch: %w", err)
+	}
+	return nil
+}

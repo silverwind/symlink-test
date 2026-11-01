@@ -1,0 +1,181 @@
+import {toggleElem, queryElems} from '../utils/dom.ts';
+import {html, htmlRaw} from '../utils/html.ts';
+import {confirmModal} from './comp/ConfirmModal.ts';
+import {createSortable} from '../modules/sortable.ts';
+import {DELETE, POST} from '../modules/fetch.ts';
+import {fomanticQuery} from '../modules/fomantic/base.ts';
+import {performFetchAction} from '../modules/fetch-action.ts';
+import {registerGlobalInitFunc} from '../modules/observer.ts';
+import type {SortableEvent} from 'sortablejs';
+
+type IssuePoster = {avatar_link: string, full_name: string, username: string};
+type ProcessedIssuePoster = {type: 'html', html: string};
+type IssuePosterResponse = {results: IssuePoster[]};
+
+function initRepoIssueListCheckboxes(issueSelectAll: HTMLInputElement) {
+  const container = issueSelectAll.closest('.page-content')!;
+  const issueCheckboxes = container.querySelectorAll<HTMLInputElement>('.issue-checkbox');
+  const issueFilters = container.querySelector<HTMLElement>('#issue-filters')!;
+  const issueActions = container.querySelector<HTMLElement>('#issue-actions')!;
+
+  const syncIssueSelectionState = () => {
+    const checkedCheckboxes = Array.from(issueCheckboxes).filter((el) => el.checked);
+    const anyChecked = Boolean(checkedCheckboxes.length);
+    const allChecked = anyChecked && checkedCheckboxes.length === issueCheckboxes.length;
+
+    issueSelectAll.checked = allChecked;
+    issueSelectAll.indeterminate = anyChecked && !allChecked;
+    // if any issue is selected, show the action panel, otherwise show the filter panel
+    toggleElem(issueFilters, !anyChecked);
+    toggleElem(issueActions, anyChecked);
+    // there are two panels but only one select-all checkbox, so move the checkbox to the visible panel
+    const visiblePanel = anyChecked ? issueActions : issueFilters;
+    const toolbarLeft = visiblePanel.querySelector('.issue-list-toolbar-left')!;
+    toolbarLeft.prepend(issueSelectAll);
+  };
+
+  for (const el of issueCheckboxes) {
+    el.addEventListener('change', syncIssueSelectionState);
+  }
+
+  issueSelectAll.addEventListener('change', () => {
+    for (const el of issueCheckboxes) {
+      el.checked = issueSelectAll.checked;
+    }
+    syncIssueSelectionState();
+  });
+
+  queryElems(container, '.issue-action', (el) => el.addEventListener('click',
+    async (e: MouseEvent) => {
+      e.preventDefault();
+
+      const url = el.getAttribute('data-url')!;
+      let action = el.getAttribute('data-action')!;
+      const elementId = el.getAttribute('data-element-id')!;
+      const issueIDs = Array.from(container.querySelectorAll('.issue-checkbox:checked'), (el) => el.getAttribute('data-issue-id')!).join(',');
+      if (!issueIDs) return;
+
+      // for label toggle
+      if (action === 'toggle' && e.altKey) {
+        action = 'toggle-alt';
+      }
+
+      // for delete
+      if (action === 'delete') {
+        const confirmText = el.getAttribute('data-action-delete-confirm')!;
+        if (!await confirmModal({content: confirmText, confirmButtonColor: 'red'})) {
+          return;
+        }
+      }
+
+      const data = new URLSearchParams({action, issue_ids: issueIDs, id: elementId});
+      await performFetchAction(el, {method: 'post', url, data});
+    },
+  ));
+}
+
+function initDropdownUserRemoteSearch(el: Element) {
+  let searchUrl = el.getAttribute('data-search-url');
+  const actionJumpUrl = el.getAttribute('data-action-jump-url')!;
+  let selectedUsername = el.getAttribute('data-selected-username') || '';
+  const $searchDropdown = fomanticQuery(el);
+  const elMenu = el.querySelector('.menu')!;
+  const elSearchInput = el.querySelector<HTMLInputElement>('.ui.search input')!;
+  const elItemFromInput = el.querySelector('.menu > .item-from-input')!;
+
+  $searchDropdown.dropdown('setting', {
+    fullTextSearch: true,
+    selectOnKeydown: false,
+    action: (_text: string, value: string) => {
+      window.location.assign(actionJumpUrl.replace('{username}', () => encodeURIComponent(value)));
+    },
+  });
+
+  const selectUsername = (username: string) => {
+    queryElems(elMenu, '.item.active, .item.selected', (el) => el.classList.remove('active', 'selected'));
+    elMenu.querySelector(`.item[data-value="${CSS.escape(username)}"]`)?.classList.add('selected');
+  };
+
+  const processedResults: ProcessedIssuePoster[] = []; // to be used by dropdown to generate menu items
+  const syncItemFromInput = () => {
+    const inputVal = elSearchInput.value.trim();
+    elItemFromInput.setAttribute('data-value', inputVal);
+    elItemFromInput.textContent = inputVal;
+    const showItemFromInput = !processedResults.length && inputVal !== '';
+    toggleElem(elItemFromInput, showItemFromInput);
+    selectUsername(showItemFromInput ? inputVal : selectedUsername);
+  };
+
+  elSearchInput.value = selectedUsername;
+  if (!searchUrl) {
+    elSearchInput.addEventListener('input', syncItemFromInput);
+    return;
+  }
+
+  if (!searchUrl.includes('?')) searchUrl += '?';
+  $searchDropdown.dropdown('setting', {
+    onMenuUpdated: () => syncItemFromInput(),
+    apiSettings: {
+      url: `${searchUrl}&q={query}`,
+      onResponse(resp: IssuePosterResponse) {
+        // the content is provided by backend IssuePosters handler
+        processedResults.length = 0;
+        for (const item of resp.results) {
+          const htmlAvatar = html`<img class="ui avatar tw-align-middle" src="${item.avatar_link}" aria-hidden="true" alt width="20" height="20">`;
+          const htmlFullName = item.full_name ? html`<span class="username-fullname">(${item.full_name})</span>` : '';
+          const htmlItemInner = html`<span class="username-display">${htmlRaw(htmlAvatar)}<span>${item.username}</span>${htmlRaw(htmlFullName)}</span>`;
+          if (selectedUsername.toLowerCase() === item.username.toLowerCase()) selectedUsername = item.username;
+          const htmlItem = html`<div class="item" data-value="${item.username}">${htmlRaw(htmlItemInner)}</div>`;
+          processedResults.push({type: 'html', html: htmlItem});
+        }
+        return {results: processedResults};
+      },
+    },
+  });
+}
+
+function initPinRemoveButton() {
+  for (const button of document.querySelectorAll('.issue-card-unpin')) {
+    button.addEventListener('click', async (event) => {
+      const el = event.currentTarget as HTMLElement;
+      const id = Number(el.getAttribute('data-issue-id'));
+
+      // Send the unpin request
+      const response = await DELETE(el.getAttribute('data-unpin-url')!);
+      if (response.ok) {
+        // Delete the tooltip
+        el._tippy.destroy();
+        // Remove the Card
+        el.closest(`div.issue-card[data-issue-id="${CSS.escape(String(id))}"]`)!.remove();
+      }
+    });
+  }
+}
+
+async function pinMoveEnd(e: SortableEvent) {
+  const url = e.item.getAttribute('data-move-url')!;
+  const id = Number(e.item.getAttribute('data-issue-id'));
+  await POST(url, {data: {id, position: e.newIndex! + 1}});
+}
+
+function initIssuePinSort(pinDiv: HTMLElement) {
+  initPinRemoveButton();
+
+  // If only one issue pinned, we don't need to make this Sortable
+  if (pinDiv.children.length < 2) return;
+
+  createSortable(pinDiv, {
+    group: 'shared',
+    onEnd: (e) => {
+      (async () => {
+        await pinMoveEnd(e);
+      })();
+    },
+  });
+}
+
+export function initRepoIssueList() {
+  registerGlobalInitFunc('initRepoIssueListCheckboxes', initRepoIssueListCheckboxes);
+  registerGlobalInitFunc('initDropdownUserRemoteSearch', initDropdownUserRemoteSearch);
+  registerGlobalInitFunc('initIssuePinSort', initIssuePinSort);
+}

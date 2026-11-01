@@ -1,0 +1,149 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package files
+
+import (
+	"testing"
+
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/json"
+	"gitea.dev/services/contexttest"
+	"gitea.dev/services/gitdiff"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestGetDiffPreview(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	ctx, _ := contexttest.MockContext(t, "user2/repo1")
+	ctx.SetPathParam("id", "1")
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadRepoCommit(t, ctx)
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo.GitRepo.Close()
+
+	branch := ctx.Repo.Repository.DefaultBranch
+	treePath := "README.md"
+	oldContent := "# repo1\n\nDescription for repo1"
+	content := "# repo1\n\nDescription for repo1\nthis is a new line"
+
+	t.Run("Errors", func(t *testing.T) {
+		for _, test := range []struct {
+			name                            string
+			repo                            *repo_model.Repository
+			branch, treePath, expectedError string
+		}{
+			{"empty repo", &repo_model.Repository{}, branch, treePath, "repository does not exist [id: 0, uid: 0, owner_name: , name: ]"},
+			{"bad branch", ctx.Repo.Repository, "bad_branch", treePath, "branch does not exist [name: bad_branch]"},
+			{"empty treePath", ctx.Repo.Repository, branch, "", "path is invalid [path: ]"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				diff, err := GetDiffPreview(ctx, test.repo, test.branch, test.treePath, oldContent, content)
+				assert.Nil(t, diff)
+				assert.EqualError(t, err, test.expectedError)
+			})
+		}
+	})
+
+	expectedDiff := &gitdiff.Diff{
+		Files: []*gitdiff.DiffFile{
+			{
+				Name:        "README.md",
+				OldName:     "README.md",
+				NameHash:    "8ec9a00bfd09b3190ac6b22251dbb1aa95a0579d",
+				Addition:    2,
+				Deletion:    1,
+				Type:        2,
+				IsCreated:   false,
+				IsDeleted:   false,
+				IsBin:       false,
+				IsLFSFile:   false,
+				IsRenamed:   false,
+				IsSubmodule: false,
+				Sections: []*gitdiff.DiffSection{
+					{
+						FileName: "README.md",
+						Lines: []*gitdiff.DiffLine{
+							{
+								LeftIdx:  0,
+								RightIdx: 0,
+								Type:     4,
+								Content:  "@@ -1,3 +1,4 @@",
+								Comments: nil,
+								SectionInfo: &gitdiff.DiffLineSectionInfo{
+									Path:          "README.md",
+									LastLeftIdx:   0,
+									LastRightIdx:  0,
+									LeftIdx:       1,
+									RightIdx:      1,
+									LeftHunkSize:  3,
+									RightHunkSize: 4,
+								},
+							},
+							{
+								LeftIdx:  1,
+								RightIdx: 1,
+								Type:     1,
+								Content:  " # repo1",
+								Comments: nil,
+							},
+							{
+								LeftIdx:  2,
+								RightIdx: 2,
+								Type:     1,
+								Content:  " ",
+								Comments: nil,
+							},
+							{
+								LeftIdx:  3,
+								RightIdx: 0,
+								Match:    4,
+								Type:     3,
+								Content:  "-Description for repo1",
+								Comments: nil,
+							},
+							{
+								LeftIdx:  0,
+								RightIdx: 3,
+								Match:    3,
+								Type:     2,
+								Content:  "+Description for repo1",
+								Comments: nil,
+							},
+							{
+								LeftIdx:  0,
+								RightIdx: 4,
+								Match:    -1,
+								Type:     2,
+								Content:  "+this is a new line",
+								Comments: nil,
+							},
+						},
+					},
+				},
+				IsIncomplete: false,
+			},
+		},
+		IsIncomplete: false,
+	}
+
+	for _, test := range []struct {
+		name, branch string
+	}{
+		{"with given branch", branch},
+		{"empty branch, same results", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			diff, err := GetDiffPreview(ctx, ctx.Repo.Repository, test.branch, treePath, oldContent, content)
+			assert.NoError(t, err)
+			expectedBs, err := json.Marshal(expectedDiff)
+			assert.NoError(t, err)
+			bs, err := json.Marshal(diff)
+			assert.NoError(t, err)
+			assert.JSONEq(t, string(expectedBs), string(bs))
+		})
+	}
+}

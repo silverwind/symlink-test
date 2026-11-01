@@ -1,0 +1,9 @@
+{{.Message}}
+{{if .Details}}
+<details>
+	<summary>{{.Summary}}</summary>
+	<pre>{{.Details}}</pre>
+</details>
+{{else}}
+<div>{{.Summary}}</div>
+{{end}}

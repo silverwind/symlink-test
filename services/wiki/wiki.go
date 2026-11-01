@@ -1,0 +1,411 @@
+// Copyright 2015 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package wiki
+
+import (
+	"context"
+	"fmt"
+
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	system_model "gitea.dev/models/system"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/globallock"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/util"
+	asymkey_service "gitea.dev/services/asymkey"
+	"gitea.dev/services/audit"
+	repo_service "gitea.dev/services/repository"
+)
+
+func getWikiWorkingLockKey(repoID int64) string {
+	return fmt.Sprintf("wiki_working_%d", repoID)
+}
+
+// InitWiki initializes a wiki for repository,
+// it does nothing when repository already has wiki.
+func InitWiki(ctx context.Context, repo *repo_model.Repository) error {
+	// don't use HasWiki because the error should not be ignored.
+	if exist, err := git.IsRepositoryExist(ctx, repo.WikiStorageRepo()); err != nil {
+		return err
+	} else if exist {
+		return nil
+	}
+
+	// wiki's object format should be the same as repository's
+	if err := git.InitRepository(ctx, repo.WikiStorageRepo(), repo.ObjectFormatName, repo.DefaultWikiBranch); err != nil {
+		return fmt.Errorf("InitRepository: %w", err)
+	} else if err = git.CreateDelegateHooks(ctx, repo.WikiStorageRepo()); err != nil {
+		return fmt.Errorf("createDelegateHooks: %w", err)
+	}
+	return nil
+}
+
+// prepareGitPath try to find a suitable file path with file name by the given raw wiki name.
+// An empty defaultWikiBranch means the branch doesn't exist yet.
+// return: existence, prepared file path with name, error
+func prepareGitPath(ctx context.Context, gitRepo *git.Repository, defaultWikiBranch string, wikiPath WebPath) (bool, string, error) {
+	unescaped := string(wikiPath) + ".md"
+	gitPath := WebPathToGitPath(wikiPath)
+	if defaultWikiBranch == "" {
+		return false, gitPath, nil
+	}
+
+	// Look for both files
+	filesInIndex, err := gitRepo.LsTree(ctx, defaultWikiBranch, unescaped, gitPath)
+	if err != nil {
+		log.Error("Wiki LsTree failed, err: %v", err)
+		return false, gitPath, err
+	}
+
+	foundEscaped := false
+	for _, filename := range filesInIndex {
+		switch filename {
+		case unescaped:
+			// if we find the unescaped file return it
+			return true, unescaped, nil
+		case gitPath:
+			foundEscaped = true
+		}
+	}
+
+	// If not return whether the escaped file exists, and the escaped filename to keep backwards compatibility.
+	return foundEscaped, gitPath, nil
+}
+
+// updateWikiPage adds a new page or edits an existing page in repository wiki.
+func updateWikiPage(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, oldWikiName, newWikiName WebPath, content, message string, isNew bool) (err error) {
+	err = repo.MustNotBeArchived()
+	if err != nil {
+		return err
+	}
+
+	if err = validateWebPath(newWikiName); err != nil {
+		return err
+	}
+	releaser, err := globallock.Lock(ctx, getWikiWorkingLockKey(repo.ID))
+	if err != nil {
+		return err
+	}
+	defer releaser()
+
+	if err = InitWiki(ctx, repo); err != nil {
+		return fmt.Errorf("InitWiki: %w", err)
+	}
+
+	hasDefaultBranch := git.IsBranchExist(ctx, repo.WikiStorageRepo(), repo.DefaultWikiBranch)
+
+	basePath, _, cleanup, err := repo_module.CreateTemporaryGitRepo("update-wiki")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	cloneOpts := git.CloneRepoOptions{
+		Bare:   true,
+		Shared: true,
+	}
+
+	if hasDefaultBranch {
+		cloneOpts.Branch = repo.DefaultWikiBranch
+	}
+
+	if err := git.CloneRepoToLocal(ctx, repo.WikiStorageRepo(), basePath, cloneOpts); err != nil {
+		log.Error("Failed to clone repository: %s (%v)", repo.FullName(), err)
+		return fmt.Errorf("failed to clone repository: %s (%w)", repo.FullName(), err)
+	}
+
+	gitRepo, err := git.OpenRepositoryLocal(ctx, basePath)
+	if err != nil {
+		log.Error("Unable to open temporary repository: %s (%v)", basePath, err)
+		return fmt.Errorf("failed to open new temporary repository in: %s %w", basePath, err)
+	}
+	defer gitRepo.Close()
+
+	if hasDefaultBranch {
+		if err := gitRepo.ReadTreeToIndex(ctx, "HEAD"); err != nil {
+			log.Error("Unable to read HEAD tree to index in: %s %v", basePath, err)
+			return fmt.Errorf("unable to read HEAD tree to index in: %s %w", basePath, err)
+		}
+	}
+
+	isWikiExist, newWikiPath, err := prepareGitPath(ctx, gitRepo, cloneOpts.Branch, newWikiName)
+	if err != nil {
+		return err
+	}
+
+	if isNew {
+		if isWikiExist {
+			return repo_model.ErrWikiAlreadyExist{
+				Title: newWikiPath,
+			}
+		}
+	} else {
+		// avoid check existence again if wiki name is not changed since gitRepo.LsFiles(...) is not free.
+		isOldWikiExist := true
+		oldWikiPath := newWikiPath
+		if oldWikiName != newWikiName {
+			isOldWikiExist, oldWikiPath, err = prepareGitPath(ctx, gitRepo, cloneOpts.Branch, oldWikiName)
+			if err != nil {
+				return err
+			}
+		}
+
+		if isOldWikiExist {
+			err := gitRepo.RemoveFilesFromIndex(ctx, oldWikiPath)
+			if err != nil {
+				log.Error("RemoveFilesFromIndex failed: %v", err)
+				return err
+			}
+		}
+	}
+
+	// FIXME: The wiki doesn't have lfs support at present - if this changes need to check attributes here
+
+	objectHash, err := gitRepo.HashObjectBytes(ctx, []byte(content))
+	if err != nil {
+		log.Error("HashObject failed: %v", err)
+		return err
+	}
+
+	if err := gitRepo.AddObjectToIndex(ctx, "100644", objectHash, newWikiPath); err != nil {
+		log.Error("AddObjectToIndex failed: %v", err)
+		return err
+	}
+
+	tree, err := gitRepo.WriteTree(ctx)
+	if err != nil {
+		log.Error("WriteTree failed: %v", err)
+		return err
+	}
+
+	commitTreeOpts := git.CommitTreeOpts{
+		Message: message,
+	}
+
+	committer := doer.NewGitSig()
+
+	originalGitRepo, closer, err := git.RepositoryFromContextOrOpen(ctx, repo.WikiStorageRepo())
+	if err != nil {
+		return fmt.Errorf("unable to open wiki repository: %w", err)
+	}
+	defer closer.Close()
+
+	sign, signingKey, signer, _ := asymkey_service.SignWikiCommit(ctx, repo, originalGitRepo, doer)
+	if sign {
+		commitTreeOpts.Key = signingKey
+		if repo.GetTrustModel() == repo_model.CommitterTrustModel || repo.GetTrustModel() == repo_model.CollaboratorCommitterTrustModel {
+			committer = signer
+		}
+	} else {
+		commitTreeOpts.NoGPGSign = true
+	}
+	if hasDefaultBranch {
+		commitTreeOpts.Parents = []string{"HEAD"}
+	}
+
+	commitHash, err := gitRepo.CommitTree(ctx, doer.NewGitSig(), committer, tree, commitTreeOpts)
+	if err != nil {
+		log.Error("CommitTree failed: %v", err)
+		return err
+	}
+
+	if err := git.PushFromLocal(ctx, basePath, repo.WikiStorageRepo(), git.PushOptions{
+		Branch: fmt.Sprintf("%s:%s%s", commitHash.String(), git.BranchPrefix, repo.DefaultWikiBranch),
+		Env: repo_module.FullPushingEnvironment(
+			doer,
+			doer,
+			repo,
+			repo.Name+".wiki",
+			0,
+			0,
+		),
+	}); err != nil {
+		log.Error("Push failed: %v", err)
+		if git.IsErrPushOutOfDate(err) || git.IsErrPushRejected(err) {
+			return err
+		}
+		return fmt.Errorf("failed to push: %w", err)
+	}
+
+	return nil
+}
+
+// AddWikiPage adds a new wiki page with a given wikiPath.
+func AddWikiPage(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, wikiName WebPath, content, message string) error {
+	return updateWikiPage(ctx, doer, repo, "", wikiName, content, message, true)
+}
+
+// EditWikiPage updates a wiki page identified by its wikiPath,
+// optionally also changing wikiPath.
+func EditWikiPage(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, oldWikiName, newWikiName WebPath, content, message string) error {
+	return updateWikiPage(ctx, doer, repo, oldWikiName, newWikiName, content, message, false)
+}
+
+// DeleteWikiPage deletes a wiki page identified by its path.
+func DeleteWikiPage(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, wikiName WebPath) (err error) {
+	err = repo.MustNotBeArchived()
+	if err != nil {
+		return err
+	}
+
+	releaser, err := globallock.Lock(ctx, getWikiWorkingLockKey(repo.ID))
+	if err != nil {
+		return err
+	}
+	defer releaser()
+
+	if err = InitWiki(ctx, repo); err != nil {
+		return fmt.Errorf("InitWiki: %w", err)
+	}
+
+	basePath, _, cleanup, err := repo_module.CreateTemporaryGitRepo("update-wiki")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := git.CloneRepoToLocal(ctx, repo.WikiStorageRepo(), basePath, git.CloneRepoOptions{
+		Bare:   true,
+		Shared: true,
+		Branch: repo.DefaultWikiBranch,
+	}); err != nil {
+		log.Error("Failed to clone repository: %s (%v)", repo.FullName(), err)
+		return fmt.Errorf("failed to clone repository: %s (%w)", repo.FullName(), err)
+	}
+
+	gitRepo, err := git.OpenRepositoryLocal(ctx, basePath)
+	if err != nil {
+		log.Error("Unable to open temporary repository: %s (%v)", basePath, err)
+		return fmt.Errorf("failed to open new temporary repository in: %s %w", basePath, err)
+	}
+	defer gitRepo.Close()
+
+	if err := gitRepo.ReadTreeToIndex(ctx, "HEAD"); err != nil {
+		log.Error("Unable to read HEAD tree to index in: %s %v", basePath, err)
+		return fmt.Errorf("unable to read HEAD tree to index in: %s %w", basePath, err)
+	}
+
+	found, wikiPath, err := prepareGitPath(ctx, gitRepo, repo.DefaultWikiBranch, wikiName)
+	if err != nil {
+		return err
+	}
+	if found {
+		err := gitRepo.RemoveFilesFromIndex(ctx, wikiPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		return util.ErrNotExist
+	}
+
+	// FIXME: The wiki doesn't have lfs support at present - if this changes need to check attributes here
+
+	tree, err := gitRepo.WriteTree(ctx)
+	if err != nil {
+		return err
+	}
+	message := fmt.Sprintf("Delete page %q", wikiName)
+	commitTreeOpts := git.CommitTreeOpts{
+		Message: message,
+		Parents: []string{"HEAD"},
+	}
+
+	committer := doer.NewGitSig()
+
+	originalGitRepo, closer, err := git.RepositoryFromContextOrOpen(ctx, repo.WikiStorageRepo())
+	if err != nil {
+		return fmt.Errorf("unable to open wiki repository: %w", err)
+	}
+	defer closer.Close()
+
+	sign, signingKey, signer, _ := asymkey_service.SignWikiCommit(ctx, repo, originalGitRepo, doer)
+	if sign {
+		commitTreeOpts.Key = signingKey
+		if repo.GetTrustModel() == repo_model.CommitterTrustModel || repo.GetTrustModel() == repo_model.CollaboratorCommitterTrustModel {
+			committer = signer
+		}
+	} else {
+		commitTreeOpts.NoGPGSign = true
+	}
+
+	commitHash, err := gitRepo.CommitTree(ctx, doer.NewGitSig(), committer, tree, commitTreeOpts)
+	if err != nil {
+		return err
+	}
+
+	if err := git.PushFromLocal(ctx, basePath, repo.WikiStorageRepo(), git.PushOptions{
+		Branch: fmt.Sprintf("%s:%s%s", commitHash.String(), git.BranchPrefix, repo.DefaultWikiBranch),
+		Env: repo_module.FullPushingEnvironment(
+			doer,
+			doer,
+			repo,
+			repo.Name+".wiki",
+			0,
+			0,
+		),
+	}); err != nil {
+		if git.IsErrPushOutOfDate(err) || git.IsErrPushRejected(err) {
+			return err
+		}
+		return fmt.Errorf("Push: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteWiki removes the actual and local copy of repository wiki.
+func DeleteWiki(ctx context.Context, repo *repo_model.Repository) error {
+	if err := repo_service.UpdateRepositoryUnits(ctx, repo, nil, []unit.Type{unit.TypeWiki}); err != nil {
+		return err
+	}
+
+	if err := git.DeleteRepository(ctx, repo.WikiStorageRepo()); err != nil {
+		desc := fmt.Sprintf("Delete wiki repository files (%s): %v", repo.FullName(), err)
+		// Note we use the db.DefaultContext here rather than passing in a context as the context may be cancelled
+		if err = system_model.CreateNotice(graceful.GetManager().ShutdownContext(), system_model.NoticeRepository, desc); err != nil {
+			log.Error("CreateRepositoryNotice: %v", err)
+		}
+	}
+
+	audit.Record(ctx, audit_model.RepositoryWikiDelete, repo)
+
+	return nil
+}
+
+func ChangeDefaultWikiBranch(ctx context.Context, repo *repo_model.Repository, newBranch string) error {
+	if !git.IsValidRefPattern(newBranch) {
+		return fmt.Errorf("invalid branch name: %s", newBranch)
+	}
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		repo.DefaultWikiBranch = newBranch
+		if err := repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, "default_wiki_branch"); err != nil {
+			return fmt.Errorf("unable to update database: %w", err)
+		}
+
+		if !repo_service.HasWiki(ctx, repo) {
+			return nil
+		}
+
+		oldDefBranch, err := git.GetDefaultBranch(ctx, repo.WikiStorageRepo())
+		if err != nil {
+			return fmt.Errorf("unable to get default branch: %w", err)
+		}
+		if oldDefBranch == newBranch {
+			return nil
+		}
+
+		err = git.RenameBranch(ctx, repo.WikiStorageRepo(), oldDefBranch, newBranch)
+		if err != nil {
+			return fmt.Errorf("unable to rename default branch: %w", err)
+		}
+		return nil
+	})
+}

@@ -1,0 +1,208 @@
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package org
+
+import (
+	"net/http"
+
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/renderhelper"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
+)
+
+const tplOrgHome templates.TplName = "org/home"
+
+// Home show organization home page
+func Home(ctx *context.Context) {
+	ctx.SetPathParam("org", ctx.PathParam("username"))
+	context.OrgAssignment(context.OrgAssignmentOptions{})(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	orgHome(ctx, false)
+}
+
+func Repositories(ctx *context.Context) {
+	orgHome(ctx, true)
+}
+
+func orgHome(ctx *context.Context, viewRepositories bool) {
+	org := ctx.Org.Organization
+	if org == nil {
+		// some requests may reach here by "user" route patterns, e.g.: "/{owner}/-/repositories"
+		ctx.NotFound(nil)
+		return
+	}
+
+	ctx.Data["PageIsUserProfile"] = true
+	ctx.Data["Title"] = org.DisplayName()
+
+	var orderBy db.SearchOrderBy
+	sortOrder := ctx.FormString("sort")
+	if _, ok := repo_model.OrderByFlatMap[sortOrder]; !ok {
+		sortOrder = setting.UI.ExploreDefaultSort // TODO: add new default sort order for org home?
+	}
+	ctx.Data["SortType"] = sortOrder
+	orderBy = repo_model.OrderByFlatMap[sortOrder]
+
+	keyword := ctx.FormTrim("q")
+	ctx.Data["Keyword"] = keyword
+
+	language := ctx.FormTrim("language")
+	ctx.Data["Language"] = language
+
+	page := ctx.FormInt("page")
+	if page <= 0 {
+		page = 1
+	}
+
+	archived := ctx.FormOptionalBool("archived")
+	ctx.Data["IsArchived"] = archived
+
+	fork := ctx.FormOptionalBool("fork")
+	ctx.Data["IsFork"] = fork
+
+	mirror := ctx.FormOptionalBool("mirror")
+	ctx.Data["IsMirror"] = mirror
+
+	template := ctx.FormOptionalBool("template")
+	ctx.Data["IsTemplate"] = template
+
+	private := ctx.FormOptionalBool("private")
+	ctx.Data["IsPrivate"] = private
+
+	opts := &organization.FindOrgMembersOpts{
+		Doer:         ctx.Doer,
+		OrgID:        org.ID,
+		IsDoerMember: ctx.Org.IsMember,
+		ListOptions:  db.ListOptions{Page: 1, PageSize: 25},
+	}
+
+	members, _, err := organization.FindOrgMembers(ctx, opts)
+	if err != nil {
+		ctx.ServerError("FindOrgMembers", err)
+		return
+	}
+
+	const orgOverviewTeamsLimit = 5
+	ctx.Data["OrgOverviewMembers"] = members
+	// The overview widget shows only teams the viewer belongs to. ctx.Org.Teams
+	// may include visible-but-not-joined teams (via IncludeVisibilities for
+	// signed-in non-members), so re-query the viewer's own membership; owners
+	// keep the full list they are entitled to manage.
+	overviewTeams := ctx.Org.Teams
+	if !ctx.Org.IsOwner {
+		overviewTeams = nil
+		if ctx.Org.IsMember {
+			overviewTeams, _, err = organization.SearchTeam(ctx, &organization.SearchTeamOptions{
+				OrgID:       org.ID,
+				UserID:      ctx.Doer.ID,
+				ListOptions: db.ListOptions{Page: 1, PageSize: orgOverviewTeamsLimit},
+			})
+			if err != nil {
+				ctx.ServerError("SearchTeam", err)
+				return
+			}
+		}
+	}
+	ctx.Data["OrgOverviewTeams"] = overviewTeams[:min(len(overviewTeams), orgOverviewTeamsLimit)]
+	ctx.Data["DisableNewPullMirrors"] = setting.Mirror.DisableNewPull
+	ctx.Data["ShowMemberAndTeamTab"] = ctx.Org.IsMember || len(members) > 0
+
+	prepareResult, err := shared_user.RenderUserOrgHeader(ctx)
+	if err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	// if no profile readme, it still means "view repositories"
+	isViewOverview := !viewRepositories && prepareOrgProfileReadme(ctx, prepareResult)
+	ctx.Data["PageIsViewRepositories"] = !isViewOverview
+	ctx.Data["PageIsViewOverview"] = isViewOverview
+	ctx.Data["ShowOrgProfileReadmeSelector"] = isViewOverview && prepareResult.ProfilePublicReadmeBlob != nil && prepareResult.ProfilePrivateReadmeBlob != nil
+
+	repos, count, err := repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
+		ListOptions: db.ListOptions{
+			PageSize: setting.UI.User.RepoPagingNum,
+			Page:     page,
+		},
+		Keyword:            keyword,
+		OwnerID:            org.ID,
+		OrderBy:            orderBy,
+		Private:            ctx.IsSigned,
+		Actor:              ctx.Doer,
+		Language:           language,
+		IncludeDescription: setting.UI.SearchRepoDescription,
+		Archived:           archived,
+		Fork:               fork,
+		Mirror:             mirror,
+		Template:           template,
+		IsPrivate:          private,
+	})
+	if err != nil {
+		ctx.ServerError("SearchRepository", err)
+		return
+	}
+
+	ctx.Data["Repos"] = repos
+	ctx.Data["Total"] = count
+
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(setting.UI.User.RepoPagingNum).CurPage(page).Build()
+	ctx.Data["Page"] = pager
+
+	ctx.HTML(http.StatusOK, tplOrgHome)
+}
+
+func prepareOrgProfileReadme(ctx *context.Context, prepareResult *shared_user.PrepareOwnerHeaderResult) bool {
+	viewAs := ctx.FormString("view_as", util.Iif(ctx.Org.IsMember, "member", "public"))
+	viewAsMember := viewAs == "member"
+
+	var profileRepo *repo_model.Repository
+	var readmeBlob *git.Blob
+	if viewAsMember {
+		if prepareResult.ProfilePrivateReadmeBlob != nil {
+			profileRepo, readmeBlob = prepareResult.ProfilePrivateRepo, prepareResult.ProfilePrivateReadmeBlob
+		} else {
+			profileRepo, readmeBlob = prepareResult.ProfilePublicRepo, prepareResult.ProfilePublicReadmeBlob
+			viewAsMember = false
+		}
+	} else {
+		if prepareResult.ProfilePublicReadmeBlob != nil {
+			profileRepo, readmeBlob = prepareResult.ProfilePublicRepo, prepareResult.ProfilePublicReadmeBlob
+		} else {
+			profileRepo, readmeBlob = prepareResult.ProfilePrivateRepo, prepareResult.ProfilePrivateReadmeBlob
+			viewAsMember = true
+		}
+	}
+	if readmeBlob == nil {
+		return false
+	}
+
+	readmeBytes, err := readmeBlob.GetBlobContent(ctx, setting.UI.MaxDisplayFileSize)
+	if err != nil {
+		log.Error("failed to GetBlobContent for profile %q (view as %q) readme: %v", profileRepo.FullName(), viewAs, err)
+		return false
+	}
+
+	rctx := renderhelper.NewRenderContextRepoFile(ctx, profileRepo, renderhelper.RepoFileOptions{
+		CurrentRefSubURL: git.RefNameFromBranch(profileRepo.DefaultBranch).RefWebLinkPath(),
+	})
+	ctx.Data["ProfileReadmeContent"], err = markdown.RenderString(rctx, readmeBytes)
+	if err != nil {
+		log.Error("failed to GetBlobContent for profile %q (view as %q) readme: %v", profileRepo.FullName(), viewAs, err)
+		return false
+	}
+	ctx.Data["IsViewingOrgAsMember"] = viewAsMember
+	return true
+}

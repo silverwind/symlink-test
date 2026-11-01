@@ -1,0 +1,844 @@
+:root {
+  /* fonts */
+  --fonts-proportional: -apple-system, "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial;
+  --fonts-monospace: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace, var(--fonts-emoji);
+  /* sturdier fonts precede "math", which is thin Latin Modern Math in Firefox and Linux Chromium, DejaVu Math follows it for its small display operators, https://issues.chromium.org/issues/40069293 */
+  --fonts-math: "Cambria Math", "STIX Two Math", gitea-math-book, "Libertinus Math", math, "DejaVu Math TeX Gyre", "Noto Sans Math";
+  /* GitHub explicitly sets font names like: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Twemoji Mozilla";
+  Actually "Twemoji Mozilla" emoji font is widely used by browsers like Firefox, Pale Moon, and it is more likely up-to-dated than the system emoji font.
+  So not setting emoji font seems to be the best choice, here we just use a non-existing dummy font name and let browsers choose. */
+  --fonts-emoji: -emoji-fallback;
+  /* font weights - use between 400 and 600 for general purposes. Avoid 700 as it is perceived too bold */
+  --font-weight-light: 300;
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --line-height-default: normal; /* line-height: use the default value as "modules/normalize.css" */
+  --line-height-code: 20px; /* line-height for code, also used by the editor */
+  /* images */
+  --checkbox-mask-checked: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9" viewBox="0 0 12 9"><path fill-rule="evenodd" d="M11.78.22a.75.75 0 0 1 0 1.061L4.52 8.541a.75.75 0 0 1-1.062 0L.202 5.285a.75.75 0 0 1 1.061-1.061l2.725 2.723L10.718.22a.75.75 0 0 1 1.062 0"/></svg>');
+  --checkbox-mask-indeterminate: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="2" viewBox="0 0 10 2"><path fill-rule="evenodd" d="M0 1a1 1 0 0 1 1-1h8a1 1 0 1 1 0 2H1a1 1 0 0 1-1-1" clip-rule="evenodd"/></svg>');
+  --octicon-alert-fill: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575ZM8 5a.75.75 0 0 0-.75.75v2.5a.75.75 0 0 0 1.5 0v-2.5A.75.75 0 0 0 8 5Zm1 6a1 1 0 1 0-2 0 1 1 0 0 0 2 0Z"/></svg>');
+  --octicon-chevron-right: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z"></path></svg>');
+  --octicon-x: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.75.75 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.75.75 0 0 1-.734-.215L8 9.06l-3.22 3.22a.75.75 0 0 1-1.042-.018.75.75 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06"/></svg>');
+  --select-arrows: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path d="m4.074 9.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.043 9H4.251a.25.25 0 0 0-.177.427m0-1.957L7.47 4.073a.25.25 0 0 1 .354 0L11.22 7.47a.25.25 0 0 1-.177.426H4.251a.25.25 0 0 1-.177-.426"/></svg>');
+  /* other variables */
+  --border-radius: 4px;
+  --border-radius-medium: 6px;
+  --border-radius-full: 99999px; /* TODO: use calc(infinity * 1px) */
+  --opacity-disabled: 0.55;
+  --height-loading: 16rem;
+  --min-height-textarea: 132px; /* padding + 6 lines + border = calc(1.57142em + 6lh + 2px), but lh is not fully supported */
+  --tab-size: 4;
+  --checkbox-size: 14px; /* height and width of checkbox and radio inputs */
+  --page-spacing: 16px; /* space between page elements */
+  --page-margin-x: 32px; /* minimum space on left and right side of page */
+  --page-space-bottom: 64px; /* space between last page element and footer */
+  --transition-hover-fade: opacity 0.2s ease; /* fade transition for elements that show on hover */
+
+  /* z-index */
+  --z-index-modal: 1001; /* modal dialog */
+  --z-index-toast: 1002; /* should be larger than modal */
+
+  --font-size-label: 12px; /* font size of individual labels */
+
+  --gap-inline: 0.25rem; /* gap for inline texts and elements, for example: the spaces for sentence with labels, button text, etc */
+  --gap-block: 0.5rem; /* gap for element blocks, for example: spaces between buttons, menu image & title, header icon & title etc */
+
+  --background-view-image: repeating-conic-gradient(var(--color-transparency-grid-dark) 0 25%, var(--color-transparency-grid-light) 0 50%) 0 0 / 18px 18px;
+}
+
+@media (min-width: 768px) and (max-width: 1200px) {
+  :root {
+    --page-margin-x: 16px;
+  }
+}
+
+@media (max-width: 767.98px) {
+  :root {
+    --page-margin-x: 8px;
+  }
+}
+
+:root * {
+  --fonts-regular: var(--fonts-override, var(--fonts-proportional)), "Noto Sans", "Liberation Sans", sans-serif, var(--fonts-emoji);
+}
+
+*, ::before, ::after {
+  /* these are needed for tailwind borders to work because we do not load tailwind's base
+     https://github.com/tailwindlabs/tailwindcss/blob/master/src/css/preflight.css */
+  border-width: 0;
+  border-style: solid;
+  border-color: currentcolor;
+}
+
+html, body {
+  height: 100%;
+  font-size: 14px;
+}
+
+body {
+  line-height: 20px;
+  font-family: var(--fonts-regular);
+  color: var(--color-text);
+  background-color: var(--color-body);
+  tab-size: var(--tab-size);
+  display: flex;
+  flex-direction: column;
+  overflow-x: visible;
+  overflow-wrap: break-word;
+}
+
+textarea {
+  font-family: var(--fonts-regular);
+}
+
+pre,
+code,
+kbd,
+samp {
+  font-family: var(--fonts-monospace);
+}
+
+pre,
+code,
+samp,
+.tw-font-mono {
+  font-size: 0.95em; /* compensate for monospace fonts being usually slightly larger */
+}
+
+mark {
+  background: var(--color-highlight-bg);
+  color: inherit;
+}
+
+@font-face {
+  font-family: gitea-math-book; /* the Book weight shares its family name with the thinner Regular */
+  src: local("NewComputerModernMath-Book"), local("NewCMMath-Book");
+}
+
+math {
+  font-family: var(--fonts-math);
+  font-size-adjust: ex-height 0.52; /* match KaTeX's x-height (0.431 × 1.21em) regardless of math font, https://github.com/w3c/mathml-core/issues/41 */
+}
+
+/* there are many <code> blocks in non-markup(.markup code) / non-code-diff(code.code-inner) containers, for example: translation strings, etc,
+so we need to make <code> have default global styles, ".markup code" has its own styles and these styles sometimes conflict.
+TODO: in the future, we should use `div` instead of `code` for `.code-inner` because it is a container for highlighted code line, then drop this ":not" patch */
+code:where(:not(.code-inner)) {
+  padding: 1px 4px;
+  border-radius: var(--border-radius);
+  background-color: var(--color-markup-code-inline);
+}
+
+b,
+strong,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: var(--font-weight-semibold);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5 {
+  line-height: 1.28571429;
+  margin: calc(2rem - 0.1428571428571429em) 0 1rem;
+  font-weight: var(--font-weight-medium);
+  padding: 0;
+}
+
+h1 {
+  min-height: 1rem;
+  font-size: 2rem;
+}
+
+h2 {
+  font-size: 1.71428571rem;
+}
+
+h3 {
+  font-size: 1.28571429rem;
+}
+
+h4 {
+  font-size: 1.07142857rem;
+}
+
+h5 {
+  font-size: 1rem;
+}
+
+h1:first-child,
+h2:first-child,
+h3:first-child,
+h4:first-child,
+h5:first-child {
+  margin-top: 0;
+}
+
+h1:last-child,
+h2:last-child,
+h3:last-child,
+h4:last-child,
+h5:last-child {
+  margin-bottom: 0;
+}
+
+p {
+  margin: 0 0 1em;
+  line-height: 1.4285;
+}
+
+p:first-child {
+  margin-top: 0;
+}
+
+p:last-child {
+  margin-bottom: 0;
+}
+
+table {
+  border-collapse: collapse;
+}
+
+ul {
+  margin: 0.5em 0;
+  padding: 0 0 0 1.5em;
+}
+
+button {
+  cursor: pointer;
+}
+
+details summary {
+  cursor: pointer;
+}
+
+progress {
+  background: var(--color-secondary-dark-1);
+  border-radius: var(--border-radius);
+  border: none;
+  overflow: hidden;
+}
+
+progress::-webkit-progress-bar {
+  background: var(--color-secondary-dark-1);
+}
+
+progress::-webkit-progress-value {
+  background-color: var(--color-accent);
+}
+
+progress::-moz-progress-bar {
+  background-color: var(--color-accent);
+}
+
+@media (forced-colors: active) {
+  progress {
+    outline: 1px solid CanvasText;
+    outline-offset: -1px;
+  }
+  progress::-webkit-progress-value {
+    background: CanvasText;
+  }
+}
+
+* {
+  caret-color: var(--color-caret);
+}
+
+::file-selector-button {
+  border: 1px solid var(--color-light-border);
+  color: var(--color-text-light);
+  background: var(--color-light);
+  border-radius: var(--border-radius);
+}
+
+::file-selector-button:hover {
+  color: var(--color-text);
+  background: var(--color-hover);
+}
+
+::selection,
+relative-time::part(root)::selection {
+  background: var(--color-primary-light-1);
+  color: var(--color-white);
+}
+
+::placeholder {
+  color: var(--color-placeholder-text) !important;
+  opacity: 1 !important;
+}
+
+.unselectable,
+.btn,
+.button,
+.lines-num,
+.lines-commit,
+.lines-commit .blame-info,
+.ellipsis-button {
+  -webkit-touch-callout: none;
+  user-select: none;
+}
+
+.container-disabled {
+  opacity: var(--opacity-disabled);
+  pointer-events: none;
+  user-select: none;
+}
+
+a {
+  color: var(--color-primary);
+  cursor: pointer;
+  text-decoration-line: none;
+}
+
+a:hover {
+  text-decoration-line: underline;
+}
+
+/* a = always colored, underlined on hover */
+/* a.muted = colored on hover, underlined on hover */
+/* a.suppressed = never colored, underlined on hover */
+/* a.silenced = never colored, never underlined */
+
+a.muted,
+a.suppressed,
+a.silenced,
+.muted-links a {
+  color: inherit;
+}
+
+a:hover,
+a.muted:hover,
+.muted-links a:hover {
+  color: var(--color-primary);
+}
+
+a.silenced:hover,
+a.suppressed:hover {
+  color: inherit;
+}
+
+/* keyboard focus ring for interactive elements */
+a:focus-visible,
+button:focus-visible,
+.ui.button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
+a.silenced:hover {
+  text-decoration-line: none;
+}
+
+a.disabled {
+  cursor: default;
+  pointer-events: none;
+  opacity: var(--opacity-disabled);
+}
+
+a.label,
+.ui .menu a,
+.ui.cards a.card {
+  text-decoration-line: none !important;
+}
+
+.native-select {
+  position: relative;
+}
+
+.native-select > select {
+  appearance: none; /* hide default triangle */
+  padding: 6px 26px 6px 10px;
+  border: 1px solid var(--color-light-border) !important;
+  color: var(--color-text);
+  border-radius: var(--border-radius);
+}
+
+/* ::before and ::after pseudo elements don't work on select elements,
+   so we need to put it on the parent wrapper element. */
+.native-select::after {
+  position: absolute;
+  pointer-events: none; /* make the click event can pass through the svg to the select element */
+  top: 50%;
+  transform: translateY(-50%);
+  right: 5px;
+  content: "";
+  width: 16px;
+  height: 16px;
+  mask-size: cover;
+  mask-image: var(--select-arrows);
+  background: currentcolor;
+}
+
+.empty-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 40px;
+  padding-bottom: 40px;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.inline-code-block {
+  padding: 2px 4px;
+  border-radius: .24em;
+  background-color: var(--color-label-bg);
+}
+
+.ui.menu .dropdown.item:hover,
+.ui.menu a.item:hover,
+.ui.menu details.item summary:hover {
+  color: var(--color-text);
+  background: var(--color-hover);
+}
+
+/* slightly more contrast for filters on issue list */
+.ui.ui.menu .dropdown.item.disabled {
+  color: var(--color-text-light-2);
+}
+
+.full.height {
+  flex-grow: 1;
+  padding-bottom: var(--page-space-bottom);
+}
+
+.status-page-error {
+  margin-top: max(45vh - 90px, 80px);
+  margin-bottom: 80px;
+}
+
+.status-page-error-title {
+  font-size: 48px;
+  margin-bottom: 14px; /* some elements below may use tw-my-4 or tw-my-8, so use 14px as a minimal margin */
+  line-height: initial;
+  text-align: center;
+  font-weight: var(--font-weight-bold);
+  color: var(--color-text-light-2);
+}
+
+/* add margin below .secondary nav when it is the first child */
+.page-content > :first-child.secondary-nav {
+  margin-bottom: 14px;
+}
+
+/* add margin to all pages when there is no .secondary.nav */
+.page-content > :first-child:not(.secondary-nav) {
+  margin-top: var(--page-spacing);
+}
+/* if .ui.grid is the first child the first grid-column has 'padding-top: 1rem' which we need
+   to compensate here */
+.page-content > :first-child.ui.grid {
+  margin-top: calc(var(--page-spacing) - 1rem);
+}
+
+.ui .sha.label {
+  font-family: var(--fonts-monospace);
+  font-size: 13px;
+  font-weight: var(--font-weight-normal);
+  flex-shrink: 0;
+}
+
+.ui .migrate {
+  color: var(--color-text-light-2) !important;
+}
+
+.ui .migrate a {
+  color: var(--color-text-light) !important;
+}
+
+.ui .migrate a:hover {
+  color: var(--color-text) !important;
+}
+
+/* FIXME: this is a longstanding dirty patch since 2015, it only makes the pages more messy and shouldn't be used */
+.center {
+  text-align: center;
+}
+
+overflow-menu {
+  border-bottom: 1px solid var(--color-secondary) !important;
+  display: flex;
+  position: relative;
+}
+
+/* hide until JS has arranged the items, so the un-collapsed menu is never painted */
+overflow-menu:not([data-ready]) {
+  visibility: hidden;
+}
+
+overflow-menu .overflow-menu-popup {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 100;
+  background-color: var(--color-menu);
+  color: var(--color-text);
+  border: 1px solid var(--color-secondary);
+  border-radius: var(--border-radius);
+  box-shadow: 0 6px 18px var(--color-shadow);
+  padding: 4px 0;
+}
+
+overflow-menu .overflow-menu-popup::before,
+overflow-menu .overflow-menu-popup::after {
+  content: "";
+  position: absolute;
+  right: 10px;
+  border: 8px solid transparent;
+}
+
+overflow-menu .overflow-menu-popup::before {
+  bottom: 100%;
+  border-bottom-color: var(--color-secondary);
+}
+
+overflow-menu .overflow-menu-popup::after {
+  bottom: calc(100% - 1px);
+  border-bottom-color: var(--color-menu);
+}
+
+overflow-menu.ui.menu .overflow-menu-popup > .item.item { /* doubled class beats the host menu's item styles */
+  margin: 0 4px;
+  padding-inline: 8px !important; /* plus the margin, matches the host's tab padding */
+  border: none;
+  border-radius: var(--border-radius);
+  color: var(--color-text);
+  width: calc(100% - 8px);
+}
+
+overflow-menu.ui.menu .overflow-menu-popup > .item.item:hover,
+overflow-menu.ui.menu .overflow-menu-popup > .item.item:focus {
+  background: var(--color-hover);
+}
+
+overflow-menu.ui.menu .overflow-menu-popup > .item.item.active {
+  background: var(--color-active);
+}
+
+overflow-menu .overflow-menu-items {
+  display: flex;
+  flex: 1;
+}
+
+overflow-menu .overflow-menu-items .item {
+  margin-bottom: 0 !important; /* reset fomantic's margin, because the active menu has special bottom border */
+}
+
+overflow-menu .overflow-menu-items .item-flex-space {
+  flex: 1;
+}
+
+overflow-menu .overflow-menu-button {
+  background: transparent;
+  border: none;
+  color: inherit;
+  text-align: center;
+  width: 32px;
+  padding: 0;
+}
+
+/* match the styles of ".ui.secondary.pointing.menu .active.item" */
+overflow-menu.ui.secondary.pointing.menu .overflow-menu-button.active {
+  padding: 2px 0 0;
+  border-bottom: 2px solid currentcolor;
+  background-color: transparent;
+  font-weight: var(--font-weight-medium);
+}
+
+overflow-menu .overflow-menu-button:hover {
+  color: var(--color-text-dark);
+}
+
+overflow-menu .ui.label {
+  margin-left: 7px !important; /* save some space */
+  font-variant-numeric: tabular-nums; /* equal-width digits so counts don't reflow the row */
+}
+
+/* count not loaded yet, keep the reserved space so filling it in does not shift the row */
+overflow-menu .ui.label:empty {
+  visibility: hidden;
+}
+
+.activity-bar-graph {
+  background-color: var(--color-primary);
+  color: var(--color-primary-contrast);
+}
+
+.activity-bar-graph-alt {
+  color: var(--color-primary-contrast);
+}
+
+.oauth2-authorize-application-box {
+  margin-top: 3em !important;
+}
+
+.lines-blame-btn {
+  padding: 0 0 0 5px;
+  display: flex;
+  justify-content: center;
+}
+
+.lines-num {
+  padding: 0 8px;
+  text-align: right !important;
+  color: var(--color-text-light-2);
+  width: 1%; /* this apparently needs to be a percentage so that code column stretches in diffs */
+  min-width: 72px;
+  white-space: nowrap;
+}
+
+.code-diff .lines-num {
+  min-width: 50px;
+}
+
+.lines-num span::after {
+  content: attr(data-line-number);
+  line-height: var(--line-height-code) !important;
+  padding: 0 10px;
+  display: block;
+}
+
+.lines-type-marker {
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.lines-num,
+.lines-escape,
+.lines-code {
+  font-size: 12px;
+  font-family: var(--fonts-monospace);
+  line-height: var(--line-height-code);
+  padding-top: 0;
+  padding-bottom: 0;
+  vertical-align: top;
+}
+
+.lines-escape {
+  width: 0;
+  white-space: nowrap;
+  padding: 0;
+}
+
+.lines-code {
+  padding-left: 5px;
+}
+
+.code-inner {
+  font: 12px var(--fonts-monospace);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: inherit; /* needed for inline code preview in markup */
+}
+
+.code-inner:has(.diff-line-truncated) {
+  text-decoration: underline dashed 1px;
+  text-underline-offset: 4px;
+}
+
+.code-inner .diff-line-truncated {
+  margin-left: var(--gap-inline);
+  padding: 0 4px;
+  user-select: none;
+}
+
+.blame .code-inner {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.lines-commit {
+  vertical-align: top;
+  color: var(--color-text-light-1);
+  padding: 0 !important;
+  width: 1%;
+}
+
+.lines-commit .blame-info {
+  width: min(26vw, 300px);
+  display: block;
+  padding: 0 0 0 6px;
+  line-height: var(--line-height-code);
+  box-sizing: content-box;
+}
+
+.lines-commit .blame-info .blame-data {
+  display: flex;
+  font-family: var(--fonts-regular);
+}
+
+.lines-commit .blame-info .blame-data .blame-message {
+  flex-grow: 2;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.lines-commit .blame-info .blame-data .blame-time,
+.lines-commit .blame-info .blame-data .blame-avatar {
+  flex-shrink: 0;
+}
+
+.blame-avatar {
+  display: flex;
+  align-items: center;
+  margin-right: 6px;
+}
+
+tr.top-line-blame {
+  border-top: 1px solid var(--color-secondary);
+}
+
+tr.top-line-blame:first-of-type {
+  border-top: none; /* merge code lines belonging to the same commit into one block */
+}
+
+.migrate .svg.gitea-git {
+  color: var(--color-git);
+}
+
+.color-icon {
+  display: inline-block;
+  flex-shrink: 0;
+  border-radius: var(--border-radius-full);
+  height: 14px;
+  width: 14px;
+}
+
+.icon-size-8 {
+  width: 8px;
+  height: 8px;
+}
+
+.rss-icon {
+  display: inline-flex;
+  color: var(--color-text-light-1);
+}
+
+table th[data-sortt-asc]:hover,
+table th[data-sortt-desc]:hover {
+  background: var(--color-hover) !important;
+  cursor: pointer !important;
+}
+
+table th[data-sortt-asc] .svg,
+table th[data-sortt-desc] .svg {
+  margin-left: 0.25rem;
+}
+
+/* for "image" emojis like ":git:"  ":gitea:" and ":github:" (see CUSTOM_EMOJIS config option) */
+.emoji img {
+  border-width: 0 !important;
+  margin: 0 !important;
+  width: 1em !important;
+  height: 1em !important;
+  vertical-align: -0.15em;
+}
+
+.ui.tabular.menu .item,
+.ui.secondary.pointing.menu .item {
+  padding: 11.55px 12px !important; /* match .dashboard-navbar in height */
+  color: var(--color-text-light-2);
+}
+
+.ui.tabular.menu .item:hover,
+.ui.secondary.pointing.menu a.item:hover {
+  color: var(--color-text);
+}
+
+.ui.tabular.menu .active.item,
+.ui.secondary.pointing.menu .active.item,
+.resize-for-semibold::before {
+  font-weight: var(--font-weight-semibold);
+}
+
+.resize-for-semibold::before {
+  content: attr(data-text);
+  visibility: hidden;
+  display: block;
+  height: 0;
+}
+
+.flash-error details code,
+.flash-warning details code {
+  display: block;
+  text-align: left;
+}
+
+.ui.button.ellipsis-button {
+  padding: 0 5px 8px;
+  display: inline-block;
+  font-weight: var(--font-weight-semibold);
+  line-height: 8px;
+  vertical-align: middle;
+  min-height: 0;
+}
+
+.btn,
+.ui.ui.dropdown,
+.flex-text-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gap-inline);
+  vertical-align: middle;
+  max-width: 100%; /* the inner part might have "gt-ellipsis" */
+  min-width: 0; /* if it is the top flex container, "max-width" works; but if it is inside another flex container, the parent needs to handle the x-axis and here also needs "min-width" */
+}
+
+.ui.ui.labeled.button {
+  gap: 0;
+  align-items: stretch;
+}
+
+/* this is useful to make a left-right (e.g.: title .... operations) layout with default gap, and it wrap for small widths */
+.modal-dialog .header.flex-left-right,
+.flex-left-right {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--gap-block);
+  max-width: 100%;
+  min-width: 0;
+}
+
+.ui.ui.ui.ui .item.flex-text-block, /* override .ui.list and .ui.vertical.menu */
+.ui.ui.ui.ui.flex-items-block > .item,
+.ui.form .field > label.flex-text-block, /* override fomantic "block" style */
+.flex-items-block > .item,
+.flex-text-block {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-block);
+  max-width: 100%;
+  min-width: 0;
+}
+
+.flex-left-right > .ui.button,
+.flex-text-block > .ui.button,
+.flex-text-inline > .ui.button {
+  margin: 0; /* fomantic buttons have default margin, when we use them in a flex container with gap, we do not need these margins */
+}
+
+.svg.octicon-file-directory-fill,
+.svg.octicon-file-directory-open-fill,
+.svg.octicon-file-submodule {
+  color: var(--color-primary);
+}
+
+.svg.octicon-file,
+.svg.octicon-file-symlink-file,
+.svg.octicon-file-directory-symlink {
+  color: var(--color-secondary-dark-7);
+}

@@ -1,0 +1,449 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package markup
+
+import (
+	"bytes"
+	"fmt"
+	"html/template"
+	"io"
+	"regexp"
+	"strings"
+	"sync"
+
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup/common"
+	"gitea.dev/modules/translation"
+	"gitea.dev/modules/util"
+
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
+)
+
+// Issue name styles
+const (
+	IssueNameStyleNumeric      = "numeric"
+	IssueNameStyleAlphanumeric = "alphanumeric"
+	IssueNameStyleRegexp       = "regexp"
+)
+
+type globalVarsType struct {
+	hashCurrentPattern      *regexp.Regexp
+	shortLinkPattern        *regexp.Regexp
+	anyHashPattern          *regexp.Regexp
+	comparePattern          *regexp.Regexp
+	emailRegex              *regexp.Regexp
+	emojiShortCodeRegex     *regexp.Regexp
+	issueFullPattern        *regexp.Regexp
+	filesChangedFullPattern *regexp.Regexp
+	codePreviewPattern      *regexp.Regexp
+
+	tagCleaner *regexp.Regexp
+	nulCleaner *strings.Replacer
+}
+
+var globalVars = sync.OnceValue(func() *globalVarsType {
+	v := &globalVarsType{}
+	// NOTE: All below regex matching do not perform any extra validation.
+	// Thus a link is produced even if the linked entity does not exist.
+	// While fast, this is also incorrect and leads to false positives.
+	// TODO: fix invalid linking issue (update: stale TODO, what issues? maybe no TODO anymore)
+
+	// valid chars in encoded path and parameter: [-+~_%.a-zA-Z0-9/]
+
+	// hashCurrentPattern matches string that represents a commit SHA, e.g. d8a994ef243349f321568f9e36d5c3f444b99cae
+	// Although SHA1 hashes are 40 chars long, SHA256 are 64, the regex matches the hash from 7 to 64 chars in length
+	// so that abbreviated hash links can be used as well. This matches git and GitHub usability.
+	v.hashCurrentPattern = regexp.MustCompile(`(?:\s|^|\(|\[)([0-9a-f]{7,64})(?:\s|$|\)|\]|[.,:](\s|$))`)
+
+	// shortLinkPattern matches short but difficult to parse [[name|link|arg=test]] syntax
+	v.shortLinkPattern = regexp.MustCompile(`\[\[(.*?)\]\](\w*)`)
+
+	// anyHashPattern splits url containing SHA into parts
+	v.anyHashPattern = regexp.MustCompile(`https?://(?:\S+/){4,5}([0-9a-f]{40,64})((\.\w+)*)(/[-+~%./\w]+)?(\?[-+~%.\w&=]+)?(#[-+~%.\w]+)?`)
+
+	// comparePattern matches "http://domain/org/repo/compare/COMMIT1...COMMIT2#hash"
+	v.comparePattern = regexp.MustCompile(`https?://(?:\S+/){4,5}([0-9a-f]{7,64})(\.\.\.?)([0-9a-f]{7,64})?(#[-+~_%.a-zA-Z0-9]+)?`)
+
+	// emailRegex is definitely not perfect with edge cases,
+	// it is still accepted by the CommonMark specification, as well as the HTML5 spec:
+	//   http://spec.commonmark.org/0.28/#email-address
+	//   https://html.spec.whatwg.org/multipage/input.html#e-mail-state-(type%3Demail)
+	// At the moment, we use stricter rule for rendering purpose: only allow the "name" part starting after the word boundary
+	v.emailRegex = regexp.MustCompile(`\b([-\w.!#$%&'*+/=?^{|}~]*@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9]{2,}(?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)\b`)
+
+	// emojiShortCodeRegex find emoji by alias like :smile:
+	v.emojiShortCodeRegex = regexp.MustCompile(`:[-+\w]+:`)
+
+	// example: https://domain/org/repo/pulls/27#hash
+	v.issueFullPattern = regexp.MustCompile(`https?://(?:\S+/)[\w_.-]+/[\w_.-]+/(?:issues|pulls)/((?:\w{1,10}-)?[1-9][0-9]*)([\?|#](\S+)?)?\b`)
+
+	// example: https://domain/org/repo/pulls/27/files#hash
+	v.filesChangedFullPattern = regexp.MustCompile(`https?://(?:\S+/)[\w_.-]+/[\w_.-]+/pulls/((?:\w{1,10}-)?[1-9][0-9]*)/files([\?|#](\S+)?)?\b`)
+
+	// codePreviewPattern matches "http://domain/.../{owner}/{repo}/src/commit/{commit}/{filepath}#L10-L20"
+	v.codePreviewPattern = regexp.MustCompile(`https?://\S+/([^\s/]+)/([^\s/]+)/src/commit/([0-9a-f]{7,64})(/\S+)#(L\d+(-L\d+)?)`)
+
+	// cleans: "<foo/bar", "<any words/", ("<html", "<head", "<script", "<style", "<?", "<%")
+	v.tagCleaner = regexp.MustCompile(`(?i)<(/?\w+/\w+|/[\w ]+/|/?(html|head|script|style|%|\?)\b)`)
+	v.nulCleaner = strings.NewReplacer("\000", "")
+	return v
+})
+
+type processor func(ctx *RenderContext, node *html.Node)
+
+// PostProcessDefault does the final required transformations to the passed raw HTML
+// data, and ensures its validity. Transformations include: replacing links and
+// emails with HTML links, parsing shortlinks in the format of [[Link]], like
+// MediaWiki, linking issues in the format #ID, and mentions in the format
+// @user, and others.
+func PostProcessDefault(ctx *RenderContext, input io.Reader, output io.Writer) error {
+	procs := []processor{
+		fullIssuePatternProcessor,
+		comparePatternProcessor,
+		codePreviewPatternProcessor,
+		fullHashPatternProcessor,
+		shortLinkProcessor,
+		linkProcessor,
+		mentionProcessor,
+		issueIndexPatternProcessor,
+		commitCrossReferencePatternProcessor,
+		hashCurrentPatternProcessor,
+		emailAddressProcessor,
+		emojiProcessor,
+		emojiShortCodeProcessor,
+	}
+	return postProcess(ctx, procs, input, output)
+}
+
+// PostProcessCommitMessage will use the same logic as PostProcess, but will disable the shortLinkProcessor.
+func PostProcessCommitMessage(ctx *RenderContext, content template.HTML) template.HTML {
+	procs := []processor{
+		fullIssuePatternProcessor,
+		comparePatternProcessor,
+		fullHashPatternProcessor,
+		linkProcessor,
+		mentionProcessor,
+		issueIndexPatternProcessor,
+		commitCrossReferencePatternProcessor,
+		hashCurrentPatternProcessor,
+		emailAddressProcessor,
+		emojiProcessor,
+		emojiShortCodeProcessor,
+	}
+	return postProcessHTML(ctx, procs, content)
+}
+
+var emojiProcessors = []processor{
+	emojiShortCodeProcessor,
+	emojiProcessor,
+}
+
+// PostProcessCommitMessageSubject will use the same logic as PostProcess and
+// PostProcessCommitMessage, but will disable the shortLinkProcessor and
+// emailAddressProcessor, and wraps the whole subject in defaultLink.
+func PostProcessCommitMessageSubject(ctx *RenderContext, defaultLink, content string) template.HTML {
+	procs := []processor{
+		fullIssuePatternProcessor,
+		comparePatternProcessor,
+		fullHashPatternProcessor,
+		mentionProcessor,
+		issueIndexPatternProcessor,
+		commitCrossReferencePatternProcessor,
+		hashCurrentPatternProcessor,
+		linkProcessor,
+	}
+
+	content = strings.TrimSpace(content)
+	m := common.GlobalVars().LinkifyRegex.FindStringSubmatch(content)
+	contentIsFullLink := m != nil && m[0] == content
+	// Only call post-processers when the content is not a full link
+	// If the content is a full link, just render it as its text and add our real link to wrap it
+	// Otherwise: if the content full link gets its "A" element by "linkProcessor", the outer link (our real link) won't work
+	if contentIsFullLink {
+		procs = nil
+	}
+
+	procs = append(procs, func(ctx *RenderContext, node *html.Node) {
+		ch := &html.Node{Parent: node, Type: html.TextNode, Data: node.Data}
+		node.Type = html.ElementNode
+		node.Data = "a"
+		node.DataAtom = atom.A
+		node.Attr = []html.Attribute{{Key: "href", Val: defaultLink}, {Key: "class", Val: "muted title-full-link"}}
+		node.FirstChild, node.LastChild = ch, ch
+		for n := node.FirstChild; n != nil; {
+			n = visitNode(ctx, emojiProcessors, n)
+		}
+	})
+	rendered := postProcessHTML(ctx, procs, htmlutil.EscapeString(content))
+	return htmlutil.HTMLFormat(`<span class="title-full-link-hover">%s</span>`, rendered)
+}
+
+// PostProcessIssueTitle to process title on individual issue/pull page
+func PostProcessIssueTitle(ctx *RenderContext, titleHTML template.HTML) template.HTML {
+	return postProcessHTML(ctx, []processor{
+		issueIndexPatternProcessor,
+		commitCrossReferencePatternProcessor,
+		hashCurrentPatternProcessor,
+		emojiShortCodeProcessor,
+		emojiProcessor,
+	}, titleHTML)
+}
+
+// PostProcessDescriptionHTML will use similar logic as PostProcess, but will
+// use a single special linkProcessor.
+func PostProcessDescriptionHTML(ctx *RenderContext, content template.HTML) template.HTML {
+	return postProcessHTML(ctx, []processor{
+		descriptionLinkProcessor,
+		emojiShortCodeProcessor,
+		emojiProcessor,
+	}, content)
+}
+
+// PostProcessEmoji for when we want to just process emoji and shortcodes
+// in various places it isn't already run through the normal Markdown processor
+func PostProcessEmoji(ctx *RenderContext, content template.HTML) template.HTML {
+	return postProcessHTML(ctx, emojiProcessors, content)
+}
+
+func postProcessHTML(ctx *RenderContext, procs []processor, content template.HTML) template.HTML {
+	var buf strings.Builder
+	if err := postProcess(ctx, procs, strings.NewReader(string(content)), &buf); err != nil {
+		log.Warn("postProcessHTML err: %v, input: %s", err, util.TruncateRunes(string(content), 200))
+		return content
+	}
+	return template.HTML(buf.String())
+}
+
+func RenderTocHeadingItems(ctx *RenderContext, nodeDetailsAttrs map[string]string, out io.Writer) {
+	locale, ok := ctx.Value(translation.ContextKey).(translation.Locale)
+	if !ok {
+		locale = translation.NewLocale("")
+	}
+	_, _ = htmlutil.HTMLPrintTag(out, "details", nodeDetailsAttrs)
+	_, _ = htmlutil.HTMLPrintf(out, "<summary>%s</summary>\n", locale.TrString("toc"))
+
+	baseLevel := 6
+	for _, header := range ctx.TocHeadingItems {
+		if header.HeadingLevel < baseLevel {
+			baseLevel = header.HeadingLevel
+		}
+	}
+
+	currentLevel := baseLevel
+	indent := []byte{' ', ' '}
+	_, _ = htmlutil.HTMLPrint(out, "<ul>\n")
+	for _, header := range ctx.TocHeadingItems {
+		for currentLevel < header.HeadingLevel {
+			_, _ = out.Write(indent)
+			_, _ = htmlutil.HTMLPrint(out, "<ul>\n")
+			indent = append(indent, ' ', ' ')
+			currentLevel++
+		}
+		for currentLevel > header.HeadingLevel {
+			indent = indent[:len(indent)-2]
+			_, _ = out.Write(indent)
+			_, _ = htmlutil.HTMLPrint(out, "</ul>\n")
+			currentLevel--
+		}
+		_, _ = out.Write(indent)
+		_, _ = htmlutil.HTMLPrintf(out, "<li><a href=\"#%s\">%s</a></li>\n", header.AnchorID, header.InnerText)
+	}
+	for currentLevel > baseLevel {
+		indent = indent[:len(indent)-2]
+		_, _ = out.Write(indent)
+		_, _ = htmlutil.HTMLPrint(out, "</ul>\n")
+		currentLevel--
+	}
+	_, _ = htmlutil.HTMLPrint(out, "</ul>\n</details>\n")
+}
+
+func postProcess(ctx *RenderContext, procs []processor, input io.Reader, output io.Writer) error {
+	if !ctx.usedByRender && ctx.RenderHelper != nil {
+		defer ctx.RenderHelper.CleanUp()
+	}
+	// FIXME: don't read all content to memory
+	rawHTML, err := io.ReadAll(input)
+	if err != nil {
+		return err
+	}
+
+	// parse the HTML
+	node, err := html.Parse(io.MultiReader(
+		// prepend "<html><body>"
+		strings.NewReader("<html><body>"),
+		// strip out NULLs (they're always invalid), and escape known tags
+		bytes.NewReader(globalVars().tagCleaner.ReplaceAll([]byte(globalVars().nulCleaner.Replace(string(rawHTML))), []byte("&lt;$1"))),
+		// close the tags
+		strings.NewReader("</body></html>"),
+	))
+	if err != nil {
+		return fmt.Errorf("markup.postProcess: invalid HTML: %w", err)
+	}
+
+	if node.Type == html.DocumentNode {
+		node = node.FirstChild
+	}
+
+	visitNode(ctx, procs, node)
+
+	newNodes := make([]*html.Node, 0, 5)
+
+	if node.Data == "html" {
+		node = node.FirstChild
+		for node != nil && node.Data != "body" {
+			node = node.NextSibling
+		}
+	}
+	if node != nil {
+		if node.Data == "body" {
+			child := node.FirstChild
+			for child != nil {
+				newNodes = append(newNodes, child)
+				child = child.NextSibling
+			}
+		} else {
+			newNodes = append(newNodes, node)
+		}
+	}
+
+	// Render everything to buf.
+	if ctx.TocShowInSection == TocShowInMain && len(ctx.TocHeadingItems) > 0 {
+		RenderTocHeadingItems(ctx, nil, output)
+	}
+	for _, node := range newNodes {
+		if err := html.Render(output, node); err != nil {
+			return fmt.Errorf("markup.postProcess: html.Render: %w", err)
+		}
+	}
+	return nil
+}
+
+func isEmojiNode(node *html.Node) bool {
+	if node.Type == html.ElementNode && node.Data == atom.Span.String() {
+		for _, attr := range node.Attr {
+			if (attr.Key == "class" || attr.Key == "data-attr-class") && strings.Contains(attr.Val, "emoji") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func visitNode(ctx *RenderContext, procs []processor, node *html.Node) *html.Node {
+	if node.Type == html.TextNode {
+		for _, proc := range procs {
+			proc(ctx, node) // it might add siblings
+		}
+		return node.NextSibling
+	}
+	if node.Type != html.ElementNode {
+		return node.NextSibling
+	}
+
+	processNodeHeadingAndID(ctx, node)
+	processFootnoteNode(ctx, node) // FIXME: the footnote processing should be done in the "footnote.go" renderer directly
+
+	if isEmojiNode(node) {
+		// TextNode emoji will be converted to `<span class="emoji">`, then the next iteration will visit the "span"
+		// if we don't stop it, it will go into the TextNode again and create an infinite recursion
+		return node.NextSibling
+	} else if node.Data == "code" || node.Data == "pre" || node.Data == "math" {
+		return node.NextSibling // ignore code, pre and math nodes
+	} else if node.Data == "img" {
+		return visitNodeImg(ctx, node)
+	} else if node.Data == "video" {
+		return visitNodeVideo(ctx, node)
+	} else if node.Data == "source" {
+		return visitNodePictureSource(ctx, node)
+	}
+
+	if node.Data == "a" {
+		processNodeA(ctx, node)
+		// only use emoji processors for the content in the "A" tag,
+		// because the content there is not processable, for example: the content is a commit id or a full URL.
+		procs = emojiProcessors
+	}
+	next := node.NextSibling
+	for n := node.FirstChild; n != nil; {
+		n = visitNode(ctx, procs, n)
+	}
+	return next
+}
+
+// createKeyword() renders a highlighted version of an action keyword
+func createKeyword(ctx *RenderContext, content string) *html.Node {
+	// CSS class for action keywords (e.g. "closes: #1")
+	const keywordClass = "issue-keyword"
+
+	span := &html.Node{
+		Type: html.ElementNode,
+		Data: atom.Span.String(),
+		Attr: []html.Attribute{},
+	}
+	span.Attr = append(span.Attr, ctx.RenderInternal.NodeSafeAttr("class", keywordClass))
+
+	text := &html.Node{
+		Type: html.TextNode,
+		Data: content,
+	}
+	span.AppendChild(text)
+
+	return span
+}
+
+func createLink(ctx *RenderContext, href, content, class string) *html.Node {
+	a := &html.Node{
+		Type: html.ElementNode,
+		Data: atom.A.String(),
+		Attr: []html.Attribute{{Key: "href", Val: href}},
+	}
+	if !RenderBehaviorForTesting.DisableAdditionalAttributes {
+		a.Attr = append(a.Attr, html.Attribute{Key: "data-markdown-generated-content"})
+	}
+	if class != "" {
+		a.Attr = append(a.Attr, ctx.RenderInternal.NodeSafeAttr("class", class))
+	}
+
+	text := &html.Node{
+		Type: html.TextNode,
+		Data: content,
+	}
+
+	a.AppendChild(text)
+	return a
+}
+
+// replaceContent takes text node, and in its content it replaces a section of
+// it with the specified newNode.
+func replaceContent(node *html.Node, i, j int, newNode *html.Node) {
+	replaceContentList(node, i, j, []*html.Node{newNode})
+}
+
+// replaceContentList takes text node, and in its content it replaces a section of
+// it with the specified newNodes. An example to visualize how this can work can
+// be found here: https://play.golang.org/p/5zP8NnHZ03s
+func replaceContentList(node *html.Node, i, j int, newNodes []*html.Node) {
+	// get the data before and after the match
+	before := node.Data[:i]
+	after := node.Data[j:]
+
+	// Replace in the current node the text, so that it is only what it is
+	// supposed to have.
+	node.Data = before
+
+	// Get the current next sibling, before which we place the replaced data,
+	// and after that we place the new text node.
+	nextSibling := node.NextSibling
+	for _, n := range newNodes {
+		node.Parent.InsertBefore(n, nextSibling)
+	}
+	if after != "" {
+		node.Parent.InsertBefore(&html.Node{
+			Type: html.TextNode,
+			Data: after,
+		}, nextSibling)
+	}
+}

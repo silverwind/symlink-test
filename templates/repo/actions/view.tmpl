@@ -1,0 +1,11 @@
+{{template "base/head" .}}
+
+<div class="page-content repository">
+	{{template "repo/header" .}}
+	{{template "repo/actions/view_component" (dict
+		"JobID" .JobID
+		"ActionsViewURL" .ActionsViewURL
+	)}}
+</div>
+
+{{template "base/footer" .}}

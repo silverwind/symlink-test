@@ -1,0 +1,153 @@
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+)
+
+type downloadScopeCase struct {
+	name         string
+	method       string
+	url          string
+	publicOnlyOK bool
+}
+
+func TestDownloadRepoContent(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	session := loginUser(t, "user2")
+
+	for _, route := range []struct{ path, blobName, svgName string }{
+		{"raw", "RawBlob", "SVGUsesSecureHeaders"},
+		{"media", "MediaBlob", "MediaSVGUsesSecureHeaders"},
+	} {
+		t.Run(route.blobName, func(t *testing.T) {
+			req := NewRequest(t, "GET", "/user2/repo1/"+route.path+"/blob/4b4851ad51df6a7d9f25c979345979eaeb5b349f")
+			resp := session.MakeRequest(t, req, http.StatusOK)
+			assert.Equal(t, "# repo1\n\nDescription for repo1", resp.Body.String())
+		})
+
+		t.Run(route.svgName, func(t *testing.T) {
+			req := NewRequest(t, "GET", "/user2/repo2/"+route.path+"/blob/6395b68e1feebb1e4c657b4f9f6ba2676a283c0b")
+			resp := session.MakeRequest(t, req, http.StatusOK)
+			assert.Contains(t, resp.Header().Get("Content-Security-Policy"), "sandbox")
+			assert.Equal(t, "image/svg+xml", resp.Header().Get("Content-Type"))
+			assert.Equal(t, "nosniff", resp.Header().Get("X-Content-Type-Options"))
+		})
+	}
+
+	t.Run("MimeTypeMap", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/user2/repo2/raw/branch/master/test.xml")
+		resp := session.MakeRequest(t, req, http.StatusOK)
+		// although the file is a valid XML file, it is served as "text/plain" to avoid site content spamming (the same to "text/html" files)
+		assert.Equal(t, "text/plain; charset=utf-8", resp.Header().Get("Content-Type"))
+
+		defer test.MockVariableValue(&setting.MimeTypeMap)()
+		setting.MimeTypeMap.Enabled = true
+
+		setting.MimeTypeMap.Map[".xml"] = "text/xml"
+		req = NewRequest(t, "GET", "/user2/repo2/raw/branch/master/test.xml")
+		resp = session.MakeRequest(t, req, http.StatusOK)
+		// respect the mime mapping, and "text/plain" protection isn't used anymore
+		assert.Equal(t, "text/xml; charset=utf-8", resp.Header().Get("Content-Type"))
+		assert.Equal(t, "inline; filename=test.xml", resp.Header().Get("Content-Disposition"))
+
+		setting.MimeTypeMap.Map[".xml"] = "application/xml"
+		req = NewRequest(t, "GET", "/user2/repo2/raw/branch/master/test.xml")
+		resp = session.MakeRequest(t, req, http.StatusOK)
+		// non-text file don't have "charset"
+		assert.Equal(t, "application/xml", resp.Header().Get("Content-Type"))
+	})
+
+	t.Run("TokenScopes", func(t *testing.T) {
+		ownerReadToken := getUserToken(t, "user2", auth_model.AccessTokenScopeReadRepository)
+		miscToken := getUserToken(t, "user2", auth_model.AccessTokenScopeReadMisc)
+		publicOnlyToken := getUserToken(t, "user2", auth_model.AccessTokenScopeReadRepository, auth_model.AccessTokenScopePublicOnly)
+
+		cases := []downloadScopeCase{
+			{
+				name:         "PublicArchiveDownload",
+				method:       http.MethodGet,
+				url:          "/user2/repo1/archive/master.tar.gz",
+				publicOnlyOK: true,
+			},
+			{
+				name:         "PrivateArchiveDownload",
+				method:       http.MethodGet,
+				url:          "/user2/repo2/archive/master.tar.gz",
+				publicOnlyOK: false,
+			},
+			{
+				name:         "PublicArchiveInitiate",
+				method:       http.MethodPost,
+				url:          "/user2/repo1/archive/master.tar.gz",
+				publicOnlyOK: true,
+			},
+			{
+				name:         "PrivateArchiveInitiate",
+				method:       http.MethodPost,
+				url:          "/user2/repo2/archive/master.tar.gz",
+				publicOnlyOK: false,
+			},
+		}
+		for _, route := range []string{"Raw", "Media"} {
+			for _, ref := range []struct{ name, path string }{
+				{"Blob", "blob/4b4851ad51df6a7d9f25c979345979eaeb5b349f"},
+				{"Branch", "branch/master/README.md"},
+				{"Tag", "tag/v1.1/README.md"},
+				{"Commit", "commit/65f1bf27bc3bf70f64657658635e66094edbcb4d/README.md"},
+			} {
+				cases = append(cases, downloadScopeCase{
+					name:         "Public" + route + ref.name,
+					method:       http.MethodGet,
+					url:          "/user2/repo1/" + strings.ToLower(route) + "/" + ref.path,
+					publicOnlyOK: true,
+				})
+			}
+		}
+		cases = append(cases,
+			downloadScopeCase{
+				name:         "PrivateRawBranch",
+				method:       http.MethodGet,
+				url:          "/user2/repo2/raw/branch/master/test.xml",
+				publicOnlyOK: false,
+			},
+			downloadScopeCase{
+				name:         "PrivateRawBlob",
+				method:       http.MethodGet,
+				url:          "/user2/repo2/raw/blob/6395b68e1feebb1e4c657b4f9f6ba2676a283c0b",
+				publicOnlyOK: false,
+			},
+			downloadScopeCase{
+				name:         "PrivateMediaBranch",
+				method:       http.MethodGet,
+				url:          "/user2/repo2/media/branch/master/test.xml",
+				publicOnlyOK: false,
+			},
+		)
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				MakeRequest(t, NewRequest(t, tc.method, tc.url).AddTokenAuth(miscToken), http.StatusForbidden)
+				MakeRequest(t, NewRequest(t, tc.method, tc.url).AddTokenAuth(ownerReadToken), http.StatusOK)
+
+				publicOnlyStatus := http.StatusNotFound
+				if tc.publicOnlyOK {
+					publicOnlyStatus = http.StatusOK
+				}
+				MakeRequest(t, NewRequest(t, tc.method, tc.url).AddTokenAuth(publicOnlyToken), publicOnlyStatus)
+			})
+		}
+	})
+}

@@ -1,0 +1,559 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"compress/gzip"
+	"crypto/sha1"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/packages"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/packages/npm"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPackageNpm(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	token := "Bearer " + getTokenForLoggedInUser(t, loginUser(t, user.Name), auth_model.AccessTokenScopeWritePackage)
+
+	packageName := "@scope/test-package"
+	packageVersion := "1.0.1-pre"
+	packageTag := "latest"
+	packageTag2 := "release"
+	packageAuthor := "KN4CK3R"
+	packageDescription := "Test Description"
+	packageBinName := "cli"
+	packageBinPath := "./cli.sh"
+	repoType := "gitea"
+	repoURL := "http://localhost:3000/gitea/test.git"
+	repoDirectory := "package-subdir"
+
+	attachmentBytes := test.WriteTarCompression(gzip.NewWriter, map[string]string{
+		"package/package.json": `{"name":"` + packageName + `","version":"` + packageVersion + `","scripts":{"postinstall":"echo hi"}}`,
+	}).Bytes()
+	attachmentData := base64.StdEncoding.EncodeToString(attachmentBytes)
+	sha1Sum := sha1.Sum(attachmentBytes)
+	sha1SumHex := hex.EncodeToString(sha1Sum[:])
+	sha512Sum := sha512.Sum512(attachmentBytes)
+	integrity := "sha512-" + base64.StdEncoding.EncodeToString(sha512Sum[:])
+
+	buildUpload := func(version string) string {
+		return `{
+			"_id": "` + packageName + `",
+			"name": "` + packageName + `",
+			"description": "` + packageDescription + `",
+			"dist-tags": {
+			  "` + packageTag + `": "` + version + `"
+			},
+			"versions": {
+			  	"` + version + `": {
+					"name": "` + packageName + `",
+					"version": "` + version + `",
+					"description": "` + packageDescription + `",
+					"author": {
+				  	"name": "` + packageAuthor + `"
+					},
+        	"bin": {
+        	  "` + packageBinName + `": "` + packageBinPath + `"
+      	  },
+					"dist": {
+					  "integrity": "` + integrity + `",
+					  "shasum": "` + sha1SumHex + `"
+					},
+					"repository": {
+						"type": "` + repoType + `",
+						"url": "` + repoURL + `",
+						"directory": "` + repoDirectory + `"
+					},
+					"readme": "[docs](docs/usage.md)\n![logo](logo.png)",
+					"peerDependencies": {
+						"tea": "2.x",
+						"soy-milk": "1.2"
+					},
+					"peerDependenciesMeta": {
+						"soy-milk": {
+							"optional": true
+						}
+					},
+					"scripts": {
+						"postinstall": "echo hi"
+					},
+					"engines": {
+						"node": ">=22.7.0",
+						"npm": ">=10.8.2"
+					},
+					"cpu": ["x64", "arm64"],
+					"os": ["linux", "darwin"],
+					"libc": ["glibc"],
+					"directories": {
+						"doc": "./doc",
+						"man": "./man"
+					},
+					"funding": "https://example.com/fund",
+					"acceptDependencies": {
+						"left-pad": "1.x"
+					}
+			  }
+			},
+			"_attachments": {
+			  "` + packageName + `-` + version + `.tgz": {
+				"data": "` + attachmentData + `"
+			  }
+			}
+		  }`
+	}
+
+	root := fmt.Sprintf("/api/packages/%s/npm/%s", user.Name, url.PathEscape(packageName))
+	tagsRoot := fmt.Sprintf("/api/packages/%s/npm/-/package/%s/dist-tags", user.Name, url.PathEscape(packageName))
+	filename := fmt.Sprintf("%s-%s.tgz", strings.Split(packageName, "/")[1], packageVersion)
+
+	t.Run("Upload", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequestWithBody(t, "PUT", root, strings.NewReader(buildUpload(packageVersion))).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusCreated)
+
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+		assert.NoError(t, err)
+		assert.NotNil(t, pd.SemVer)
+		assert.IsType(t, &npm.Metadata{}, pd.Metadata)
+		assert.Equal(t, packageName, pd.Package.Name)
+		assert.Equal(t, packageVersion, pd.Version.Version)
+		assert.Len(t, pd.VersionProperties, 1)
+		assert.Equal(t, npm.TagProperty, pd.VersionProperties[0].Name)
+		assert.Equal(t, packageTag, pd.VersionProperties[0].Value)
+
+		pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+		assert.NoError(t, err)
+		assert.Len(t, pfs, 1)
+		assert.Equal(t, filename, pfs[0].Name)
+		assert.True(t, pfs[0].IsLead)
+
+		pb, err := packages.GetBlobByID(t.Context(), pfs[0].BlobID)
+		assert.NoError(t, err)
+		assert.EqualValues(t, len(attachmentBytes), pb.Size)
+	})
+
+	t.Run("UploadExists", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequestWithBody(t, "PUT", root, strings.NewReader(buildUpload(packageVersion))).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusConflict)
+	})
+
+	t.Run("Download", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		rootPaths := []string{
+			"/api/packages/user2/npm/@scope/test-package",
+			"/api/packages/user2/npm/@scope%2Ftest-package",
+			"/api/packages/user2/npm/%40scope%2ftest-package",
+		}
+		for _, root := range rootPaths {
+			req := NewRequest(t, "GET", fmt.Sprintf("%s/-/%s/%s", root, packageVersion, filename)).AddTokenAuth(token)
+			resp := MakeRequest(t, req, http.StatusOK)
+			b, _ := base64.StdEncoding.DecodeString(attachmentData)
+			assert.Equal(t, b, resp.Body.Bytes())
+
+			req = NewRequest(t, "GET", fmt.Sprintf("%s/-/%s", root, filename)).AddTokenAuth(token)
+			resp = MakeRequest(t, req, http.StatusOK)
+			assert.Equal(t, b, resp.Body.Bytes())
+		}
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+		assert.EqualValues(t, 6, pvs[0].DownloadCount)
+	})
+
+	t.Run("PackageMetadata", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "GET", fmt.Sprintf("/api/packages/%s/npm/%s", user.Name, "does-not-exist")).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusNotFound)
+
+		req = NewRequest(t, "GET", root).
+			AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		result := DecodeJSON(t, resp, &npm.PackageMetadata{})
+
+		assert.Equal(t, packageName, result.ID)
+		assert.Equal(t, packageName, result.Name)
+		assert.Equal(t, packageDescription, result.Description)
+		assert.Contains(t, result.DistTags, packageTag)
+		assert.Equal(t, packageVersion, result.DistTags[packageTag])
+		assert.Equal(t, packageAuthor, result.Author.Name)
+		assert.Contains(t, result.Versions, packageVersion)
+		pmv := result.Versions[packageVersion]
+		assert.Equal(t, fmt.Sprintf("%s@%s", packageName, packageVersion), pmv.ID)
+		assert.Equal(t, packageName, pmv.Name)
+		assert.Equal(t, packageDescription, pmv.Description)
+		assert.Equal(t, packageAuthor, pmv.Author.Name)
+		assert.Equal(t, packageBinPath, pmv.Bin[packageBinName])
+		assert.Equal(t, integrity, pmv.Dist.Integrity)
+		assert.Equal(t, sha1SumHex, pmv.Dist.Shasum)
+		assert.Equal(t, fmt.Sprintf("%sapi/packages/%s/npm/%s/-/%s", setting.AppURL, user.Name, packageName, filename), pmv.Dist.Tarball)
+		assert.Equal(t, repoType, result.Repository.Type)
+		assert.Equal(t, repoURL, result.Repository.URL)
+		assert.Equal(t, map[string]string{"tea": "2.x", "soy-milk": "1.2"}, pmv.PeerDependencies)
+		assert.Equal(t, map[string]any{"soy-milk": map[string]any{"optional": true}}, pmv.PeerDependenciesMeta)
+		assert.True(t, pmv.HasInstallScript)
+		assert.False(t, pmv.HasShrinkwrap)
+		assert.Equal(t, map[string]string{"node": ">=22.7.0", "npm": ">=10.8.2"}, pmv.Engines)
+		assert.Equal(t, []string{"x64", "arm64"}, pmv.CPU)
+		assert.Equal(t, []string{"linux", "darwin"}, pmv.OS)
+		assert.Equal(t, []string{"glibc"}, pmv.Libc)
+		assert.Equal(t, map[string]string{"doc": "./doc", "man": "./man"}, pmv.Directories)
+		assert.Equal(t, "https://example.com/fund", pmv.Funding)
+		assert.Equal(t, map[string]string{"left-pad": "1.x"}, pmv.AcceptDependencies)
+		assert.Empty(t, pmv.Deprecated)
+
+		req = NewRequest(t, "GET", root).AddTokenAuth(token).SetHeader("If-None-Match", resp.Header().Get("ETag"))
+		MakeRequest(t, req, http.StatusNotModified)
+	})
+
+	t.Run("PingWhoami", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		registry := fmt.Sprintf("/api/packages/%s/npm/-/", user.Name)
+		MakeRequest(t, NewRequest(t, "GET", registry+"ping"), http.StatusOK)
+		MakeRequest(t, NewRequest(t, "GET", registry+"whoami"), http.StatusUnauthorized)
+		resp := MakeRequest(t, NewRequest(t, "GET", registry+"whoami").AddTokenAuth(token), http.StatusOK)
+		assert.JSONEq(t, `{"username":"`+user.Name+`"}`, resp.Body.String())
+	})
+
+	t.Run("PackageVersionMetadata", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		for _, selector := range []string{packageVersion, packageTag} {
+			req := NewRequest(t, "GET", fmt.Sprintf("%s/%s", root, selector)).AddTokenAuth(token)
+			resp := MakeRequest(t, req, http.StatusOK)
+
+			pmv := DecodeJSON(t, resp, &npm.PackageMetadataVersion{})
+			assert.Equal(t, fmt.Sprintf("%s@%s", packageName, packageVersion), pmv.ID)
+			assert.Equal(t, npm.Repository{Type: repoType, URL: repoURL, Directory: repoDirectory}, pmv.Repository)
+		}
+
+		for _, missing := range []string{"9.9.9", "no-such-tag"} {
+			req := NewRequest(t, "GET", root+"/"+missing).AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusNotFound)
+		}
+	})
+
+	t.Run("AddTag", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		test := func(t *testing.T, status int, tag, version string) {
+			req := NewRequestWithBody(t, "PUT", fmt.Sprintf("%s/%s", tagsRoot, tag), strings.NewReader(`"`+version+`"`)).
+				AddTokenAuth(token)
+			MakeRequest(t, req, status)
+		}
+
+		test(t, http.StatusBadRequest, "1.0", packageVersion)
+		test(t, http.StatusBadRequest, "v1.0", packageVersion)
+		test(t, http.StatusNotFound, packageTag2, "1.2")
+		test(t, http.StatusOK, packageTag, packageVersion)
+		test(t, http.StatusOK, packageTag2, packageVersion)
+
+		// an oversized dist-tag body is rejected instead of being read unbounded
+		oversized := strings.Repeat("a", 5*1024)
+		req := NewRequestWithBody(t, "PUT", fmt.Sprintf("%s/%s", tagsRoot, packageTag), strings.NewReader(oversized)).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusRequestEntityTooLarge)
+	})
+
+	t.Run("ListTags", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "GET", tagsRoot).
+			AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		result := DecodeJSON(t, resp, map[string]string{})
+
+		assert.Len(t, result, 2)
+		assert.Contains(t, result, packageTag)
+		assert.Equal(t, packageVersion, result[packageTag])
+		assert.Contains(t, result, packageTag2)
+		assert.Equal(t, packageVersion, result[packageTag2])
+	})
+
+	t.Run("DeleteTag", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		test := func(t *testing.T, status int, tag string) {
+			req := NewRequest(t, "DELETE", fmt.Sprintf("%s/%s", tagsRoot, tag)).
+				AddTokenAuth(token)
+			MakeRequest(t, req, status)
+		}
+
+		test(t, http.StatusBadRequest, "v1.0")
+		test(t, http.StatusBadRequest, "1.0")
+		test(t, http.StatusOK, "dummy")
+		test(t, http.StatusOK, packageTag2)
+		test(t, http.StatusOK, packageTag)
+
+		resp := MakeRequest(t, NewRequest(t, "GET", tagsRoot).AddTokenAuth(token), http.StatusOK)
+		assert.Equal(t, map[string]string{packageTag: packageVersion}, DecodeJSON(t, resp, map[string]string{}))
+		resp = MakeRequest(t, NewRequest(t, "GET", root+"/"+packageTag).AddTokenAuth(token), http.StatusOK)
+		assert.Equal(t, packageVersion, DecodeJSON(t, resp, &npm.PackageMetadataVersion{}).Version)
+	})
+
+	t.Run("Search", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		url := fmt.Sprintf("/api/packages/%s/npm/-/v1/search", user.Name)
+
+		cases := []struct {
+			Query           string
+			Skip            int
+			Take            int
+			ExpectedTotal   int64
+			ExpectedResults int
+		}{
+			{"", 0, 0, 1, 1},
+			{"", 0, 10, 1, 1},
+			{"gitea", 0, 10, 0, 0},
+			{"test", 0, 10, 1, 1},
+			{"test", 1, 10, 1, 0},
+		}
+
+		for i, c := range cases {
+			req := NewRequest(t, "GET", fmt.Sprintf("%s?text=%s&from=%d&size=%d", url, c.Query, c.Skip, c.Take))
+			resp := MakeRequest(t, req, http.StatusOK)
+
+			result := DecodeJSON(t, resp, &npm.PackageSearch{})
+
+			assert.Equal(t, c.ExpectedTotal, result.Total, "case %d: unexpected total hits", i)
+			assert.Len(t, result.Objects, c.ExpectedResults, "case %d: unexpected result count", i)
+		}
+	})
+
+	t.Run("WebViewReadmeRepoLinks", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+		assert.NoError(t, err)
+		require.Len(t, pvs, 1)
+
+		// link the package to a repository so README relative links resolve against
+		// repository files instead of the site root
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+		assert.NoError(t, packages.SetRepositoryLink(t.Context(), pvs[0].PackageID, repo.ID))
+
+		req := NewRequest(t, "GET", fmt.Sprintf("/%s/-/packages/npm/%s/%s", user.Name, url.PathEscape(packageName), packageVersion)).
+			AddBasicAuth(user.Name)
+		resp := MakeRequest(t, req, http.StatusOK)
+		doc := NewHTMLParser(t, resp.Body)
+		rendered, _ := doc.Find(".markup.markdown").Html()
+		assertHTMLEq(t, `<p dir="auto"><a href="/user2/repo1/src/branch/master/package-subdir/docs/usage.md" rel="nofollow">docs</a>
+<a href="/user2/repo1/src/branch/master/package-subdir/logo.png" rel="nofollow noopener" target="_blank"><img src="/user2/repo1/media/branch/master/package-subdir/logo.png" alt="logo" loading="lazy"/></a></p>
+`, rendered)
+	})
+
+	t.Run("Deprecate", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		deprecationMessage := "critical bug fixed in v0.2.3"
+		buildDeprecate := func(message string) string {
+			return `{
+				"_id": "` + packageName + `",
+				"name": "` + packageName + `",
+				"versions": {
+					"` + packageVersion + `": {
+						"name": "` + packageName + `",
+						"version": "` + packageVersion + `",
+						"deprecated": "` + message + `"
+					}
+				}
+			}`
+		}
+
+		req := NewRequestWithBody(t, "PUT", root, strings.NewReader(buildDeprecate(deprecationMessage))).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		req = NewRequest(t, "GET", root).AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		result := DecodeJSON(t, resp, &npm.PackageMetadata{})
+
+		assert.Contains(t, result.Versions, packageVersion)
+		assert.Equal(t, deprecationMessage, result.Versions[packageVersion].Deprecated)
+
+		// Empty deprecation message clears the flag (undeprecate).
+		req = NewRequestWithBody(t, "PUT", root, strings.NewReader(buildDeprecate(""))).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		req = NewRequest(t, "GET", root).AddTokenAuth(token)
+		resp = MakeRequest(t, req, http.StatusOK)
+		result = DecodeJSON(t, resp, &npm.PackageMetadata{})
+		assert.Empty(t, result.Versions[packageVersion].Deprecated)
+
+		// Unknown versions are silently skipped (idempotent); the known
+		// version is still updated.
+		mixedBody := `{
+			"_id": "` + packageName + `",
+			"name": "` + packageName + `",
+			"versions": {
+				"` + packageVersion + `": {
+					"name": "` + packageName + `",
+					"version": "` + packageVersion + `",
+					"deprecated": "` + deprecationMessage + `"
+				},
+				"99.99.99": {
+					"name": "` + packageName + `",
+					"version": "99.99.99",
+					"deprecated": "ghost"
+				}
+			}
+		}`
+		req = NewRequestWithBody(t, "PUT", root, strings.NewReader(mixedBody)).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		req = NewRequest(t, "GET", root).AddTokenAuth(token)
+		resp = MakeRequest(t, req, http.StatusOK)
+		result = DecodeJSON(t, resp, &npm.PackageMetadata{})
+		assert.Equal(t, deprecationMessage, result.Versions[packageVersion].Deprecated)
+		assert.NotContains(t, result.Versions, "99.99.99")
+
+		// Restore the cleared state for subsequent subtests.
+		req = NewRequestWithBody(t, "PUT", root, strings.NewReader(buildDeprecate(""))).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		// A user who has no write access to the URL owner's packages must
+		// be rejected by reqPackageAccess before deprecatePackage runs.
+		otherUser := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
+		otherToken := "Bearer " + getTokenForLoggedInUser(t, loginUser(t, otherUser.Name), auth_model.AccessTokenScopeWritePackage)
+		req = NewRequestWithBody(t, "PUT", root, strings.NewReader(buildDeprecate(deprecationMessage))).
+			AddTokenAuth(otherToken)
+		MakeRequest(t, req, http.StatusUnauthorized)
+	})
+
+	t.Run("UploadHasShrinkwrapClaim", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		// The tarball in `data` does not contain npm-shrinkwrap.json.
+		// Even when the client claims _hasShrinkwrap: true, the
+		// authoritative tarball scan must overrule the claim.
+		claimPackageName := "@scope/test-shrinkwrap-claim"
+		claimVersion := "1.0.0"
+		claimRoot := fmt.Sprintf("/api/packages/%s/npm/%s", user.Name, url.PathEscape(claimPackageName))
+		body := `{
+			"_id": "` + claimPackageName + `",
+			"name": "` + claimPackageName + `",
+			"versions": {
+				"` + claimVersion + `": {
+					"name": "` + claimPackageName + `",
+					"version": "` + claimVersion + `",
+					"_hasShrinkwrap": true,
+					"dist": {
+						"integrity": "` + integrity + `",
+						"shasum": "` + sha1SumHex + `"
+					}
+				}
+			},
+			"_attachments": {
+				"` + claimPackageName + `-` + claimVersion + `.tgz": {
+					"data": "` + attachmentData + `"
+				}
+			}
+		}`
+		req := NewRequestWithBody(t, "PUT", claimRoot, strings.NewReader(body)).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusCreated)
+
+		req = NewRequest(t, "GET", claimRoot).AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+		result := DecodeJSON(t, resp, &npm.PackageMetadata{})
+		require.Contains(t, result.Versions, claimVersion)
+		assert.False(t, result.Versions[claimVersion].HasShrinkwrap, "client-claimed _hasShrinkwrap must be overridden by tarball scan")
+
+		// Clean up so the subsequent Delete subtest's version counts match.
+		req = NewRequest(t, "DELETE", claimRoot+"/-rev/dummy").AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequestWithBody(t, "PUT", root, strings.NewReader(buildUpload(packageVersion+"-dummy"))).
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusCreated)
+
+		req = NewRequest(t, "PUT", root+"/-rev/dummy")
+		MakeRequest(t, req, http.StatusUnauthorized)
+
+		req = NewRequest(t, "PUT", root+"/-rev/dummy").
+			AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		t.Run("Version", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 2)
+
+			req := NewRequest(t, "DELETE", fmt.Sprintf("%s/-/%s/%s/-rev/dummy", root, packageVersion, filename))
+			MakeRequest(t, req, http.StatusUnauthorized)
+
+			req = NewRequest(t, "DELETE", fmt.Sprintf("%s/-/%s/-rev/dummy", root, filename)).
+				AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusOK)
+
+			pvs, err = packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
+		})
+
+		t.Run("Full", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
+
+			req := NewRequest(t, "DELETE", root+"/-rev/dummy")
+			MakeRequest(t, req, http.StatusUnauthorized)
+
+			req = NewRequest(t, "DELETE", root+"/-rev/dummy").
+				AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusOK)
+
+			pvs, err = packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeNpm)
+			assert.NoError(t, err)
+			assert.Empty(t, pvs)
+		})
+	})
+}

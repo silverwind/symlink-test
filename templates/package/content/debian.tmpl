@@ -1,0 +1,63 @@
+{{if eq .PackageDescriptor.Package.Type "debian"}}
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "packages.installation"}}</h4>
+	<div class="ui attached segment">
+		<div class="ui form">
+			<div class="field">
+				<label>{{svg "octicon-terminal"}} {{ctx.Locale.Tr "packages.debian.registry"}}</label>
+				{{$.PackageVersionSetupManual}}
+			</div>
+			<div class="field">
+				<label>{{svg "octicon-terminal"}} {{ctx.Locale.Tr "packages.debian.install"}}</label>
+				<div class="markup">
+					<pre class="code-block"><code>sudo apt install {{$.PackageDescriptor.Package.Name}}={{$.PackageDescriptor.Version.Version}}</code></pre>
+				</div>
+			</div>
+			<div class="field">
+				<label>{{ctx.Locale.Tr "packages.registry.documentation" "Debian" "https://docs.gitea.com/usage/packages/debian/"}}</label>
+			</div>
+		</div>
+	</div>
+
+	{{$viewData := $.PackageVersionViewData}}
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "packages.debian.repository"}}</h4>
+	<div class="ui attached segment">
+		<table class="ui single line very basic table">
+			<tbody>
+				<tr>
+					<td class="collapsing"><h5>{{ctx.Locale.Tr "packages.debian.repository.distributions"}}</h5></td>
+					<td>{{StringUtils.Join $viewData.Distributions ", "}}</td>
+				</tr>
+				<tr>
+					<td class="collapsing"><h5>{{ctx.Locale.Tr "packages.debian.repository.components"}}</h5></td>
+					<td>{{StringUtils.Join $viewData.Components ", "}}</td>
+				</tr>
+				<tr>
+					<td class="collapsing"><h5>{{ctx.Locale.Tr "packages.debian.repository.architectures"}}</h5></td>
+					<td>{{StringUtils.Join $viewData.Architectures ", "}}</td>
+				</tr>
+			</tbody>
+		</table>
+	</div>
+
+	{{if .PackageDescriptor.Metadata.Description}}
+		<h4 class="ui top attached header">{{ctx.Locale.Tr "packages.about"}}</h4>
+		<div class="ui attached segment">
+			{{.PackageDescriptor.Metadata.Description}}
+		</div>
+	{{end}}
+
+	{{if .PackageDescriptor.Metadata.Dependencies}}
+		<h4 class="ui top attached header">{{ctx.Locale.Tr "packages.dependencies"}}</h4>
+		<div class="ui attached segment">
+			<table class="ui single line very basic table">
+				<tbody>
+					{{range .PackageDescriptor.Metadata.Dependencies}}
+						<tr>
+							<td>{{.}}</td>
+						</tr>
+					{{end}}
+				</tbody>
+			</table>
+		</div>
+	{{end}}
+{{end}}

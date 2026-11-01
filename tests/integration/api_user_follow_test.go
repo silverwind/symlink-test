@@ -1,0 +1,110 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"fmt"
+	"net/http"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAPIFollow(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	user1 := "user4"
+	user2 := "user1"
+
+	session1 := loginUser(t, user1)
+	token1 := getTokenForLoggedInUser(t, session1, auth_model.AccessTokenScopeReadUser)
+
+	session2 := loginUser(t, user2)
+	token2 := getTokenForLoggedInUser(t, session2, auth_model.AccessTokenScopeWriteUser)
+
+	t.Run("Follow", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "PUT", "/api/v1/user/following/"+user1).
+			AddTokenAuth(token2)
+		MakeRequest(t, req, http.StatusNoContent)
+
+		// blocked user can't follow blocker
+		user34 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 34})
+		req = NewRequest(t, "PUT", "/api/v1/user/following/user2").
+			AddTokenAuth(getUserToken(t, user34.Name, auth_model.AccessTokenScopeWriteUser))
+		MakeRequest(t, req, http.StatusForbidden)
+
+		// reserved users can't be followed
+		_, err := db.GetEngine(t.Context()).Insert(&user_model.User{Name: "reserved-user", LowerName: "reserved-user", Type: user_model.UserTypeUserReserved})
+		require.NoError(t, err)
+		req = NewRequest(t, "PUT", "/api/v1/user/following/reserved-user").
+			AddTokenAuth(token2)
+		MakeRequest(t, req, http.StatusBadRequest)
+	})
+
+	for _, list := range []struct {
+		name     string
+		url      string
+		token    string
+		username string
+	}{
+		{"ListFollowing", fmt.Sprintf("/api/v1/users/%s/following", user2), token2, user1},
+		{"ListMyFollowing", "/api/v1/user/following", token2, user1},
+		{"ListFollowers", fmt.Sprintf("/api/v1/users/%s/followers", user1), token1, user2},
+		{"ListMyFollowers", "/api/v1/user/followers", token1, user2},
+	} {
+		t.Run(list.name, func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequest(t, "GET", list.url).
+				AddTokenAuth(list.token)
+			resp := MakeRequest(t, req, http.StatusOK)
+
+			users := DecodeJSON(t, resp, []api.User{})
+			assert.Len(t, users, 1)
+			assert.Equal(t, list.username, users[0].UserName)
+		})
+	}
+
+	t.Run("CheckFollowing", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "GET", fmt.Sprintf("/api/v1/users/%s/following/%s", user2, user1)).
+			AddTokenAuth(token2)
+		MakeRequest(t, req, http.StatusNoContent)
+
+		req = NewRequest(t, "GET", fmt.Sprintf("/api/v1/users/%s/following/%s", user1, user2)).
+			AddTokenAuth(token2)
+		MakeRequest(t, req, http.StatusNotFound)
+	})
+
+	t.Run("CheckMyFollowing", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "GET", "/api/v1/user/following/"+user1).
+			AddTokenAuth(token2)
+		MakeRequest(t, req, http.StatusNoContent)
+
+		req = NewRequest(t, "GET", "/api/v1/user/following/"+user2).
+			AddTokenAuth(token1)
+		MakeRequest(t, req, http.StatusNotFound)
+	})
+
+	t.Run("Unfollow", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequest(t, "DELETE", "/api/v1/user/following/"+user1).
+			AddTokenAuth(token2)
+		MakeRequest(t, req, http.StatusNoContent)
+	})
+}

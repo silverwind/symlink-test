@@ -1,0 +1,116 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package common
+
+import (
+	"fmt"
+	"net/http"
+
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/gtprof"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/public"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/web/routing"
+	"gitea.dev/services/context"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// ProtocolMiddlewares returns HTTP protocol related middlewares, and it provides a global panic recovery
+func ProtocolMiddlewares() (handlers []any) {
+	// the order is important
+	handlers = append(handlers, ChiRoutePathHandler())   // make sure chi has correct paths
+	handlers = append(handlers, RequestContextHandler()) //	prepare the context and panic recovery
+	handlers = append(handlers, SecurityHeadersHandler())
+
+	if setting.ReverseProxyLimit > 0 && len(setting.ReverseProxyTrustedProxies) > 0 {
+		handlers = append(handlers, ForwardedHeadersHandler(setting.ReverseProxyLimit, setting.ReverseProxyTrustedProxies))
+	}
+
+	handlers = append(handlers, routing.NewRequestInfoHandler())
+
+	if setting.IsAccessLogEnabled() {
+		handlers = append(handlers, context.AccessLogger())
+	}
+
+	if !setting.IsProd {
+		handlers = append(handlers, public.ViteDevMiddleware)
+	}
+
+	return handlers
+}
+
+// SecurityHeadersHandler sets headers globally for every response that leaves Gitea.
+func SecurityHeadersHandler() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			if setting.Security.XContentTypeOptions != "unset" {
+				resp.Header().Set("X-Content-Type-Options", setting.Security.XContentTypeOptions)
+			}
+			if setting.Security.XFrameOptions != "unset" {
+				resp.Header().Set("X-Frame-Options", setting.Security.XFrameOptions)
+			}
+			next.ServeHTTP(resp, req)
+		})
+	}
+}
+
+func RequestContextHandler() func(h http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(respOrig http.ResponseWriter, req *http.Request) {
+			// this response writer might not be the same as the one in context.Base.Resp
+			// because there might be a "gzip writer" in the middle, so the "written size" here is the compressed size
+			respWriter := context.WrapResponseWriter(respOrig)
+
+			profDesc := fmt.Sprintf("HTTP: %s %s", req.Method, req.RequestURI)
+			ctx, finished := reqctx.NewRequestContext(req.Context(), profDesc)
+			defer finished()
+
+			ctx, span := gtprof.GetTracer().Start(ctx, gtprof.TraceSpanHTTP)
+			req = req.WithContext(ctx)
+			defer func() {
+				chiCtx := chi.RouteContext(req.Context())
+				span.SetAttributeString(gtprof.TraceAttrHTTPRoute, chiCtx.RoutePattern())
+				span.End()
+			}()
+
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					renderPanicErrorPage(respWriter, req, recovered) // it should never panic, and it handles the stack trace internally
+				}
+			}()
+
+			ctx = cache.WithCacheContext(req.Context())
+			req = httplib.RequestWithContext(req, reqctx.FromContext(ctx))
+			next.ServeHTTP(respWriter, req)
+		})
+	}
+}
+
+func ChiRoutePathHandler() func(h http.Handler) http.Handler {
+	// make sure chi uses EscapedPath(RawPath) as RoutePath, then "%2f" could be handled correctly
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			chiCtx := chi.RouteContext(req.Context())
+			if req.URL.RawPath == "" {
+				chiCtx.RoutePath = req.URL.EscapedPath()
+			} else {
+				chiCtx.RoutePath = req.URL.RawPath
+			}
+			next.ServeHTTP(resp, req)
+		})
+	}
+}
+
+func MustInitSessioner() func(next http.Handler) http.Handler {
+	middleware, err := session.Sessioner()
+	if err != nil {
+		log.Fatal("common.Sessioner failed: %v", err)
+	}
+	return middleware
+}

@@ -1,0 +1,17 @@
+-
+  id: 1
+  setting_key: 'picture.disable_gravatar'
+  setting_value: 'true'
+  version: 1
+  created: 1653533198
+  updated: 1653533198
+
+-
+  id: 2
+  setting_key: 'picture.enable_federated_avatar'
+  setting_value: 'false'
+  version: 1
+  created: 1653533198
+  updated: 1653533198
+
+# DO NOT add more test data in the fixtures, test case should prepare their own test data separately and clearly

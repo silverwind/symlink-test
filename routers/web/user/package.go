@@ -1,0 +1,605 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package user
+
+import (
+	gocontext "context"
+	"errors"
+	"net/http"
+	"net/url"
+	"time"
+	"uuid"
+
+	"gitea.dev/models/db"
+	org_model "gitea.dev/models/organization"
+	packages_model "gitea.dev/models/packages"
+	container_model "gitea.dev/models/packages/container"
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/optional"
+	alpine_module "gitea.dev/modules/packages/alpine"
+	arch_module "gitea.dev/modules/packages/arch"
+	container_module "gitea.dev/modules/packages/container"
+	rpm_module "gitea.dev/modules/packages/rpm"
+	terraform_module "gitea.dev/modules/packages/terraform"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	packages_helper "gitea.dev/routers/api/packages/helper"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
+	packages_service "gitea.dev/services/packages"
+	container_service "gitea.dev/services/packages/container"
+)
+
+const (
+	tplPackagesList       templates.TplName = "user/overview/packages"
+	tplPackagesView       templates.TplName = "package/view"
+	tplPackageVersionList templates.TplName = "user/overview/package_versions"
+	tplPackagesSettings   templates.TplName = "package/settings"
+)
+
+// ListPackages displays a list of all packages of the context user
+func ListPackages(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+	page := max(ctx.FormInt("page"), 1)
+	query := ctx.FormTrim("q")
+	packageType := ctx.FormTrim("type")
+
+	pvs, total, err := packages_model.SearchLatestVersions(ctx, &packages_model.PackageSearchOptions{
+		Paginator: &db.ListOptions{
+			PageSize: setting.UI.PackagesPagingNum,
+			Page:     page,
+		},
+		OwnerID:    ctx.ContextUser.ID,
+		Type:       packages_model.Type(packageType),
+		Name:       packages_model.SearchValue{Value: query},
+		IsInternal: optional.Some(false),
+	})
+	if err != nil {
+		ctx.ServerError("SearchLatestVersions", err)
+		return
+	}
+
+	pds, err := packages_model.GetPackageDescriptors(ctx, pvs)
+	if err != nil {
+		ctx.ServerError("GetPackageDescriptors", err)
+		return
+	}
+
+	repositoryAccessMap := make(map[int64]bool)
+	for _, pd := range pds {
+		if pd.Repository == nil {
+			continue
+		}
+		if _, has := repositoryAccessMap[pd.Repository.ID]; has {
+			continue
+		}
+
+		permission, err := access_model.GetDoerRepoPermission(ctx, pd.Repository, ctx.Doer)
+		if err != nil {
+			ctx.ServerError("GetDoerRepoPermission", err)
+			return
+		}
+		repositoryAccessMap[pd.Repository.ID] = permission.HasAnyUnitAccess()
+	}
+
+	hasPackages, err := packages_model.HasOwnerPackages(ctx, ctx.ContextUser.ID)
+	if err != nil {
+		ctx.ServerError("HasOwnerPackages", err)
+		return
+	}
+
+	ctx.Data["Title"] = ctx.Tr("packages.title")
+	ctx.Data["IsPackagesPage"] = true
+	ctx.Data["Query"] = query
+	ctx.Data["PackageType"] = packageType
+	ctx.Data["AvailableTypes"] = packages_model.TypeList
+	ctx.Data["HasPackages"] = hasPackages
+	ctx.Data["PackageDescriptors"] = pds
+	ctx.Data["Total"] = total
+	ctx.Data["RepositoryAccessMap"] = repositoryAccessMap
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	// TODO: context/org -> HandleOrgAssignment() can not be used
+	if ctx.ContextUser.IsOrganization() {
+		org := org_model.OrgFromUser(ctx.ContextUser)
+		ctx.Data["Org"] = org
+		ctx.Data["OrgLink"] = ctx.ContextUser.OrganisationLink()
+
+		if ctx.Doer != nil {
+			ctx.Data["IsOrganizationMember"], _ = org_model.IsOrganizationMember(ctx, org.ID, ctx.Doer.ID)
+			ctx.Data["IsOrganizationOwner"], _ = org_model.IsOrganizationOwner(ctx, org.ID, ctx.Doer.ID)
+		} else {
+			ctx.Data["IsOrganizationMember"] = false
+			ctx.Data["IsOrganizationOwner"] = false
+		}
+	}
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(setting.UI.PackagesPagingNum).CurPage(page).Build()
+	ctx.Data["Page"] = pager
+	ctx.HTML(http.StatusOK, tplPackagesList)
+}
+
+// RedirectToLastVersion redirects to the latest package version
+func RedirectToLastVersion(ctx *context.Context) {
+	p, err := packages_model.GetPackageByName(ctx, ctx.Package.Owner.ID, packages_model.Type(ctx.PathParam("type")), ctx.PathParam("name"))
+	if err != nil {
+		if err == packages_model.ErrPackageNotExist {
+			ctx.NotFound(err)
+		} else {
+			ctx.ServerError("GetPackageByName", err)
+		}
+		return
+	}
+
+	pvs, _, err := packages_model.SearchLatestVersions(ctx, &packages_model.PackageSearchOptions{
+		PackageID:  p.ID,
+		IsInternal: optional.Some(false),
+	})
+	if err != nil {
+		ctx.ServerError("GetPackageByName", err)
+		return
+	}
+	if len(pvs) == 0 {
+		ctx.NotFound(err)
+		return
+	}
+
+	pd, err := packages_model.GetPackageDescriptor(ctx, pvs[0])
+	if err != nil {
+		ctx.ServerError("GetPackageDescriptor", err)
+		return
+	}
+	ctx.Redirect(pd.VersionWebLink())
+}
+
+func viewPackageContainerImage(ctx gocontext.Context, pd *packages_model.PackageDescriptor, digest string) (*container_module.Metadata, error) {
+	manifestBlob, err := container_model.GetContainerBlob(ctx, &container_model.BlobSearchOptions{
+		OwnerID: pd.Owner.ID,
+		Image:   pd.Package.LowerName,
+		Digest:  digest,
+	})
+	if err != nil {
+		return nil, err
+	}
+	manifestReader, err := packages_service.OpenBlobStream(manifestBlob.Blob)
+	if err != nil {
+		return nil, err
+	}
+	defer manifestReader.Close()
+	_, _, metadata, err := container_service.ParseManifestMetadata(ctx, manifestReader, pd.Owner.ID, pd.Package.LowerName)
+	return metadata, err
+}
+
+// ViewPackageVersion displays a single package version
+func ViewPackageVersion(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	versionSub := ctx.PathParam("version_sub")
+	pd := ctx.Package.Descriptor
+	ctx.Data["Title"] = pd.Package.Name
+	ctx.Data["IsPackagesPage"] = true
+	ctx.Data["PackageDescriptor"] = pd
+
+	registryHostURL, err := url.Parse(httplib.GuessCurrentHostURL(ctx))
+	if err != nil {
+		registryHostURL, _ = url.Parse(setting.AppURL)
+	}
+	ctx.Data["PackageRegistryHost"] = registryHostURL.Host
+
+	switch pd.Package.Type {
+	case packages_model.TypeAlpine:
+		branches := make(container.Set[string])
+		repositories := make(container.Set[string])
+		architectures := make(container.Set[string])
+
+		for _, f := range pd.Files {
+			for _, pp := range f.Properties {
+				switch pp.Name {
+				case alpine_module.PropertyBranch:
+					branches.Add(pp.Value)
+				case alpine_module.PropertyRepository:
+					repositories.Add(pp.Value)
+				case alpine_module.PropertyArchitecture:
+					architectures.Add(pp.Value)
+				}
+			}
+		}
+
+		ctx.Data["Branches"] = util.Sorted(branches.Values())
+		ctx.Data["Repositories"] = util.Sorted(repositories.Values())
+		ctx.Data["Architectures"] = util.Sorted(architectures.Values())
+	case packages_model.TypeArch:
+		repositories := make(container.Set[string])
+		architectures := make(container.Set[string])
+
+		for _, f := range pd.Files {
+			for _, pp := range f.Properties {
+				switch pp.Name {
+				case arch_module.PropertyRepository:
+					repositories.Add(pp.Value)
+				case arch_module.PropertyArchitecture:
+					architectures.Add(pp.Value)
+				}
+			}
+		}
+
+		ctx.Data["Repositories"] = util.Sorted(repositories.Values())
+		ctx.Data["Architectures"] = util.Sorted(architectures.Values())
+	case packages_model.TypeRpm:
+		groups := make(container.Set[string])
+		architectures := make(container.Set[string])
+
+		for _, f := range pd.Files {
+			for _, pp := range f.Properties {
+				switch pp.Name {
+				case rpm_module.PropertyGroup:
+					groups.Add(pp.Value)
+				case rpm_module.PropertyArchitecture:
+					architectures.Add(pp.Value)
+				}
+			}
+		}
+
+		ctx.Data["Groups"] = util.Sorted(groups.Values())
+		ctx.Data["Architectures"] = util.Sorted(architectures.Values())
+	case packages_model.TypeContainer:
+		imageMetadata := pd.Metadata
+		if versionSub != "" {
+			imageMetadata, err = viewPackageContainerImage(ctx, pd, versionSub)
+			if errors.Is(err, util.ErrNotExist) {
+				ctx.NotFound(nil)
+				return
+			} else if err != nil {
+				ctx.ServerError("viewPackageContainerImage", err)
+				return
+			}
+		}
+		ctx.Data["ContainerImageMetadata"] = imageMetadata
+	}
+	var pvs []*packages_model.PackageVersion
+	var pvsTotal int64
+	if pd.Package.Type == packages_model.TypeContainer {
+		pvs, pvsTotal, err = container_model.SearchImageTags(ctx, &container_model.ImageTagsSearchOptions{
+			Paginator: db.NewAbsoluteListOptions(0, 5),
+			PackageID: pd.Package.ID,
+			IsTagged:  true,
+		})
+	} else {
+		pvs, pvsTotal, err = packages_model.SearchVersions(ctx, &packages_model.PackageSearchOptions{
+			Paginator:  db.NewAbsoluteListOptions(0, 5),
+			PackageID:  pd.Package.ID,
+			IsInternal: optional.Some(false),
+		})
+	}
+	if err != nil {
+		ctx.ServerError("", err)
+		return
+	}
+	ctx.Data["LatestVersions"] = pvs
+	ctx.Data["TotalVersionCount"] = pvsTotal
+	pkgSpec := packages_service.GetSpecManager().Get(pd.Package.Type)
+	viewData, err := pkgSpec.GetViewPackageVersionData(ctx, pd)
+	if err != nil {
+		ctx.ServerError("GetViewPackageVersionData", err)
+		return
+	}
+
+	ctx.Data["PackageVersionViewData"] = viewData
+	ctx.Data["PackageVersionSetupManual"] = pkgSpec.RenderSetupManual(ctx, pd, viewData)
+	ctx.Data["CanWritePackages"] = ctx.Package.AccessMode >= perm.AccessModeWrite
+
+	hasRepositoryAccess := false
+	if pd.Repository != nil {
+		permission, err := access_model.GetDoerRepoPermission(ctx, pd.Repository, ctx.Doer)
+		if err != nil {
+			ctx.ServerError("GetDoerRepoPermission", err)
+			return
+		}
+		hasRepositoryAccess = permission.HasAnyUnitAccess()
+	}
+	ctx.Data["HasRepositoryAccess"] = hasRepositoryAccess
+	ctx.HTML(http.StatusOK, tplPackagesView)
+}
+
+// ListPackageVersions lists all versions of a package
+func ListPackageVersions(ctx *context.Context) {
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	p, err := packages_model.GetPackageByName(ctx, ctx.Package.Owner.ID, packages_model.Type(ctx.PathParam("type")), ctx.PathParam("name"))
+	if err != nil {
+		if err == packages_model.ErrPackageNotExist {
+			ctx.NotFound(err)
+		} else {
+			ctx.ServerError("GetPackageByName", err)
+		}
+		return
+	}
+
+	page := max(ctx.FormInt("page"), 1)
+	pagination := &db.ListOptions{
+		PageSize: setting.UI.PackagesPagingNum,
+		Page:     page,
+	}
+
+	query := ctx.FormTrim("q")
+	sort := ctx.FormTrim("sort")
+
+	ctx.Data["Title"] = ctx.Tr("packages.title")
+	ctx.Data["IsPackagesPage"] = true
+	ctx.Data["PackageDescriptor"] = &packages_model.PackageDescriptor{
+		Package: p,
+		Owner:   ctx.Package.Owner,
+	}
+	ctx.Data["Query"] = query
+	ctx.Data["Sort"] = sort
+
+	var (
+		total int64
+		pvs   []*packages_model.PackageVersion
+	)
+	switch p.Type {
+	case packages_model.TypeContainer:
+		tagged := ctx.FormTrim("tagged")
+
+		ctx.Data["Tagged"] = tagged
+
+		pvs, total, err = container_model.SearchImageTags(ctx, &container_model.ImageTagsSearchOptions{
+			Paginator: pagination,
+			PackageID: p.ID,
+			Query:     query,
+			IsTagged:  tagged == "" || tagged == "tagged",
+			Sort:      sort,
+		})
+		if err != nil {
+			ctx.ServerError("SearchImageTags", err)
+			return
+		}
+	default:
+		pvs, total, err = packages_model.SearchVersions(ctx, &packages_model.PackageSearchOptions{
+			Paginator: pagination,
+			PackageID: p.ID,
+			Version: packages_model.SearchValue{
+				ExactMatch: false,
+				Value:      query,
+			},
+			IsInternal: optional.Some(false),
+			Sort:       sort,
+		})
+		if err != nil {
+			ctx.ServerError("SearchVersions", err)
+			return
+		}
+	}
+
+	ctx.Data["PackageDescriptors"], err = packages_model.GetPackageDescriptors(ctx, pvs)
+	if err != nil {
+		ctx.ServerError("GetPackageDescriptors", err)
+		return
+	}
+
+	ctx.Data["Total"] = total
+
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(setting.UI.PackagesPagingNum).CurPage(page).Build()
+	ctx.Data["Page"] = pager
+
+	ctx.HTML(http.StatusOK, tplPackageVersionList)
+}
+
+// PackageSettings displays the package settings page
+func PackageSettings(ctx *context.Context) {
+	pd := ctx.Package.Descriptor
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	ctx.Data["Title"] = pd.Package.Name
+	ctx.Data["IsPackagesPage"] = true
+	ctx.Data["PackageDescriptor"] = pd
+	ctx.Data["CanWritePackages"] = ctx.Package.AccessMode >= perm.AccessModeWrite
+
+	if pd.Package.RepoID > 0 {
+		repo, err := repo_model.GetRepositoryByID(ctx, pd.Package.RepoID)
+		if err != nil {
+			ctx.ServerError("GetRepositoryByID", err)
+			return
+		}
+		ctx.Data["LinkedRepoName"] = repo.Name
+	}
+
+	ctx.HTML(http.StatusOK, tplPackagesSettings)
+}
+
+// PackageSettingsPost updates the package settings
+func PackageSettingsPost(ctx *context.Context) {
+	form := web.GetForm[*forms.PackageSettingForm](ctx)
+	switch form.Action {
+	case "link":
+		packageSettingsPostActionLink(ctx, form)
+	case "delete":
+		packageSettingsPostActionDelete(ctx)
+	default:
+		ctx.NotFound(nil)
+	}
+}
+
+func packageSettingsPostActionLink(ctx *context.Context, form *forms.PackageSettingForm) {
+	pd := ctx.Package.Descriptor
+	if form.RepoName == "" { // remove the link
+		if err := packages_model.SetRepositoryLink(ctx, pd.Package.ID, 0); err != nil {
+			ctx.JSONError(ctx.Tr("packages.settings.unlink.error"))
+			return
+		}
+
+		ctx.Flash.Success(ctx.Tr("packages.settings.unlink.success"))
+		ctx.JSONRedirect("")
+		return
+	}
+
+	repo, err := repo_model.GetRepositoryByName(ctx, pd.Owner.ID, form.RepoName)
+	if err != nil {
+		if repo_model.IsErrRepoNotExist(err) {
+			ctx.JSONError(ctx.Tr("packages.settings.link.repo_not_found", form.RepoName))
+		} else {
+			ctx.ServerError("GetRepositoryByOwnerAndName", err)
+		}
+		return
+	}
+
+	if err := packages_model.SetRepositoryLink(ctx, pd.Package.ID, repo.ID); err != nil {
+		ctx.JSONError(ctx.Tr("packages.settings.link.error"))
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("packages.settings.link.success"))
+	ctx.JSONRedirect("")
+}
+
+func packageSettingsPostActionDelete(ctx *context.Context) {
+	pd := ctx.Package.Descriptor
+
+	if ctx.FormString("package_name") != pd.Package.Name {
+		ctx.Flash.Error(ctx.Tr("packages.settings.delete.invalid_package_name"))
+		ctx.Redirect(pd.PackageSettingsLink())
+		return
+	}
+	if err := packages_service.RemovePackage(ctx, ctx.Doer, pd.Package); err != nil {
+		errTr := util.ErrorAsTranslatable(err)
+		if errTr == nil {
+			ctx.ServerError("RemovePackage", err)
+			return
+		}
+		ctx.Flash.Error(errTr.Translate(ctx.Locale))
+		ctx.Redirect(pd.PackageSettingsLink())
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("packages.settings.delete.success"))
+	ctx.Redirect(ctx.Package.Owner.HomeLink() + "/-/packages")
+}
+
+// PackageVersionDelete deletes a package version
+func PackageVersionDelete(ctx *context.Context) {
+	pd := ctx.Package.Descriptor
+	if pd.Version == nil {
+		ctx.NotFound(nil)
+		return
+	}
+
+	if err := packages_service.RemovePackageVersion(ctx, ctx.Doer, pd.Version); err != nil {
+		errTr := util.ErrorAsTranslatable(err)
+		if errTr == nil {
+			ctx.ServerError("RemovePackageVersion", err)
+			return
+		}
+		ctx.Flash.Error(errTr.Translate(ctx.Locale))
+	} else {
+		ctx.Flash.Success(ctx.Tr("packages.settings.delete.version.success"))
+	}
+
+	// redirect to the package if there are still versions available
+	redirectURL := ctx.Package.Owner.HomeLink() + "/-/packages"
+	if has, _ := packages_model.ExistVersion(ctx, &packages_model.PackageSearchOptions{PackageID: pd.Package.ID, IsInternal: optional.Some(false)}); has {
+		redirectURL = pd.PackageWebLink()
+	}
+	ctx.Redirect(redirectURL)
+}
+
+// DownloadPackageFile serves the content of a package file
+func DownloadPackageFile(ctx *context.Context) {
+	pf, err := packages_model.GetFileForVersionByID(ctx, ctx.Package.Descriptor.Version.ID, ctx.PathParamInt64("fileid"))
+	if err != nil {
+		if errors.Is(err, packages_model.ErrPackageFileNotExist) {
+			ctx.NotFound(err)
+		} else {
+			ctx.ServerError("GetFileForVersionByID", err)
+		}
+		return
+	}
+
+	s, u, _, err := packages_service.OpenFileForDownload(ctx, pf, ctx.Req.Method)
+	if err != nil {
+		ctx.ServerError("OpenFileForDownload", err)
+		return
+	}
+
+	packages_helper.ServePackageFile(ctx, s, u, pf, httplib.ServeHeaderOptions{
+		Filename:           pf.Name,
+		LastModified:       pf.CreatedUnix.AsLocalTime(),
+		ContentDisposition: httplib.ContentDispositionAttachment,
+	})
+}
+
+// ActionPackageTerraformLock locks a terraform state
+func ActionPackageTerraformLock(ctx *context.Context) {
+	pd := ctx.Package.Descriptor
+	if pd.Package.Type != packages_model.TypeTerraformState {
+		ctx.NotFound(nil)
+		return
+	}
+
+	existingLock, err := terraform_module.GetLock(ctx, pd.Package.ID)
+	if err != nil {
+		ctx.ServerError("GetLock", err)
+		return
+	}
+	if existingLock.IsLocked() {
+		ctx.Flash.Error(ctx.Tr("packages.terraform.lock.error.already_locked"))
+		ctx.Redirect(pd.VersionWebLink())
+		return
+	}
+
+	lockID := uuid.New().String()
+	lockInfo := &terraform_module.LockInfo{
+		ID:        lockID,
+		Operation: "Manual UI Lock",
+		Who:       ctx.Doer.Name,
+		Created:   time.Now(),
+	}
+
+	if err := terraform_module.SetLock(ctx, pd.Package.ID, lockInfo); err != nil {
+		ctx.ServerError("SetLock", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("packages.terraform.lock.success"))
+	ctx.Redirect(pd.VersionWebLink())
+}
+
+// ActionPackageTerraformUnlock unlocks a terraform state
+func ActionPackageTerraformUnlock(ctx *context.Context) {
+	pd := ctx.Package.Descriptor
+	if pd.Package.Type != packages_model.TypeTerraformState {
+		ctx.NotFound(nil)
+		return
+	}
+
+	if err := terraform_module.RemoveLock(ctx, pd.Package.ID); err != nil {
+		ctx.ServerError("RemoveLock", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("packages.terraform.unlock.success"))
+	ctx.Redirect(pd.VersionWebLink())
+}

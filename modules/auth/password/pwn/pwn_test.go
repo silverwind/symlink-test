@@ -1,0 +1,73 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package pwn
+
+import (
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+type mockTransport struct{}
+
+func (mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != "api.pwnedpasswords.com" {
+		return nil, errors.New("unsupported host")
+	}
+	respMap := map[string]string{
+		"/range/5c1d8": "EAF2F254732680E8AC339B84F3266ECCBB5:1\r\nFC446EB88938834178CB9322C1EE273C2A7:2",
+		"/range/ba189": "FD4CB34F0378BCB15D23F6FFD28F0775C9E:3\r\nFDF342FCD8C3611DAE4D76E8A992A3E4169:4",
+		"/range/a1733": "C4CE0F1F0062B27B9E2F41AF0C08218017C:1\r\nFC446EB88938834178CB9322C1EE273C2A7:2\r\nFE81480327C992FE62065A827429DD1318B:0",
+		"/range/5617b": "FD4CB34F0378BCB15D23F6FFD28F0775C9E:3\r\nFDF342FCD8C3611DAE4D76E8A992A3E4169:4\r\nFE81480327C992FE62065A827429DD1318B:0",
+		"/range/79082": "FDF342FCD8C3611DAE4D76E8A992A3E4169:4\r\nFE81480327C992FE62065A827429DD1318B:0\r\nAFEF386F56EB0B4BE314E07696E5E6E6536:0",
+	}
+	if req.URL.Path == "/range/b6b47" { // sha1("ratelimited") prefix
+		return &http.Response{Request: req, StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader("rate limited"))}, nil
+	}
+	if req.URL.Path == "/range/76eff" {
+		return &http.Response{Request: req, StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(strings.Repeat("0", maxResponseSize+1)))}, nil
+	}
+	if resp, ok := respMap[req.URL.Path]; ok {
+		return &http.Response{Request: req, StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(resp))}, nil
+	}
+	return nil, errors.New("unsupported path")
+}
+
+func TestPassword(t *testing.T) {
+	ctx := t.Context()
+	client := New()
+	client.mockTransport = mockTransport{}
+
+	count, err := client.CheckPassword(ctx, "", false)
+	assert.ErrorContains(t, err, "password cannot be empty")
+	assert.EqualValues(t, -1, count)
+
+	for _, test := range []struct {
+		password string
+		padding  bool
+		count    int
+	}{
+		{"pwned", false, 1},
+		{"notpwned", false, 0},
+		{"paddedpwned", true, 1},
+		{"paddednotpwned", true, 0},
+		{"paddednotpwnedzero", true, 0},
+	} {
+		count, err = client.CheckPassword(ctx, test.password, test.padding)
+		assert.NoError(t, err)
+		assert.EqualValues(t, test.count, count)
+	}
+
+	count, err = client.CheckPassword(ctx, "ratelimited", false)
+	assert.Error(t, err)
+	assert.EqualValues(t, -1, count)
+
+	count, err = client.CheckPassword(ctx, "oversized", false)
+	assert.ErrorContains(t, err, "exceeds")
+	assert.EqualValues(t, -1, count)
+}

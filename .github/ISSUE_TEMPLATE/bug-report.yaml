@@ -1,0 +1,28 @@
+name: Bug Report
+description: Something isn't working as expected.
+labels: ["type/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        - **Security issue?** Email security@gitea.io instead of opening a public issue.
+        - **Need help** with setup or configuration? Ask on [Discord](https://discord.gg/Gitea) or the [forum](https://forum.gitea.com).
+        - Search [existing issues](https://github.com/go-gitea/gitea/issues?q=is%3Aissue) first.
+  - type: input
+    id: gitea-ver
+    attributes:
+      label: Gitea Version
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What you did, what you expected to happen, and what happened instead. Include logs if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: How are you running Gitea?
+      description: Install method (binary, Docker, package), operating system, and database.

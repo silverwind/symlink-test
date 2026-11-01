@@ -1,0 +1,200 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package actions
+
+import (
+	"errors"
+	"net/http"
+
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/web"
+	shared_user "gitea.dev/routers/web/shared/user"
+	actions_service "gitea.dev/services/actions"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
+)
+
+const (
+	tplRepoVariables  templates.TplName = "repo/settings/actions"
+	tplOrgVariables   templates.TplName = "org/settings/actions"
+	tplUserVariables  templates.TplName = "user/settings/actions"
+	tplAdminVariables templates.TplName = "admin/actions"
+)
+
+type variablesCtx struct {
+	BelongingScope    actions_model.BelongingScope
+	IsRepo            bool
+	IsOrg             bool
+	IsUser            bool
+	IsGlobal          bool
+	VariablesTemplate templates.TplName
+	RedirectLink      string
+}
+
+func getVariablesCtx(ctx *context.Context) (*variablesCtx, error) {
+	if ctx.Data["PageIsRepoSettings"] == true {
+		return &variablesCtx{
+			BelongingScope:    actions_model.BelongingScopeRepo(ctx.Repo.Repository.ID),
+			IsRepo:            true,
+			VariablesTemplate: tplRepoVariables,
+			RedirectLink:      ctx.Repo.RepoLink + "/settings/actions/variables",
+		}, nil
+	}
+
+	if ctx.Data["PageIsOrgSettings"] == true {
+		if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+			ctx.ServerError("RenderUserOrgHeader", err)
+			return nil, nil //nolint:nilnil // error is already handled by ctx.ServerError
+		}
+		return &variablesCtx{
+			BelongingScope:    actions_model.BelongingScopeOwner(ctx.Org.Organization.ID),
+			IsOrg:             true,
+			VariablesTemplate: tplOrgVariables,
+			RedirectLink:      ctx.Org.OrgLink + "/settings/actions/variables",
+		}, nil
+	}
+
+	if ctx.Data["PageIsUserSettings"] == true {
+		return &variablesCtx{
+			BelongingScope:    actions_model.BelongingScopeOwner(ctx.Doer.ID),
+			IsUser:            true,
+			VariablesTemplate: tplUserVariables,
+			RedirectLink:      setting.AppSubURL + "/user/settings/actions/variables",
+		}, nil
+	}
+
+	if ctx.Data["PageIsAdmin"] == true {
+		return &variablesCtx{
+			BelongingScope:    actions_model.BelongingScopeGlobal(),
+			IsGlobal:          true,
+			VariablesTemplate: tplAdminVariables,
+			RedirectLink:      setting.AppSubURL + "/-/admin/actions/variables",
+		}, nil
+	}
+
+	return nil, errors.New("unable to set Variables context")
+}
+
+func Variables(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("actions.variables")
+	ctx.Data["PageType"] = "variables"
+	ctx.Data["PageIsSharedSettingsVariables"] = true
+
+	vCtx, err := getVariablesCtx(ctx)
+	if err != nil {
+		ctx.ServerError("getVariablesCtx", err)
+		return
+	}
+
+	variables, err := db.Find[actions_model.ActionVariable](ctx, actions_model.FindVariablesOpts{
+		BelongingScope: vCtx.BelongingScope,
+	})
+	if err != nil {
+		ctx.ServerError("FindVariables", err)
+		return
+	}
+	ctx.Data["Variables"] = variables
+	ctx.Data["DataMaxLength"] = actions_model.VariableDataMaxLength
+	ctx.Data["DescriptionMaxLength"] = actions_model.VariableDescriptionMaxLength
+	ctx.HTML(http.StatusOK, vCtx.VariablesTemplate)
+}
+
+func VariableCreate(ctx *context.Context) {
+	vCtx, err := getVariablesCtx(ctx)
+	if err != nil {
+		ctx.ServerError("getVariablesCtx", err)
+		return
+	}
+
+	if ctx.HasError() { // form binding validation error
+		ctx.JSONError(ctx.GetErrMsg())
+		return
+	}
+
+	form := web.GetForm[*forms.EditVariableForm](ctx)
+
+	v, err := actions_service.CreateVariable(ctx, vCtx.BelongingScope, form.Name, form.Data, form.Description)
+	if err != nil {
+		ctx.JSONErrorAuto(err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("actions.variables.creation.success", v.Name))
+	ctx.JSONRedirect(vCtx.RedirectLink)
+}
+
+func VariableUpdate(ctx *context.Context) {
+	vCtx, err := getVariablesCtx(ctx)
+	if err != nil {
+		ctx.ServerError("getVariablesCtx", err)
+		return
+	}
+
+	if ctx.HasError() { // form binding validation error
+		ctx.JSONError(ctx.GetErrMsg())
+		return
+	}
+
+	id := ctx.PathParamInt64("variable_id")
+
+	variable := findActionsVariable(ctx, id, vCtx)
+	if ctx.Written() {
+		return
+	}
+
+	form := web.GetForm[*forms.EditVariableForm](ctx)
+	variable.Name = form.Name
+	variable.Data = form.Data
+	variable.Description = form.Description
+
+	if _, err := actions_service.UpdateVariableNameData(ctx, variable); err != nil {
+		ctx.JSONErrorAuto(err)
+		return
+	}
+	ctx.Flash.Success(ctx.Tr("actions.variables.update.success"))
+	ctx.JSONRedirect(vCtx.RedirectLink)
+}
+
+func findActionsVariable(ctx *context.Context, id int64, vCtx *variablesCtx) *actions_model.ActionVariable {
+	opts := actions_model.FindVariablesOpts{
+		IDs:            []int64{id},
+		BelongingScope: vCtx.BelongingScope,
+	}
+	got, err := actions_model.FindVariables(ctx, opts)
+	if err != nil {
+		ctx.ServerError("FindVariables", err)
+		return nil
+	} else if len(got) == 0 {
+		ctx.NotFound(nil)
+		return nil
+	}
+	return got[0]
+}
+
+func VariableDelete(ctx *context.Context) {
+	vCtx, err := getVariablesCtx(ctx)
+	if err != nil {
+		ctx.ServerError("getVariablesCtx", err)
+		return
+	}
+
+	id := ctx.PathParamInt64("variable_id")
+
+	variable := findActionsVariable(ctx, id, vCtx)
+	if ctx.Written() {
+		return
+	}
+
+	if err := actions_service.DeleteVariableByID(ctx, variable.ID); err != nil {
+		log.Error("Delete variable [%d] failed: %v", id, err)
+		ctx.JSONError(ctx.Tr("actions.variables.deletion.failed"))
+		return
+	}
+	ctx.Flash.Success(ctx.Tr("actions.variables.deletion.success"))
+	ctx.JSONRedirect(vCtx.RedirectLink)
+}

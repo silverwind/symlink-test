@@ -1,0 +1,107 @@
+<h4 class="ui top attached header">
+	{{ctx.Locale.Tr "actions.variables.management"}}
+	<div class="ui right">
+		<button type="button" class="ui primary tiny button show-modal"
+			data-modal="#edit-variable-modal"
+			data-modal-form.url="{{.Link}}/new"
+			data-modal-header="{{ctx.Locale.Tr "actions.variables.creation"}}"
+			data-modal-dialog-variable-name=""
+			data-modal-dialog-variable-data=""
+			data-modal-dialog-variable-description=""
+		>
+			{{ctx.Locale.Tr "actions.variables.creation"}}
+		</button>
+	</div>
+</h4>
+<div class="ui attached segment">
+	{{if .Variables}}
+	<div class="flex-divided-list items-with-main">
+		{{range .Variables}}
+		<div class="item tw-items-center">
+			<div class="item-leading">
+				{{svg "octicon-pencil" 32}}
+			</div>
+			<div class="item-main">
+				<div class="item-title">
+					{{.Name}}
+				</div>
+				<div class="item-body">
+					{{if .Description}}{{.Description}}{{else}}-{{end}}
+				</div>
+				<div class="item-body">
+					{{.Data}}
+				</div>
+			</div>
+			<div class="item-trailing">
+				<span>
+					{{ctx.Locale.Tr "settings.added_on" (DateUtils.AbsoluteShort .CreatedUnix)}}
+				</span>
+				<button type="button" class="btn interact-bg tw-p-2 show-modal"
+					data-tooltip-content="{{ctx.Locale.Tr "actions.variables.edit"}}"
+					data-modal="#edit-variable-modal"
+					data-modal-form.url="{{$.Link}}/{{.ID}}/edit"
+					data-modal-header="{{ctx.Locale.Tr "actions.variables.edit"}}"
+					data-modal-dialog-variable-name="{{.Name}}"
+					data-modal-dialog-variable-data="{{.Data}}"
+					data-modal-dialog-variable-description="{{.Description}}"
+				>
+					{{svg "octicon-pencil"}}
+				</button>
+				<button type="button" class="btn interact-bg tw-p-2 link-action negative"
+					data-tooltip-content="{{ctx.Locale.Tr "actions.variables.deletion"}}"
+					data-url="{{$.Link}}/{{.ID}}/delete"
+					data-modal-confirm="{{ctx.Locale.Tr "actions.variables.deletion.description"}}"
+				>
+					{{svg "octicon-trash"}}
+				</button>
+			</div>
+		</div>
+		{{end}}
+	</div>
+	{{else}}
+		{{ctx.Locale.Tr "actions.variables.none"}}
+	{{end}}
+</div>
+
+{{/** Edit variable dialog */}}
+<dialog class="modal-dialog" id="edit-variable-modal">
+	<div class="header"></div>
+	<form class="ui form form-fetch-action" method="post">
+		<div class="content">
+			<div class="field">
+				{{ctx.Locale.Tr "actions.variables.description"}}
+			</div>
+			<div class="field">
+				<label for="dialog-variable-name">{{ctx.Locale.Tr "name"}}</label>
+				<input autofocus required
+					name="name"
+					id="dialog-variable-name"
+					pattern="^(?!GITEA_|GITHUB_)[a-zA-Z_][a-zA-Z0-9_]*$"
+					data-tooltip-content="{{ctx.Locale.Tr "secrets.creation.name_pattern"}}"
+					placeholder="MY_VARIABLE_NAME"
+				>
+			</div>
+			<div class="field">
+				<label for="dialog-variable-data">{{ctx.Locale.Tr "value"}}</label>
+				<textarea required
+					name="data"
+					id="dialog-variable-data"
+					maxlength="{{.DataMaxLength}}"
+					placeholder="{{ctx.Locale.Tr "secrets.creation.value_placeholder"}}"
+				></textarea>
+			</div>
+			<div class="field">
+				<label for="dialog-variable-description">{{ctx.Locale.Tr "secrets.creation.description"}}</label>
+				<textarea
+					name="description"
+					id="dialog-variable-description"
+					rows="2"
+					maxlength="{{.DescriptionMaxLength}}"
+					placeholder="{{ctx.Locale.Tr "secrets.creation.description_placeholder"}}"
+				></textarea>
+			</div>
+		</div>
+		{{template "base/modal_actions_confirm" (dict "ModalButtonTypes" "confirm")}}
+	</form>
+</dialog>
+

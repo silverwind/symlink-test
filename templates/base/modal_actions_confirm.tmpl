@@ -1,0 +1,26 @@
+{{/* Two buttons (negative, positive):
+* ModalButtonTypes: "yes" (default) or "confirm"
+* ModalButtonCancelText
+* ModalButtonOkText
+
+Single danger button (GitHub-like):
+* ModalButtonDangerText "This action will destroy your data"
+
+The ".ok.button" and ".cancel.button" selectors are also used by "modules/modal.ts"
+*/}}
+<div class="actions">
+	{{if .ModalButtonDangerText}}
+		<button type="submit" class="ui danger red ok button">{{.ModalButtonDangerText}}</button>
+	{{else}}
+		{{$textNegative := ctx.Locale.Tr "modal.no"}}
+		{{$textPositive := ctx.Locale.Tr "modal.yes"}}
+		{{if eq .ModalButtonTypes "confirm"}}
+			{{$textNegative = ctx.Locale.Tr "modal.cancel"}}
+			{{$textPositive = ctx.Locale.Tr "modal.confirm"}}
+		{{end}}
+		{{if .ModalButtonCancelText}}{{$textNegative = .ModalButtonCancelText}}{{end}}
+		{{if .ModalButtonOkText}}{{$textPositive = .ModalButtonOkText}}{{end}}
+		<button type="button" class="ui cancel button">{{svg "octicon-x"}} {{$textNegative}}</button>
+		<button type="submit" class="ui primary ok button">{{svg "octicon-check"}} {{$textPositive}}</button>
+	{{end}}
+</div>

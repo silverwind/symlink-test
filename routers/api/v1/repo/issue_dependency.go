@@ -1,0 +1,557 @@
+// Copyright 2016 The Gogs Authors. All rights reserved.
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"net/http"
+
+	issues_model "gitea.dev/models/issues"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+)
+
+// GetIssueDependencies list an issue's dependencies
+func GetIssueDependencies(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/dependencies issue issueListIssueDependencies
+	// ---
+	// summary: List an issue's dependencies, i.e all issues that block this issue.
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/IssueList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	// If this issue's repository does not enable dependencies then there can be no dependencies by default
+	if !ctx.Repo.Repository.IsDependenciesEnabled(ctx) {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if issue == nil {
+		return
+	}
+
+	listOptions := utils.GetListOptions(ctx)
+
+	canWrite := ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull)
+
+	blockerIssues := make([]*issues_model.Issue, 0, min(listOptions.PageSize, setting.API.MaxResponseItems))
+
+	// Get the issues this issue depends on, i.e. the `<#b>`: `<issue> <- <#b>`
+	blockersInfo, total, err := issue.BlockedByDependencies(ctx, listOptions)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	repoPerms := make(map[int64]access_model.Permission)
+	repoPerms[ctx.Repo.Repository.ID] = ctx.Repo.Permission
+	for _, blocker := range blockersInfo {
+		// Get the permissions for this repository
+		// If the repo ID exists in the map, return the exist permissions
+		// else get the permission and add it to the map
+		var perm access_model.Permission
+		existPerm, ok := repoPerms[blocker.RepoID]
+		if ok {
+			perm = existPerm
+		} else {
+			var err error
+			perm, err = access_model.GetDoerRepoPermission(ctx, &blocker.Repository, ctx.Doer)
+			if err != nil {
+				ctx.APIErrorInternal(err)
+				return
+			}
+			repoPerms[blocker.RepoID] = perm
+		}
+
+		// check permission
+		if !perm.CanReadIssuesOrPulls(blocker.Issue.IsPull) {
+			if !canWrite {
+				hiddenBlocker := &issues_model.DependencyInfo{
+					Issue: issues_model.Issue{
+						Title: "HIDDEN",
+					},
+				}
+				blocker = hiddenBlocker
+			} else {
+				confidentialBlocker := &issues_model.DependencyInfo{
+					Issue: issues_model.Issue{
+						RepoID:   blocker.Issue.RepoID,
+						Index:    blocker.Index,
+						Title:    blocker.Title,
+						IsClosed: blocker.IsClosed,
+						IsPull:   blocker.IsPull,
+					},
+					Repository: repo_model.Repository{
+						ID:        blocker.Issue.Repo.ID,
+						Name:      blocker.Issue.Repo.Name,
+						OwnerName: blocker.Issue.Repo.OwnerName,
+					},
+				}
+				confidentialBlocker.Issue.Repo = &confidentialBlocker.Repository
+				blocker = confidentialBlocker
+			}
+		}
+		blockerIssues = append(blockerIssues, &blocker.Issue)
+	}
+	ctx.SetLinkHeader(total, listOptions.PageSize)
+	ctx.SetTotalCountHeader(total)
+	ctx.JSON(http.StatusOK, convert.ToAPIIssueList(ctx, ctx.Doer, blockerIssues))
+}
+
+// CreateIssueDependency create a new issue dependencies
+func CreateIssueDependency(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/issues/{index}/dependencies issue issueCreateIssueDependencies
+	// ---
+	// summary: Make the issue in the url depend on the issue in the form.
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Issue"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	// We want to make <:index> depend on <Form>, i.e. <:index> is the target
+	target := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if ctx.Written() {
+		return
+	}
+
+	// and <Form> represents the dependency
+	form := web.GetForm[*api.IssueMeta](ctx)
+	dependency := getFormIssue(ctx, form)
+	if ctx.Written() {
+		return
+	}
+
+	dependencyPerm := getPermissionForRepo(ctx, dependency.Repo)
+	if ctx.Written() {
+		return
+	}
+
+	createIssueDependency(ctx, target, dependency, ctx.Repo.Permission, *dependencyPerm)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIIssue(ctx, ctx.Doer, target))
+}
+
+// RemoveIssueDependency remove an issue dependency
+func RemoveIssueDependency(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/{index}/dependencies issue issueRemoveIssueDependencies
+	// ---
+	// summary: Remove an issue dependency
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Issue"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	// We want to make <:index> depend on <Form>, i.e. <:index> is the target
+	target := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if ctx.Written() {
+		return
+	}
+
+	// and <Form> represents the dependency
+	form := web.GetForm[*api.IssueMeta](ctx)
+	dependency := getFormIssue(ctx, form)
+	if ctx.Written() {
+		return
+	}
+
+	dependencyPerm := getPermissionForRepo(ctx, dependency.Repo)
+	if ctx.Written() {
+		return
+	}
+
+	removeIssueDependency(ctx, target, dependency, ctx.Repo.Permission, *dependencyPerm)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIIssue(ctx, ctx.Doer, target))
+}
+
+// GetIssueBlocks list issues that are blocked by this issue
+func GetIssueBlocks(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/blocks issue issueListBlocks
+	// ---
+	// summary: List issues that are blocked by this issue
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/IssueList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	// We need to list the issues that DEPEND on this issue not the other way round
+	// Therefore whether dependencies are enabled or not in this repository is potentially irrelevant.
+
+	issue := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if ctx.Written() {
+		return
+	}
+
+	page := max(ctx.FormInt("page"), 1)
+	limit := ctx.FormInt("limit")
+	if limit <= 1 {
+		limit = setting.API.DefaultPagingNum
+	}
+
+	skip := (page - 1) * limit
+	maxNum := page * limit
+
+	deps, err := issue.BlockingDependencies(ctx)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	var issues []*issues_model.Issue
+
+	repoPerms := make(map[int64]access_model.Permission)
+	repoPerms[ctx.Repo.Repository.ID] = ctx.Repo.Permission
+
+	for i, depMeta := range deps {
+		if i < skip || i >= maxNum {
+			continue
+		}
+
+		// Get the permissions for this repository
+		// If the repo ID exists in the map, return the exist permissions
+		// else get the permission and add it to the map
+		var perm access_model.Permission
+		existPerm, ok := repoPerms[depMeta.RepoID]
+		if ok {
+			perm = existPerm
+		} else {
+			var err error
+			perm, err = access_model.GetDoerRepoPermission(ctx, &depMeta.Repository, ctx.Doer)
+			if err != nil {
+				ctx.APIErrorInternal(err)
+				return
+			}
+			repoPerms[depMeta.RepoID] = perm
+		}
+
+		if !perm.CanReadIssuesOrPulls(depMeta.Issue.IsPull) {
+			continue
+		}
+
+		depMeta.Issue.Repo = &depMeta.Repository
+		issues = append(issues, &depMeta.Issue)
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToAPIIssueList(ctx, ctx.Doer, issues))
+}
+
+// CreateIssueBlocking block the issue given in the body by the issue in path
+func CreateIssueBlocking(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/issues/{index}/blocks issue issueCreateIssueBlocking
+	// ---
+	// summary: Block the issue given in the body by the issue in path
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Issue"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	dependency := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if ctx.Written() {
+		return
+	}
+
+	form := web.GetForm[*api.IssueMeta](ctx)
+	target := getFormIssue(ctx, form)
+	if ctx.Written() {
+		return
+	}
+
+	targetPerm := getPermissionForRepo(ctx, target.Repo)
+	if ctx.Written() {
+		return
+	}
+
+	createIssueDependency(ctx, target, dependency, *targetPerm, ctx.Repo.Permission)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIIssue(ctx, ctx.Doer, dependency))
+}
+
+// RemoveIssueBlocking unblock the issue given in the body by the issue in path
+func RemoveIssueBlocking(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/{index}/blocks issue issueRemoveIssueBlocking
+	// ---
+	// summary: Unblock the issue given in the body by the issue in path
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Issue"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	dependency := getRepoIssueByIndexForDoer(ctx, ctx.PathParamInt64("index"))
+	if ctx.Written() {
+		return
+	}
+
+	form := web.GetForm[*api.IssueMeta](ctx)
+	target := getFormIssue(ctx, form)
+	if ctx.Written() {
+		return
+	}
+
+	targetPerm := getPermissionForRepo(ctx, target.Repo)
+	if ctx.Written() {
+		return
+	}
+
+	removeIssueDependency(ctx, target, dependency, *targetPerm, ctx.Repo.Permission)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.JSON(http.StatusCreated, convert.ToAPIIssue(ctx, ctx.Doer, dependency))
+}
+
+func getFormIssue(ctx *context.APIContext, form *api.IssueMeta) *issues_model.Issue {
+	var repo *repo_model.Repository
+	if form.Owner != ctx.Repo.Repository.OwnerName || form.Name != ctx.Repo.Repository.Name {
+		if !setting.Service.AllowCrossRepositoryDependencies {
+			ctx.JSON(http.StatusBadRequest, "CrossRepositoryDependencies not enabled")
+			return nil
+		}
+		var err error
+		repo, err = repo_model.GetRepositoryByOwnerAndName(ctx, form.Owner, form.Name)
+		if err != nil {
+			ctx.APIErrorAuto(err)
+			return nil
+		}
+	} else {
+		repo = ctx.Repo.Repository
+	}
+
+	issue, err := issues_model.GetIssueByIndex(ctx, repo.ID, form.Index)
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return nil
+	}
+	issue.Repo = repo
+	return issue
+}
+
+func getPermissionForRepo(ctx *context.APIContext, repo *repo_model.Repository) *access_model.Permission {
+	if repo.ID == ctx.Repo.Repository.ID {
+		return &ctx.Repo.Permission
+	}
+
+	perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return nil
+	}
+
+	return &perm
+}
+
+func createIssueDependency(ctx *context.APIContext, target, dependency *issues_model.Issue, targetPerm, dependencyPerm access_model.Permission) {
+	if target.Repo.IsArchived || !target.Repo.IsDependenciesEnabled(ctx) {
+		// The target's repository doesn't have dependencies enabled
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	if !targetPerm.CanWriteIssuesOrPulls(target.IsPull) {
+		// We can't write to the target
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	if !dependencyPerm.CanReadIssuesOrPulls(dependency.IsPull) {
+		// We can't read the dependency
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	err := issues_model.CreateIssueDependency(ctx, ctx.Doer, target, dependency)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+}
+
+func removeIssueDependency(ctx *context.APIContext, target, dependency *issues_model.Issue, targetPerm, dependencyPerm access_model.Permission) {
+	if target.Repo.IsArchived || !target.Repo.IsDependenciesEnabled(ctx) {
+		// The target's repository doesn't have dependencies enabled
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	if !targetPerm.CanWriteIssuesOrPulls(target.IsPull) {
+		// We can't write to the target
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	if !dependencyPerm.CanReadIssuesOrPulls(dependency.IsPull) {
+		// We can't read the dependency
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	err := issues_model.RemoveIssueDependency(ctx, ctx.Doer, target, dependency, issues_model.DependencyTypeBlockedBy)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+}

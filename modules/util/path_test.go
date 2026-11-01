@@ -1,0 +1,293 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package util
+
+import (
+	"net/url"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"gitea.dev/modules/consts"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestFileURLToPath(t *testing.T) {
+	cases := []struct {
+		url      string
+		expected string
+		invalid  bool
+		windows  bool
+	}{
+		{
+			url:     "",
+			invalid: true,
+		},
+		{
+			url:     "http://test.io",
+			invalid: true,
+		},
+		{
+			url:      "file:///path",
+			expected: "/path",
+		},
+		{
+			url:      "file:///C:/path",
+			expected: "C:/path",
+			windows:  true,
+		},
+		{
+			url:      "file:///z:/path",
+			expected: "z:/path",
+			windows:  true,
+		},
+		{
+			url:      "file:///path",
+			expected: "/path",
+			windows:  true,
+		},
+	}
+
+	for _, c := range cases {
+		u, _ := url.Parse(c.url)
+		p, err := fileURLToPathInternal(u, c.windows)
+		if c.invalid {
+			assert.Error(t, err, "case %s: should return error", c.url)
+		} else {
+			assert.NoError(t, err, "case %s: should not return error", c.url)
+			assert.Equal(t, c.expected, p, "case %s: should be equal", c.url)
+		}
+	}
+}
+
+func TestMisc_IsReadmeFileName(t *testing.T) {
+	trueTestCases := []string{
+		"readme",
+		"README",
+		"readME.mdown",
+		"README.md",
+		"readme.i18n.md",
+	}
+	falseTestCases := []string{
+		"test.md",
+		"wow.MARKDOWN",
+		"LOL.mDoWn",
+		"test",
+		"abcdefg",
+		"abcdefghijklmnopqrstuvwxyz",
+		"test.md.test",
+		"readmf",
+	}
+
+	for _, testCase := range trueTestCases {
+		assert.True(t, IsReadmeFileName(testCase))
+	}
+	for _, testCase := range falseTestCases {
+		assert.False(t, IsReadmeFileName(testCase))
+	}
+
+	type extensionTestcase struct {
+		name     string
+		expected bool
+		idx      int
+	}
+
+	exts := []string{".md", ".txt", ""}
+	testCasesExtensions := []extensionTestcase{
+		{
+			name:     "readme",
+			expected: true,
+			idx:      2,
+		},
+		{
+			name:     "readme.md",
+			expected: true,
+			idx:      0,
+		},
+		{
+			name:     "README.md",
+			expected: true,
+			idx:      0,
+		},
+		{
+			name:     "ReAdMe.Md",
+			expected: true,
+			idx:      0,
+		},
+		{
+			name:     "readme.txt",
+			expected: true,
+			idx:      1,
+		},
+		{
+			name:     "readme.doc",
+			expected: true,
+			idx:      3,
+		},
+		{
+			name: "readmee.md",
+		},
+		{
+			name:     "readme..",
+			expected: true,
+			idx:      3,
+		},
+	}
+
+	for _, testCase := range testCasesExtensions {
+		idx, ok := IsReadmeFileExtension(testCase.name, exts...)
+		assert.Equal(t, testCase.expected, ok)
+		assert.Equal(t, testCase.idx, idx)
+	}
+
+	idx, ok := IsReadmeFileExtension("readme", ".md")
+	assert.False(t, ok)
+	assert.Zero(t, idx)
+}
+
+func TestCleanPath(t *testing.T) {
+	cases := []struct {
+		elems    []string
+		expected string
+	}{
+		{[]string{}, ``},
+		{[]string{``}, ``},
+		{[]string{`..`}, `.`},
+		{[]string{`a`}, `a`},
+		{[]string{`/a/`}, `a`},
+		{[]string{`../a/`, `../b`, `c/..`, `d`}, `a/b/d`},
+		{[]string{`a`, ``, `b`}, `a/b`},
+		{[]string{`a`, `..`, `b`}, `a/b`},
+		{[]string{`lfs`, `repo/..`, `user/../path`}, `lfs/path`},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.expected, PathJoinRel(c.elems...), "case: %v", c.elems)
+		assert.Equal(t, c.expected, PathJoinRelX(c.elems...), "case: %v", c.elems)
+	}
+
+	backslashPath := []string{`a\..\b`}
+	assert.Equal(t, `a\..\b`, PathJoinRel(backslashPath...), "case: %v", backslashPath)
+	assert.Equal(t, `b`, PathJoinRelX(backslashPath...), "case: %v", backslashPath)
+
+	// for POSIX only, but the result is similar on Windows, because the first element must be an absolute path
+	if consts.IsWindows {
+		cases = []struct {
+			elems    []string
+			expected string
+		}{
+			{[]string{`C:\..`}, `C:\`},
+			{[]string{`C:\a`}, `C:\a`},
+			{[]string{`C:\a/`}, `C:\a`},
+			{[]string{`C:\..\a\`, `../b`, `c\..`, `d`}, `C:\a\b\d`},
+			{[]string{`C:\a/..\b`}, `C:\b`},
+			{[]string{`C:\a`, ``, `b`}, `C:\a\b`},
+			{[]string{`C:\a`, `..`, `b`}, `C:\a\b`},
+			{[]string{`C:\lfs`, `repo/..`, `user/../path`}, `C:\lfs\path`},
+		}
+	} else {
+		cases = []struct {
+			elems    []string
+			expected string
+		}{
+			{[]string{`/..`}, `/`},
+			{[]string{`/a`}, `/a`},
+			{[]string{`/a/`}, `/a`},
+			{[]string{`/../a/`, `../b`, `c/..`, `d`}, `/a/b/d`},
+			{[]string{`/a\..\b`}, `/b`},
+			{[]string{`/a`, ``, `b`}, `/a/b`},
+			{[]string{`/a`, `..`, `b`}, `/a/b`},
+			{[]string{`/lfs`, `repo/..`, `user/../path`}, `/lfs/path`},
+		}
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.expected, FilePathJoinAbs(c.elems[0], c.elems[1:]...), "case: %v", c.elems)
+	}
+}
+
+func TestListDirRecursively(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = os.WriteFile(tmpDir+"/.config", nil, 0o644)
+	_ = os.Mkdir(tmpDir+"/d1", 0o755)
+	_ = os.WriteFile(tmpDir+"/d1/f-d1", nil, 0o644)
+	_ = os.Mkdir(tmpDir+"/d1/s1", 0o755)
+	_ = os.WriteFile(tmpDir+"/d1/s1/f-d1s1", nil, 0o644)
+	_ = os.Mkdir(tmpDir+"/d2", 0o755)
+
+	res, err := ListDirRecursively(tmpDir, &ListDirOptions{IncludeDir: true})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{".config", "d1/", "d1/f-d1", "d1/s1/", "d1/s1/f-d1s1", "d2/"}, res)
+
+	res, err = ListDirRecursively(tmpDir, &ListDirOptions{SkipCommonHiddenNames: true})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"d1/f-d1", "d1/s1/f-d1s1"}, res)
+}
+
+func TestReadWriteRegularPathFile(t *testing.T) {
+	const readLimit = 10000
+	tmpDir := t.TempDir()
+	rootDir := tmpDir + "/root"
+	_ = os.Mkdir(rootDir, 0o755)
+	_ = os.WriteFile(tmpDir+"/other-file", []byte("other-content"), 0o755)
+	_ = os.Mkdir(rootDir+"/real-dir", 0o755)
+	_ = os.WriteFile(rootDir+"/real-dir/real-file", []byte("dummy-content"), 0o644)
+	_ = os.Symlink(rootDir+"/real-dir", rootDir+"/link-dir")
+	_ = os.Symlink(rootDir+"/real-dir/real-file", rootDir+"/real-dir/link-file")
+
+	t.Run("Read", func(t *testing.T) {
+		content, err := os.ReadFile(filepath.Join(rootDir, "../other-file"))
+		require.NoError(t, err)
+		assert.Equal(t, "other-content", string(content))
+
+		content, err = ReadRegularPathFile(rootDir, "../other-file", readLimit)
+		require.ErrorIs(t, err, os.ErrNotExist)
+		assert.Empty(t, string(content))
+
+		content, err = ReadRegularPathFile(rootDir, "real-dir/real-file", readLimit)
+		require.NoError(t, err)
+		assert.Equal(t, "dummy-content", string(content))
+
+		_, err = ReadRegularPathFile(rootDir, "link-dir/real-file", readLimit)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+		_, err = ReadRegularPathFile(rootDir, "real-dir/link-file", readLimit)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+		_, err = ReadRegularPathFile(rootDir, "link-dir/link-file", readLimit)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+	})
+
+	t.Run("Write", func(t *testing.T) {
+		assertFileContent := func(path, expected string) {
+			data, err := os.ReadFile(path)
+			if expected == "" {
+				assert.ErrorIs(t, err, os.ErrNotExist)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, expected, string(data), "file content mismatch for %s", path)
+		}
+
+		err := WriteRegularPathFile(rootDir, "new-dir/new-file", []byte("new-content"), 0o755, 0o644)
+		require.NoError(t, err)
+		assertFileContent(rootDir+"/new-dir/new-file", "new-content")
+
+		err = WriteRegularPathFile(rootDir, "link-dir/real-file", []byte("new-content"), 0o755, 0o644)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+		err = WriteRegularPathFile(rootDir, "link-dir/link-file", []byte("new-content"), 0o755, 0o644)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+		err = WriteRegularPathFile(rootDir, "link-dir/new-file", []byte("new-content"), 0o755, 0o644)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+		err = WriteRegularPathFile(rootDir, "real-dir/link-file", []byte("new-content"), 0o755, 0o644)
+		require.ErrorIs(t, err, ErrNotRegularPathFile)
+
+		err = WriteRegularPathFile(rootDir, "../other-file", []byte("new-content"), 0o755, 0o644)
+		require.NoError(t, err)
+		assertFileContent(rootDir+"/../other-file", "other-content")
+		assertFileContent(rootDir+"/other-file", "new-content")
+
+		err = WriteRegularPathFile(rootDir, "real-dir/real-file", []byte("changed-content"), 0o755, 0o644)
+		require.NoError(t, err)
+		assertFileContent(rootDir+"/real-dir/real-file", "changed-content")
+	})
+}

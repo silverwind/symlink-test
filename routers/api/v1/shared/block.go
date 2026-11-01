@@ -1,0 +1,98 @@
+// Copyright 2024 The Gitea Authors.
+// SPDX-License-Identifier: MIT
+
+package shared
+
+import (
+	"errors"
+	"net/http"
+
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	user_service "gitea.dev/services/user"
+)
+
+func ListBlocks(ctx *context.APIContext, blocker *user_model.User) {
+	listOptions := utils.GetListOptions(ctx)
+	blocks, total, err := user_model.FindBlockings(ctx, &user_model.FindBlockingOptions{
+		ListOptions: listOptions,
+		BlockerID:   blocker.ID,
+	})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if err := user_model.BlockingList(blocks).LoadAttributes(ctx); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	users := make([]*api.User, 0, len(blocks))
+	for _, b := range blocks {
+		users = append(users, convert.ToUser(ctx, b.Blockee, blocker))
+	}
+
+	ctx.SetLinkHeader(total, listOptions.PageSize)
+	ctx.SetTotalCountHeader(total)
+	ctx.JSON(http.StatusOK, &users)
+}
+
+func CheckUserBlock(ctx *context.APIContext, blocker *user_model.User) {
+	blockee, err := user_model.GetUserByName(ctx, ctx.PathParam("username"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	_, err = user_model.GetBlocking(ctx, blocker.ID, blockee.ID)
+	if errors.Is(err, util.ErrNotExist) {
+		ctx.Status(http.StatusNotFound)
+	} else if err == nil {
+		ctx.Status(http.StatusNoContent)
+	} else {
+		ctx.APIErrorInternal(err)
+	}
+}
+
+func BlockUser(ctx *context.APIContext, blocker *user_model.User) {
+	blockee, err := user_model.GetUserByName(ctx, ctx.PathParam("username"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	if err := user_service.BlockUser(ctx, ctx.Doer, blocker, blockee, ctx.FormString("note")); err != nil {
+		if errors.Is(err, user_model.ErrCanNotBlock) || errors.Is(err, user_model.ErrBlockOrganization) {
+			ctx.APIError(http.StatusBadRequest, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+func UnblockUser(ctx *context.APIContext, doer, blocker *user_model.User) {
+	blockee, err := user_model.GetUserByName(ctx, ctx.PathParam("username"))
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
+
+	if err := user_service.UnblockUser(ctx, doer, blocker, blockee); err != nil {
+		if errors.Is(err, user_model.ErrCanNotUnblock) || errors.Is(err, user_model.ErrBlockOrganization) {
+			ctx.APIError(http.StatusBadRequest, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}

@@ -1,0 +1,129 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package asymkey
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+
+	"xorm.io/builder"
+)
+
+// This file contains functions for creating authorized_principals files
+//
+// There is a dependence on the database within RewriteAllPrincipalKeys & RegeneratePrincipalKeys
+// The sshOpLocker is used from ssh_key_authorized_keys.go
+
+const authorizedPrincipalsFile = "authorized_principals"
+
+// RewriteAllPrincipalKeys removes any authorized principal and rewrite all keys from database again.
+// Note: db.GetEngine(ctx).Iterate does not get latest data after insert/delete, so we have to call this function
+// outside any session scope independently.
+func RewriteAllPrincipalKeys(ctx context.Context) error {
+	// Don't rewrite key if internal server
+	if setting.SSH.StartBuiltinServer || !setting.SSH.CreateAuthorizedPrincipalsFile {
+		return nil
+	}
+
+	return asymkey_model.WithSSHOpLocker(func() error {
+		return rewriteAllPrincipalKeys(ctx)
+	})
+}
+
+func rewriteAllPrincipalKeys(ctx context.Context) error {
+	if setting.SSH.RootPath != "" {
+		// First of ensure that the RootPath is present, and if not make it with 0700 permissions
+		// This of course doesn't guarantee that this is the right directory for authorized_keys
+		// but at least if it's supposed to be this directory and it doesn't exist and we're the
+		// right user it will at least be created properly.
+		err := os.MkdirAll(setting.SSH.RootPath, 0o700)
+		if err != nil {
+			log.Error("Unable to MkdirAll(%s): %v", setting.SSH.RootPath, err)
+			return err
+		}
+	}
+
+	fPath := filepath.Join(setting.SSH.RootPath, authorizedPrincipalsFile)
+	tmpPath := fPath + ".tmp"
+	t, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = t.Close()
+		_ = util.RemoveWithRetry(tmpPath)
+	}()
+
+	if setting.SSH.AuthorizedPrincipalsBackup {
+		isExist, err := util.IsExist(fPath)
+		if err != nil {
+			log.Error("Unable to check if %s exists. Error: %v", fPath, err)
+			return err
+		}
+		if isExist {
+			bakPath := fmt.Sprintf("%s_%d.gitea_bak", fPath, time.Now().Unix())
+			if err = util.CopyFile(fPath, bakPath); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := regeneratePrincipalKeys(ctx, t); err != nil {
+		return err
+	}
+
+	_ = t.Close()
+	return util.RenameWithRetry(tmpPath, fPath)
+}
+
+func regeneratePrincipalKeys(ctx context.Context, t io.Writer) error {
+	if err := db.Iterate(ctx, builder.Eq{"type": asymkey_model.KeyTypePrincipal}, func(ctx context.Context, key *asymkey_model.PublicKey) error {
+		return asymkey_model.WriteAuthorizedStringForValidKey(key, t)
+	}); err != nil {
+		return err
+	}
+
+	fPath := filepath.Join(setting.SSH.RootPath, authorizedPrincipalsFile)
+	isExist, err := util.IsExist(fPath)
+	if err != nil {
+		log.Error("Unable to check if %s exists. Error: %v", fPath, err)
+		return err
+	}
+	if isExist {
+		f, err := os.Open(fPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, asymkey_model.AuthorizedStringCommentPrefix) {
+				scanner.Scan()
+				continue
+			}
+			_, err = io.WriteString(t, line+"\n")
+			if err != nil {
+				return err
+			}
+		}
+		if err = scanner.Err(); err != nil {
+			return fmt.Errorf("regeneratePrincipalKeys scan: %w", err)
+		}
+	}
+	return nil
+}

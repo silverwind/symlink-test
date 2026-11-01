@@ -1,0 +1,22 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo_test
+
+import (
+	"testing"
+
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestRepository_WikiCloneLink(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	cloneLink := repo.WikiCloneLink(t.Context(), nil)
+	assert.Equal(t, "ssh://sshuser@try.gitea.io:3000/user2/repo1.wiki.git", cloneLink.SSH)
+	assert.Equal(t, "https://try.gitea.io/user2/repo1.wiki.git", cloneLink.HTTPS)
+}

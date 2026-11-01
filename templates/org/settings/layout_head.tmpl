@@ -1,0 +1,14 @@
+{{template "base/head" ctx.RootData}}
+<div role="main" aria-label="{{ctx.RootData.Title}}" class="page-content {{.pageClass}}">
+	{{template "org/header" ctx.RootData}}
+	<div class="ui container flex-container">
+		{{template "org/settings/navbar" ctx.RootData}}
+		<div class="flex-container-main">
+			{{template "base/alert" ctx.RootData}}
+			{{/* block: org-setting-content */}}
+
+{{if false}}{{/* to make html structure "likely" complete to prevent IDE warnings */}}
+		</div>
+	</div>
+</div>
+{{end}}

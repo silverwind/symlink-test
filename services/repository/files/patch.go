@@ -1,0 +1,234 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package files
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	git_model "gitea.dev/models/git"
+	"gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	asymkey_service "gitea.dev/services/asymkey"
+)
+
+// ErrUserCannotCommit represents "UserCannotCommit" kind of error.
+type ErrUserCannotCommit struct {
+	UserName string
+}
+
+// IsErrUserCannotCommit checks if an error is an ErrUserCannotCommit.
+func IsErrUserCannotCommit(err error) bool {
+	_, ok := err.(ErrUserCannotCommit)
+	return ok
+}
+
+func (err ErrUserCannotCommit) Error() string {
+	return fmt.Sprintf("user cannot commit to repo [user: %s]", err.UserName)
+}
+
+func (err ErrUserCannotCommit) Unwrap() error {
+	return util.ErrPermissionDenied
+}
+
+// ApplyDiffPatchOptions holds the repository diff patch update options
+type ApplyDiffPatchOptions struct {
+	LastCommitID string
+	OldBranch    string
+	NewBranch    string
+	Message      string
+	Content      string
+	Author       *IdentityOptions
+	Committer    *IdentityOptions
+	Dates        *CommitDateOptions
+	Signoff      bool
+}
+
+// Validate validates the provided options
+func (opts *ApplyDiffPatchOptions) Validate(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, doer *user_model.User) error {
+	// If no branch name is set, assume master
+	if opts.OldBranch == "" {
+		opts.OldBranch = repo.DefaultBranch
+	}
+	if opts.NewBranch == "" {
+		opts.NewBranch = opts.OldBranch
+	}
+
+	// oldBranch must exist for this operation
+	if exist, err := git_model.IsBranchExist(ctx, repo.ID, opts.OldBranch); err != nil {
+		return err
+	} else if !exist {
+		return git_model.ErrBranchNotExist{
+			BranchName: opts.OldBranch,
+		}
+	}
+	// A NewBranch can be specified for the patch to be applied to.
+	// Check to make sure the branch does not already exist, otherwise we can't proceed.
+	// If we aren't branching to a new branch, make sure user can commit to the given branch
+	if opts.NewBranch != opts.OldBranch {
+		exist, err := git_model.IsBranchExist(ctx, repo.ID, opts.NewBranch)
+		if err != nil {
+			return err
+		} else if exist {
+			return git_model.ErrBranchAlreadyExists{
+				BranchName: opts.NewBranch,
+			}
+		}
+	} else {
+		protectedBranch, err := git_model.GetFirstMatchProtectedBranchRule(ctx, repo.ID, opts.OldBranch)
+		if err != nil {
+			return err
+		}
+		if protectedBranch != nil {
+			protectedBranch.Repo = repo
+			perm, err := access.GetDoerRepoPermission(ctx, repo, doer)
+			if err != nil {
+				return err
+			}
+			if !protectedBranch.CanUserPush(ctx, doer, perm) {
+				return ErrUserCannotCommit{
+					UserName: doer.LowerName,
+				}
+			}
+		}
+		if protectedBranch != nil && protectedBranch.RequireSignedCommits {
+			_, _, _, err := asymkey_service.SignCRUDAction(ctx, doer, gitRepo, opts.OldBranch)
+			if err != nil {
+				if !asymkey_service.IsErrWontSign(err) {
+					return err
+				}
+				return ErrUserCannotCommit{
+					UserName: doer.LowerName,
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func gitPatchPrepare(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, doer *user_model.User, opts *ApplyDiffPatchOptions) (_ *TemporaryUploadRepository, retErr error) {
+	err := repo.MustNotBeArchived()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := opts.Validate(ctx, repo, gitRepo, doer); err != nil {
+		return nil, err
+	}
+
+	t, err := NewTemporaryUploadRepository(repo)
+	if err != nil {
+		return nil, fmt.Errorf("NewTemporaryUploadRepository failed: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			t.Close()
+		}
+	}()
+	// here must NOT use bare repo, because the following git commands might operate working tree ("--index") directly
+	if err := t.Clone(ctx, opts.OldBranch, false); err != nil {
+		return nil, err
+	}
+	if err := t.SetDefaultIndex(ctx); err != nil {
+		return nil, err
+	}
+
+	// Get the commit of the original branch
+	commit, err := t.GetBranchCommit(ctx, opts.OldBranch)
+	if err != nil {
+		return nil, err // Couldn't get a commit for the branch
+	}
+
+	// Assigned LastCommitID in opts if it hasn't been set
+	if opts.LastCommitID == "" {
+		opts.LastCommitID = commit.ID.String()
+	} else {
+		lastCommitID, err := t.gitRepo.ConvertToGitID(ctx, opts.LastCommitID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid last commit ID: %w", err)
+		}
+		opts.LastCommitID = lastCommitID.String()
+		if commit.ID.String() != opts.LastCommitID {
+			return nil, ErrCommitIDDoesNotMatch{
+				GivenCommitID:   opts.LastCommitID,
+				CurrentCommitID: opts.LastCommitID,
+			}
+		}
+	}
+	return t, nil
+}
+
+// ApplyDiffPatch applies a patch to the given repository
+func ApplyDiffPatch(ctx reqctx.RequestContext, repo *repo_model.Repository, doer *user_model.User, opts *ApplyDiffPatchOptions) (*structs.FileResponse, error) {
+	gitRepo, err := git.RepositoryFromRequestContextOrOpen(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	t, err := gitPatchPrepare(ctx, repo, gitRepo, doer, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer t.Close()
+
+	if err := gitcmd.NewCommand("apply", "--index", "--recount", "--cached", "--ignore-whitespace", "--whitespace=fix", "--binary", "-3").
+		WithRepo(t.gitRepo).
+		WithStdinBytes([]byte(opts.Content)).
+		RunWithStderr(ctx); err != nil {
+		return nil, fmt.Errorf("git apply error: %w", err)
+	}
+
+	return gitPatchCommitPush(ctx, t, repo, gitRepo, doer, opts)
+}
+
+func gitPatchCommitPush(ctx context.Context, t *TemporaryUploadRepository, repo *repo_model.Repository, gitRepo *git.Repository, doer *user_model.User, opts *ApplyDiffPatchOptions) (*structs.FileResponse, error) {
+	treeHash, err := t.WriteTree(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	commitOpts := &CommitTreeUserOptions{
+		ParentCommitID:    "HEAD",
+		TreeHash:          treeHash,
+		CommitMessage:     strings.TrimSpace(opts.Message),
+		SignOff:           opts.Signoff,
+		DoerUser:          doer,
+		AuthorIdentity:    opts.Author,
+		AuthorTime:        nil,
+		CommitterIdentity: opts.Committer,
+		CommitterTime:     nil,
+	}
+	if opts.Dates != nil {
+		commitOpts.AuthorTime, commitOpts.CommitterTime = &opts.Dates.Author, &opts.Dates.Committer
+	}
+	commitHash, err := t.CommitTree(ctx, commitOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Then push this tree to NewBranch
+	if err := t.Push(ctx, doer, commitHash, opts.NewBranch, false); err != nil {
+		return nil, err
+	}
+
+	commit, err := t.GetCommit(ctx, commitHash)
+	if err != nil {
+		return nil, err
+	}
+
+	fileCommitResponse, _ := GetFileCommitResponse(ctx, repo, gitRepo, commit) // ok if fails, then will be nil
+	verification := GetPayloadCommitVerification(ctx, commit)
+	fileResponse := &structs.FileResponse{
+		Commit:       fileCommitResponse,
+		Verification: verification,
+	}
+
+	return fileResponse, nil
+}

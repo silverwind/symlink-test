@@ -1,0 +1,7 @@
+extends: [[spectral:oas, all]]
+
+rules:
+  info-contact: off
+  oas2-api-host: off
+  oas2-parameter-description: off
+  operation-description: off

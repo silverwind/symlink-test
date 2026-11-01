@@ -1,0 +1,81 @@
+interface JQuery {
+  fomanticExt: {
+    onDropdownAfterFiltered?: (this: HTMLElement) => void,
+  }; // fomantic extension
+  api: any, // fomantic
+  dropdown: any; // fomantic
+  transition: any, // fomantic
+}
+
+interface JQueryStatic {
+  api: any, // fomantic
+}
+
+interface Element {
+  _tippy: import('tippy.js').Instance;
+}
+
+interface Window {
+  config: {
+    appUrl: string,
+    appSubUrl: string,
+    assetUrlPrefix: string,
+    sharedWorkerUri: string,
+    runModeIsProd: boolean,
+    customEmojis: Record<string, string>,
+    pageData: {
+      adminUserListSearchForm?: {
+        SortType: string,
+        StatusFilterMap: Record<string, string>,
+      },
+      prReview?: {
+        numberOfFiles: number,
+        numberOfViewedFiles: number,
+      },
+      DiffFileTree?: import('./modules/diff-file.ts').DiffFileTreeData,
+      FolderIcon?: string,
+      FolderOpenIcon?: string,
+      repoLink?: string,
+      repoActivityTopAuthors?: Array<{
+        avatar_link: string,
+        commits: number,
+        home_link: string,
+        login: string,
+        name: string,
+      }>,
+      dashboardRepoList?: Record<string, unknown>,
+      projectWorkflows?: import('./components/ProjectWorkflowStore.ts').ProjectWorkflowData,
+    },
+    notificationSettings: {
+      MinTimeout: number,
+      TimeoutStep: number,
+      MaxTimeout: number,
+    },
+    mermaidMaxSourceCharacters: number,
+    i18n: Record<string, string>,
+    frontendInited: boolean,
+  },
+  $: JQueryStatic,
+  jQuery: JQueryStatic,
+  _globalHandlerErrors: Array<ErrorEvent & PromiseRejectionEvent> & {
+    _inited: boolean,
+    push: (e: ErrorEvent & PromiseRejectionEvent) => void | number,
+  },
+  localUserSettings: typeof import('./modules/user-settings.ts').localUserSettings,
+
+  // various captcha plugins
+  grecaptcha: any,
+  turnstile: any,
+  hcaptcha: any,
+
+  // Make IIFE private functions can be managed by us in our scope, without exposing the IIFE module to global scope.
+  // Otherwise, when using "export" in IIFE code, the compiled JS will inject global "var externalRenderHelper = ..."
+  // which is not expected and may cause conflicts with other modules.
+  giteaExternalRenderHelper?: {
+    isValidCssColor(s: string | null): boolean,
+    queryParams: URLSearchParams,
+    postIframeMsg(cmd: 'resize' | 'open-link', data: Record<string, string | number | null>): void,
+  }
+
+  // do not add more properties here unless it is a must
+}

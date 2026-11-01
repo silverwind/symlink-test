@@ -1,0 +1,51 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"net/http"
+	"net/url"
+	"testing"
+	"time"
+
+	"gitea.dev/modules/queue"
+	"gitea.dev/modules/test"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRepoLanguages(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, u *url.URL) {
+		session := loginUser(t, "user2")
+
+		// Request editor page
+		req := NewRequest(t, "GET", "/user2/repo1/_new/master/")
+		resp := session.MakeRequest(t, req, http.StatusOK)
+
+		doc := NewHTMLParser(t, resp.Body)
+		lastCommit := doc.GetInputValueByName("last_commit")
+		assert.NotEmpty(t, lastCommit)
+
+		// Save new file to master branch
+		req = NewRequestWithValues(t, "POST", "/user2/repo1/_new/master/", map[string]string{
+			"last_commit":   lastCommit,
+			"tree_path":     "test.go",
+			"content":       "package main",
+			"commit_choice": "direct",
+		})
+		resp = session.MakeRequest(t, req, http.StatusOK)
+		assert.NotEmpty(t, test.RedirectURL(resp))
+
+		require.NoError(t, queue.GetManager().FlushAll(t.Context(), 10*time.Second))
+
+		// Save new file to master branch
+		req = NewRequest(t, "GET", "/api/v1/repos/user2/repo1/languages")
+		resp = MakeRequest(t, req, http.StatusOK)
+
+		languages := DecodeJSON(t, resp, map[string]int64{})
+
+		assert.InDeltaMapValues(t, map[string]int64{"Go": 12}, languages, 0)
+	})
+}

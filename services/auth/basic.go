@@ -1,0 +1,197 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package auth
+
+import (
+	"errors"
+	"net/http"
+
+	actions_model "gitea.dev/models/actions"
+	audit_model "gitea.dev/models/audit"
+	auth_model "gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/auth/httpauth"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/audit"
+)
+
+// Ensure the struct implements the interface.
+var (
+	_ Method = &Basic{}
+)
+
+// BasicMethodName is the constant name of the basic authentication method
+const (
+	BasicMethodName       = "basic"
+	DeployTokenMethodName = "deploy_token"
+)
+
+// Basic implements the Auth interface and authenticates requests (API requests
+// only) by looking for Basic authentication data or "x-oauth-basic" token in the "Authorization"
+// header.
+type Basic struct{}
+
+// Name represents the name of auth method
+func (b *Basic) Name() string {
+	return BasicMethodName
+}
+
+func parseAuthBasic(req *http.Request) (ret struct{ authToken, uname, passwd string }) {
+	authHeader := req.Header.Get("Authorization")
+	if authHeader == "" {
+		return ret
+	}
+	parsed, ok := httpauth.ParseAuthorizationHeader(authHeader)
+	if !ok || parsed.BasicAuth == nil {
+		return ret
+	}
+	uname, passwd := parsed.BasicAuth.Username, parsed.BasicAuth.Password
+
+	// Check if username or password is a token
+	isUsernameToken := passwd == "" || passwd == "x-oauth-basic"
+	// Assume username is token
+	authToken := uname
+	if !isUsernameToken {
+		log.Trace("Basic Authorization: Attempting login for: %s", uname)
+		// Assume password is token
+		authToken = passwd
+	} else {
+		log.Trace("Basic Authorization: Attempting login with username as token")
+	}
+	ret.authToken, ret.uname, ret.passwd = authToken, uname, passwd
+	return ret
+}
+
+// VerifyAuthToken only the access token provided as parameter, used by other auth methods that want to reuse access token verification logic
+func (b *Basic) VerifyAuthToken(req *http.Request, w http.ResponseWriter, store DataStore, sess SessionStore, authToken string) (*user_model.User, error) {
+	// get oauth2 token's user's ID
+	accessTokenScope, uid, grantID := GetOAuthAccessTokenScopeAndUserID(req.Context(), authToken)
+	if uid != 0 {
+		log.Trace("Basic Authorization: Valid OAuthAccessToken for user[%d]", uid)
+
+		u, err := user_model.GetUserByID(req.Context(), uid)
+		if err != nil {
+			log.Error("GetUserByID:  %v", err)
+			return nil, err
+		}
+		if !u.IsIndividual() {
+			return nil, nil //nolint:nilnil // the auth method is not applicable
+		}
+
+		u.ExtDoerData = user_model.NewTokenExtDoerData(user_model.CredentialOAuth2Grant, grantID, accessTokenScope)
+		return u, nil
+	}
+
+	// check personal access token
+	token, err := auth_model.GetAccessTokenBySHA(req.Context(), authToken)
+	if err == nil {
+		log.Trace("Basic Authorization: Valid AccessToken for user[%d]", uid)
+		u, err := user_model.GetUserByID(req.Context(), token.UID)
+		if err != nil {
+			log.Error("GetUserByID:  %v", err)
+			return nil, err
+		}
+
+		token.UpdatedUnix = timeutil.TimeStampNow()
+		if err = auth_model.UpdateAccessToken(req.Context(), token); err != nil {
+			log.Error("UpdateAccessToken:  %v", err)
+		}
+
+		u.ExtDoerData = user_model.NewTokenExtDoerData(user_model.CredentialAccessToken, token.ID, token.Scope)
+		return u, nil
+	} else if !errors.Is(err, util.ErrNotExist) {
+		log.Error("GetAccessTokenBySHA: %v", err)
+	}
+
+	// check task token
+	task, err := actions_model.GetRunningTaskByToken(req.Context(), authToken)
+	if err == nil && task != nil {
+		log.Trace("Basic Authorization: Valid AccessToken for task[%d]", task.ID)
+		return user_model.NewActionsUserWithTaskID(task.ID), nil
+	}
+	return nil, nil //nolint:nilnil // the auth method is not applicable
+}
+
+// Verify extracts and validates Basic data (username and password/token) from the
+// "Authorization" header of the request and returns the corresponding user object for that
+// name/token on successful validation.
+// Returns nil if header is empty or validation fails.
+func (b *Basic) Verify(req *http.Request, w http.ResponseWriter, store DataStore, sess SessionStore) (*user_model.User, error) {
+	parseBasicRet := parseAuthBasic(req)
+	authToken, uname, passwd := parseBasicRet.authToken, parseBasicRet.uname, parseBasicRet.passwd
+	if authToken == "" && uname == "" {
+		return nil, nil //nolint:nilnil // the auth method is not applicable
+	}
+	u, err := b.VerifyAuthToken(req, w, store, sess, authToken)
+	if u != nil || err != nil {
+		return u, err
+	}
+
+	if !setting.Service.EnableBasicAuth {
+		return nil, nil //nolint:nilnil // the auth method is not applicable
+	}
+
+	log.Trace("Basic Authorization: Attempting SignIn for %s", uname)
+	u, source, err := UserSignIn(req.Context(), uname, passwd)
+	if err != nil {
+		if !user_model.IsErrUserNotExist(err) {
+			log.Error("UserSignIn: %v", err)
+		}
+		return nil, err
+	}
+
+	if !source.TwoFactorShouldSkip() {
+		// Check if the user has WebAuthn registration
+		hasWebAuthn, err := auth_model.HasWebAuthnRegistrationsByUID(req.Context(), u.ID)
+		if err != nil {
+			return nil, err
+		}
+		if hasWebAuthn {
+			return nil, ErrUserAuthMessage("basic authorization is not allowed while WebAuthn enrolled")
+		}
+
+		if err := validateTOTP(req, u); err != nil {
+			return nil, err
+		}
+	}
+
+	store.GetData()["LoginMethod"] = BasicMethodName
+	log.Trace("Basic Authorization: Logged in user %-v", u)
+
+	return u, nil
+}
+
+func validateTOTP(req *http.Request, u *user_model.User) error {
+	twofa, err := auth_model.GetTwoFactorByUID(req.Context(), u.ID)
+	if err != nil {
+		if auth_model.IsErrTwoFactorNotEnrolled(err) {
+			// No 2FA enrollment for this user
+			return nil
+		}
+		return err
+	}
+	// Consume the passcode atomically so a captured OTP cannot be replayed within its validity window.
+	if ok, err := twofa.ValidateAndConsumeTOTP(req.Context(), req.Header.Get("X-Gitea-OTP")); err != nil {
+		return err
+	} else if !ok {
+		audit.RecordAs(req.Context(), u, audit_model.UserAuthenticationFailTwoFactor, u)
+
+		return util.NewInvalidArgumentErrorf("invalid provided OTP")
+	}
+	return nil
+}
+
+func GetAccessScope(doer *user_model.User, store DataStore) auth_model.AccessTokenScope {
+	if scope, ok := user_model.GetDoerTokenScope(doer); ok {
+		return scope
+	}
+	if store.GetData()["LoginMethod"] == BasicMethodName {
+		return auth_model.AccessTokenScopeAll
+	}
+	return ""
+}

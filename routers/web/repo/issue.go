@@ -1,0 +1,600 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"fmt"
+	"html/template"
+	"net/http"
+	"strings"
+
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	project_model "gitea.dev/models/project"
+	"gitea.dev/models/renderhelper"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/common"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	"gitea.dev/services/forms"
+	issue_service "gitea.dev/services/issue"
+)
+
+const (
+	tplAttachment templates.TplName = "repo/issue/view_content/attachments"
+
+	tplIssues      templates.TplName = "repo/issue/list"
+	tplIssueNew    templates.TplName = "repo/issue/new"
+	tplIssueChoose templates.TplName = "repo/issue/choose"
+	tplIssueView   templates.TplName = "repo/issue/view"
+
+	tplPullMergeBox templates.TplName = "repo/issue/view_content/pull_merge_box"
+	tplReactions    templates.TplName = "shared/reactions"
+
+	issueTemplateKey      = "IssueTemplate"
+	issueTemplateTitleKey = "IssueTemplateTitle"
+)
+
+// IssueTemplateCandidates issue templates
+var IssueTemplateCandidates = []string{
+	"ISSUE_TEMPLATE.md",
+	"ISSUE_TEMPLATE.yaml",
+	"ISSUE_TEMPLATE.yml",
+	"issue_template.md",
+	"issue_template.yaml",
+	"issue_template.yml",
+	".gitea/ISSUE_TEMPLATE.md",
+	".gitea/ISSUE_TEMPLATE.yaml",
+	".gitea/ISSUE_TEMPLATE.yml",
+	".gitea/issue_template.md",
+	".gitea/issue_template.yaml",
+	".gitea/issue_template.yml",
+	".github/ISSUE_TEMPLATE.md",
+	".github/ISSUE_TEMPLATE.yaml",
+	".github/ISSUE_TEMPLATE.yml",
+	".github/issue_template.md",
+	".github/issue_template.yaml",
+	".github/issue_template.yml",
+}
+
+// MustEnableIssues check if repository enable internal issues
+func MustEnableIssues(ctx *context.Context) {
+	if !ctx.Repo.Permission.CanRead(unit.TypeIssues) &&
+		!ctx.Repo.Permission.CanRead(unit.TypeExternalTracker) {
+		ctx.NotFound(nil)
+		return
+	}
+
+	unitExtTracker, err := ctx.Repo.Repository.GetUnit(ctx, unit.TypeExternalTracker)
+	if err == nil {
+		extURL := unitExtTracker.ExternalTrackerConfig().ExternalTrackerURL
+		if extURL != "" && !ctx.Repo.Permission.CanRead(unit.TypeIssues) {
+			ctx.Redirect(extURL)
+			return
+		}
+	}
+}
+
+// MustAllowPulls check if repository enable pull requests and user have right to do that
+func MustAllowPulls(ctx *context.Context) {
+	if !ctx.Repo.Repository.CanEnablePulls() || !ctx.Repo.Permission.CanRead(unit.TypePullRequests) {
+		ctx.NotFound(nil)
+		return
+	}
+}
+
+func retrieveProjectsInternal(ctx *context.Context, repo *repo_model.Repository) (open, closed []*project_model.Project) {
+	// Distinguish whether the owner of the repository
+	// is an individual or an organization
+	repoOwnerType := project_model.TypeIndividual
+	if repo.Owner.IsOrganization() {
+		repoOwnerType = project_model.TypeOrganization
+	}
+
+	projectsUnit := repo.MustGetUnit(ctx, unit.TypeProjects)
+
+	var openProjects []*project_model.Project
+	var closedProjects []*project_model.Project
+	var err error
+
+	if projectsUnit.ProjectsConfig().IsProjectsAllowed(repo_model.ProjectsModeRepo) {
+		openProjects, err = db.Find[project_model.Project](ctx, project_model.SearchOptions{
+			ListOptions: db.ListOptionsAll,
+			RepoID:      repo.ID,
+			IsClosed:    optional.Some(false),
+			Type:        project_model.TypeRepository,
+		})
+		if err != nil {
+			ctx.ServerError("GetProjects", err)
+			return nil, nil
+		}
+		closedProjects, err = db.Find[project_model.Project](ctx, project_model.SearchOptions{
+			ListOptions: db.ListOptionsAll,
+			RepoID:      repo.ID,
+			IsClosed:    optional.Some(true),
+			Type:        project_model.TypeRepository,
+		})
+		if err != nil {
+			ctx.ServerError("GetProjects", err)
+			return nil, nil
+		}
+	}
+
+	if projectsUnit.ProjectsConfig().IsProjectsAllowed(repo_model.ProjectsModeOwner) {
+		openProjects2, err := db.Find[project_model.Project](ctx, project_model.SearchOptions{
+			ListOptions: db.ListOptionsAll,
+			OwnerID:     repo.OwnerID,
+			IsClosed:    optional.Some(false),
+			Type:        repoOwnerType,
+		})
+		if err != nil {
+			ctx.ServerError("GetProjects", err)
+			return nil, nil
+		}
+		openProjects = append(openProjects, openProjects2...)
+		closedProjects2, err := db.Find[project_model.Project](ctx, project_model.SearchOptions{
+			ListOptions: db.ListOptionsAll,
+			OwnerID:     repo.OwnerID,
+			IsClosed:    optional.Some(true),
+			Type:        repoOwnerType,
+		})
+		if err != nil {
+			ctx.ServerError("GetProjects", err)
+			return nil, nil
+		}
+		closedProjects = append(closedProjects, closedProjects2...)
+	}
+	return openProjects, closedProjects
+}
+
+// GetActionIssue will return the issue which is used in the context.
+func GetActionIssue(ctx *context.Context, accessModeOpt ...perm.AccessMode) *issues_model.Issue {
+	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("index"))
+	if err != nil {
+		ctx.ServerError("GetIssueByIndex", err)
+		return nil
+	}
+	issue.Repo = ctx.Repo.Repository
+	accessMode := util.OptionalArg(accessModeOpt, perm.AccessModeRead)
+	if !ctx.Repo.Permission.CanAccess(accessMode, util.Iif(issue.IsPull, unit.TypePullRequests, unit.TypeIssues)) {
+		ctx.NotFound(nil)
+		return nil
+	}
+	if err = issue.LoadAttributes(ctx); err != nil {
+		ctx.ServerError("LoadAttributes", err)
+		return nil
+	}
+	return issue
+}
+
+func getActionIssues(ctx *context.Context, accessMode perm.AccessMode) issues_model.IssueList {
+	issueIDs := ctx.FormStringInt64s("issue_ids")
+	issues, err := issues_model.GetIssuesByIDs(ctx, issueIDs)
+	if err != nil {
+		ctx.ServerError("GetIssuesByIDs", err)
+		return nil
+	}
+	for _, issue := range issues {
+		if issue.RepoID != ctx.Repo.Repository.ID {
+			ctx.NotFound(errors.New("some issue's RepoID is incorrect"))
+			return nil
+		}
+		issue.Repo = ctx.Repo.Repository
+		if !ctx.Repo.Permission.CanAccess(accessMode, util.Iif(issue.IsPull, unit.TypePullRequests, unit.TypeIssues)) {
+			ctx.NotFound(nil)
+			return nil
+		}
+		if err = issue.LoadAttributes(ctx); err != nil {
+			ctx.ServerError("LoadAttributes", err)
+			return nil
+		}
+	}
+	return issues
+}
+
+// GetIssueInfo get an issue of a repository
+func GetIssueInfo(ctx *context.Context) {
+	issue, err := issues_model.GetIssueWithAttrsByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("index"))
+	if err != nil {
+		if issues_model.IsErrIssueNotExist(err) {
+			ctx.HTTPError(http.StatusNotFound)
+		} else {
+			ctx.HTTPError(http.StatusInternalServerError, "GetIssueByIndex", err.Error())
+		}
+		return
+	}
+
+	if issue.IsPull {
+		// Need to check if Pulls are enabled and we can read Pulls
+		if !ctx.Repo.Repository.CanEnablePulls() || !ctx.Repo.Permission.CanRead(unit.TypePullRequests) {
+			ctx.HTTPError(http.StatusNotFound)
+			return
+		}
+	} else {
+		// Need to check if Issues are enabled and we can read Issues
+		if !ctx.Repo.Permission.CanRead(unit.TypeIssues) {
+			ctx.HTTPError(http.StatusNotFound)
+			return
+		}
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"convertedIssue": convert.ToIssue(ctx, ctx.Doer, issue),
+		"renderedLabels": templates.NewRenderUtils(ctx).RenderLabels(issue.Labels, ctx.Repo.RepoLink, issue),
+	})
+}
+
+// UpdateIssueTitle change issue's title
+func UpdateIssueTitle(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	if !ctx.IsSigned || (!issue.IsPoster(ctx.Doer.ID) && !ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull)) {
+		ctx.HTTPError(http.StatusForbidden)
+		return
+	}
+
+	title := ctx.FormTrim("title")
+	if len(title) == 0 {
+		ctx.HTTPError(http.StatusNoContent)
+		return
+	}
+
+	if err := issue_service.ChangeTitle(ctx, issue, ctx.Doer, title); err != nil {
+		ctx.ServerError("ChangeTitle", err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"title": issue.Title,
+	})
+}
+
+// UpdateIssueRef change issue's ref (branch)
+func UpdateIssueRef(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	if !ctx.IsSigned || (!issue.IsPoster(ctx.Doer.ID) && !ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull)) || issue.IsPull {
+		ctx.HTTPError(http.StatusForbidden)
+		return
+	}
+
+	ref := ctx.FormTrim("ref")
+
+	if err := issue_service.ChangeIssueRef(ctx, issue, ctx.Doer, ref); err != nil {
+		ctx.ServerError("ChangeRef", err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"ref": ref,
+	})
+}
+
+// UpdateIssueContent change issue's content
+func UpdateIssueContent(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	if !ctx.IsSigned || (ctx.Doer.ID != issue.PosterID && !ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull)) {
+		ctx.HTTPError(http.StatusForbidden)
+		return
+	}
+
+	if err := issue_service.ChangeContent(ctx, issue, ctx.Doer, ctx.Req.FormValue("content"), ctx.FormInt("content_version")); err != nil {
+		if errors.Is(err, user_model.ErrBlockedUser) {
+			ctx.JSONError(ctx.Tr("repo.issues.edit.blocked_user"))
+		} else if errors.Is(err, issues_model.ErrIssueAlreadyChanged) {
+			if issue.IsPull {
+				ctx.JSONError(ctx.Tr("repo.pulls.edit.already_changed"))
+			} else {
+				ctx.JSONError(ctx.Tr("repo.issues.edit.already_changed"))
+			}
+		} else {
+			ctx.ServerError("ChangeContent", err)
+		}
+		return
+	}
+
+	// when update the request doesn't intend to update attachments (eg: change checkbox state), ignore attachment updates
+	if !ctx.FormBool("ignore_attachments") {
+		if err := updateAttachments(ctx, issue, ctx.FormStrings("files[]")); err != nil {
+			ctx.ServerError("UpdateAttachments", err)
+			return
+		}
+	}
+
+	rctx := renderhelper.NewRenderContextRepoComment(ctx, ctx.Repo.Repository, renderhelper.RepoCommentOptions{
+		FootnoteContextID: "0",
+	})
+	content, err := markdown.RenderString(rctx, issue.Content)
+	if err != nil {
+		ctx.ServerError("RenderString", err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"content":        commentContentHTML(ctx, content),
+		"contentVersion": issue.ContentVersion,
+		"attachments":    attachmentsHTML(ctx, issue.Attachments, issue.Content),
+	})
+}
+
+// UpdateIssueDeadline updates an issue deadline
+func UpdateIssueDeadline(ctx *context.Context) {
+	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("index"))
+	if err != nil {
+		if issues_model.IsErrIssueNotExist(err) {
+			ctx.NotFound(err)
+		} else {
+			ctx.HTTPError(http.StatusInternalServerError, "GetIssueByIndex", err.Error())
+		}
+		return
+	}
+
+	if !ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull) {
+		ctx.HTTPError(http.StatusForbidden, "", "Not repo writer")
+		return
+	}
+
+	deadlineUnix, _ := common.ParseDeadlineDateToEndOfDay(ctx.FormString("deadline"))
+	if err := issues_model.UpdateIssueDeadline(ctx, issue, deadlineUnix, ctx.Doer); err != nil {
+		ctx.HTTPError(http.StatusInternalServerError, "UpdateIssueDeadline", err.Error())
+		return
+	}
+
+	ctx.JSONRedirect("")
+}
+
+// UpdateIssueMilestone change issue's milestone
+func UpdateIssueMilestone(ctx *context.Context) {
+	issues := getActionIssues(ctx, perm.AccessModeWrite)
+	if ctx.Written() {
+		return
+	}
+
+	milestoneID := ctx.FormInt64("id")
+	for _, issue := range issues {
+		oldMilestoneID := issue.MilestoneID
+		if oldMilestoneID == milestoneID {
+			continue
+		}
+		issue.MilestoneID = milestoneID
+		if milestoneID > 0 {
+			var err error
+			issue.Milestone, err = issues_model.GetMilestoneByRepoID(ctx, ctx.Repo.Repository.ID, milestoneID)
+			if err != nil {
+				ctx.ServerError("GetMilestoneByRepoID", err)
+				return
+			}
+		} else {
+			issue.Milestone = nil
+		}
+		if err := issue_service.ChangeMilestoneAssign(ctx, issue, ctx.Doer, oldMilestoneID); err != nil {
+			ctx.ServerError("ChangeMilestoneAssign", err)
+			return
+		}
+	}
+
+	ctx.JSONOK()
+}
+
+// UpdateIssueAssignee change issue's or pull's assignee
+func UpdateIssueAssignee(ctx *context.Context) {
+	issues := getActionIssues(ctx, perm.AccessModeWrite)
+	if ctx.Written() {
+		return
+	}
+
+	assigneeID := ctx.FormInt64("id")
+	action := ctx.FormString("action")
+
+	for _, issue := range issues {
+		switch action {
+		case "clear":
+			if err := issue_service.DeleteNotPassedAssignee(ctx, issue, ctx.Doer, []*user_model.User{}); err != nil {
+				ctx.ServerError("ClearAssignees", err)
+				return
+			}
+		default:
+			assignee, err := user_model.GetUserByID(ctx, assigneeID)
+			if err != nil {
+				ctx.ServerError("GetUserByID", err)
+				return
+			}
+
+			valid, err := access_model.CanBeAssigned(ctx, assignee, issue.Repo)
+			if err != nil {
+				ctx.ServerError("canBeAssigned", err)
+				return
+			}
+			if !valid {
+				ctx.HTTPError(http.StatusForbidden, fmt.Sprintf("User %d cannot be assigned to this issue", assigneeID))
+				return
+			}
+
+			_, _, err = issue_service.ToggleAssigneeWithNotify(ctx, issue, ctx.Doer, assigneeID)
+			if err != nil {
+				ctx.ServerError("ToggleAssignee", err)
+				return
+			}
+		}
+	}
+	ctx.JSONOK()
+}
+
+func canSelfChangeOrAccessContent(ctx *context.Context, refIssue *issues_model.Issue, contentPosterID int64, accessMode perm.AccessMode) bool {
+	if !issue_service.CanSelfChangeOrAccessContent(ctx.Doer, ctx.Repo.Permission, refIssue, contentPosterID, accessMode) {
+		ctx.HTTPError(http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+// ChangeIssueReaction create a reaction for issue
+func ChangeIssueReaction(ctx *context.Context) {
+	form := web.GetForm[*forms.ReactionForm](ctx)
+	if ctx.HasError() {
+		ctx.HTTPError(http.StatusBadRequest, ctx.GetErrMsg())
+		return
+	}
+	issue := GetActionIssue(ctx)
+	if issue == nil {
+		return
+	}
+	if !canSelfChangeOrAccessContent(ctx, issue, issue.PosterID, perm.AccessModeRead) {
+		return
+	}
+
+	switch ctx.PathParam("action") {
+	case "react":
+		reaction, err := issue_service.CreateIssueReaction(ctx, ctx.Doer, issue, form.Content)
+		if err != nil {
+			if issues_model.IsErrForbiddenIssueReaction(err) || errors.Is(err, user_model.ErrBlockedUser) {
+				ctx.ServerError("ChangeIssueReaction", err)
+				return
+			}
+			log.Info("CreateIssueReaction: %s", err)
+			break
+		}
+		// Reload new reactions
+		issue.Reactions = nil
+		if err = issue.LoadAttributes(ctx); err != nil {
+			log.Info("issue.LoadAttributes: %s", err)
+			break
+		}
+
+		log.Trace("Reaction for issue created: %d/%d/%d", ctx.Repo.Repository.ID, issue.ID, reaction.ID)
+	case "unreact":
+		if err := issues_model.DeleteIssueReaction(ctx, ctx.Doer.ID, issue.ID, form.Content); err != nil {
+			ctx.ServerError("DeleteIssueReaction", err)
+			return
+		}
+
+		// Reload new reactions
+		issue.Reactions = nil
+		if err := issue.LoadAttributes(ctx); err != nil {
+			log.Info("issue.LoadAttributes: %s", err)
+			break
+		}
+
+		log.Trace("Reaction for issue removed: %d/%d", ctx.Repo.Repository.ID, issue.ID)
+	default:
+		ctx.NotFound(nil)
+		return
+	}
+
+	renderReactions(ctx, fmt.Sprintf("%s/issues/%d/reactions", ctx.Repo.RepoLink, issue.Index), issue.Reactions, setting.UI.Reactions)
+}
+
+func renderReactions(ctx *context.Context, actionURL string, reactions issues_model.ReactionList, allowedReactions []string) {
+	html, err := ctx.RenderToHTML(tplReactions, map[string]any{
+		"ActionURL":        actionURL,
+		"Reactions":        reactions.GroupByType(),
+		"AllowedReactions": allowedReactions,
+	})
+	if err != nil {
+		ctx.ServerError("RenderToHTML", err)
+		return
+	}
+	ctx.JSON(http.StatusOK, map[string]any{"html": html})
+}
+
+// GetIssueAttachments returns attachments for the issue
+func GetIssueAttachments(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if ctx.Written() {
+		return
+	}
+	attachments := make([]*api.Attachment, len(issue.Attachments))
+	for i := 0; i < len(issue.Attachments); i++ {
+		attachments[i] = convert.ToAttachment(ctx, ctx.Repo.Repository, issue.Attachments[i])
+	}
+	ctx.JSON(http.StatusOK, attachments)
+}
+
+func updateAttachments(ctx *context.Context, item any, files []string) error {
+	var attachments []*repo_model.Attachment
+	switch content := item.(type) {
+	case *issues_model.Issue:
+		attachments = content.Attachments
+	case *issues_model.Comment:
+		attachments = content.Attachments
+	default:
+		return fmt.Errorf("unknown Type: %T", content)
+	}
+	for i := 0; i < len(attachments); i++ {
+		if util.SliceContainsString(files, attachments[i].UUID) {
+			continue
+		}
+		if err := repo_model.DeleteAttachment(ctx, attachments[i], true); err != nil {
+			return err
+		}
+	}
+	var err error
+	if len(files) > 0 {
+		switch content := item.(type) {
+		case *issues_model.Issue:
+			err = issues_model.UpdateIssueAttachments(ctx, content.ID, files)
+		case *issues_model.Comment:
+			err = issues_model.UpdateCommentAttachments(ctx, content, files)
+		default:
+			return fmt.Errorf("unknown Type: %T", content)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	switch content := item.(type) {
+	case *issues_model.Issue:
+		content.Attachments, err = repo_model.GetAttachmentsByIssueID(ctx, content.ID)
+	case *issues_model.Comment:
+		content.Attachments, err = repo_model.GetAttachmentsByCommentID(ctx, content.ID)
+	default:
+		return fmt.Errorf("unknown Type: %T", content)
+	}
+	return err
+}
+
+func commentContentHTML(ctx *context.Context, content template.HTML) template.HTML {
+	if strings.TrimSpace(string(content)) == "" {
+		return htmlutil.HTMLFormat(`<span class="no-content">%s</span>`, ctx.Tr("repo.issues.no_content"))
+	}
+	return content
+}
+
+func attachmentsHTML(ctx *context.Context, attachments []*repo_model.Attachment, content string) template.HTML {
+	attachHTML, err := ctx.RenderToHTML(tplAttachment, map[string]any{
+		"ctxData":     ctx.Data,
+		"Attachments": attachments,
+		"Content":     content,
+	})
+	if err != nil {
+		ctx.ServerError("attachmentsHTML.HTMLString", err)
+		return ""
+	}
+	return attachHTML
+}

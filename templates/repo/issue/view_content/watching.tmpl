@@ -1,0 +1,7 @@
+<button class="fluid ui button" type="button" data-fetch-method="post" data-fetch-url="{{.Issue.Link}}/watch?watch={{not $.IssueWatch.IsWatching}}">
+	{{if $.IssueWatch.IsWatching}}
+		{{svg "octicon-mute" 16}} {{ctx.Locale.Tr "repo.issues.unsubscribe"}}
+	{{else}}
+		{{svg "octicon-unmute" 16}} {{ctx.Locale.Tr "repo.issues.subscribe"}}
+	{{end}}
+</button>

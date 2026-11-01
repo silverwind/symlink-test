@@ -1,0 +1,80 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package org
+
+import (
+	"encoding/base64"
+	"net/http"
+
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	user_service "gitea.dev/services/user"
+)
+
+// UpdateAvatarupdates the Avatar of an Organisation
+func UpdateAvatar(ctx *context.APIContext) {
+	// swagger:operation POST /orgs/{org}/avatar organization orgUpdateAvatar
+	// ---
+	// summary: Update Avatar
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/UpdateUserAvatarOption"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+	form := web.GetForm[*api.UpdateUserAvatarOption](ctx)
+
+	content, err := base64.StdEncoding.DecodeString(form.Image)
+	if err != nil {
+		ctx.APIError(http.StatusBadRequest, err.Error())
+		return
+	}
+
+	err = user_service.UploadAvatar(ctx, ctx.Org.Organization.AsUser(), content)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}
+
+// DeleteAvatar deletes the Avatar of an Organisation
+func DeleteAvatar(ctx *context.APIContext) {
+	// swagger:operation DELETE /orgs/{org}/avatar organization orgDeleteAvatar
+	// ---
+	// summary: Delete Avatar
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+	err := user_service.DeleteAvatar(ctx, ctx.Org.Organization.AsUser())
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.Status(http.StatusNoContent)
+}

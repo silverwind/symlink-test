@@ -1,0 +1,45 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"net/http"
+	"path"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAPIRepoLFSMigrateLocal(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	defer test.MockVariableValue(&setting.ImportLocalPaths, true)()
+
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+	session := loginUser(t, user.Name)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+
+	req := NewRequestWithJSON(t, "POST", "/api/v1/repos/migrate", &api.MigrateRepoOptions{
+		CloneAddr:   path.Join(setting.RepoRootPath, "migration/lfs-test.git"),
+		RepoOwnerID: user.ID,
+		RepoName:    "lfs-test-local",
+		LFS:         true,
+	}).AddTokenAuth(token)
+	resp := MakeRequest(t, req, NoExpectedStatus)
+	assert.Equal(t, http.StatusCreated, resp.Code)
+
+	store := lfs.NewContentStore()
+	ok, _ := store.Verify(lfs.Pointer{Oid: "fb8f7d8435968c4f82a726a92395be4d16f2f63116caf36c8ad35c60831ab041", Size: 6})
+	assert.True(t, ok)
+	ok, _ = store.Verify(lfs.Pointer{Oid: "d6f175817f886ec6fbbc1515326465fa96c3bfd54a4ea06cfd6dbbd8340e0152", Size: 6})
+	assert.True(t, ok)
+}

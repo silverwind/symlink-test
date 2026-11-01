@@ -1,0 +1,287 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package git_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/timeutil"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAddDeletedBranch(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	assert.Equal(t, git.Sha1ObjectFormat.Name(), repo.ObjectFormatName)
+	firstBranch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{ID: 1})
+
+	assert.True(t, firstBranch.IsDeleted)
+	assert.NoError(t, git_model.MarkBranchAsDeleted(t.Context(), repo.ID, firstBranch.Name, firstBranch.DeletedByID))
+	assert.NoError(t, git_model.MarkBranchAsDeleted(t.Context(), repo.ID, "branch2", int64(1)))
+
+	secondBranch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo.ID, Name: "branch2"})
+	assert.True(t, secondBranch.IsDeleted)
+
+	commit := &git.Commit{
+		ID:            git.MustIDFromString(secondBranch.CommitID),
+		CommitMessage: git.CommitMessage{MessageRaw: secondBranch.CommitMessage},
+		Committer: &git.Signature{
+			When: secondBranch.CommitTime.AsLocalTime(),
+		},
+	}
+
+	_, err := git_model.UpdateBranch(t.Context(), repo.ID, secondBranch.PusherID, secondBranch.Name, commit)
+	assert.NoError(t, err)
+}
+
+func TestGetDeletedBranches(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	branches, err := db.Find[git_model.Branch](t.Context(), git_model.FindBranchOptions{
+		ListOptions:     db.ListOptionsAll,
+		RepoID:          repo.ID,
+		IsDeletedBranch: optional.Some(true),
+	})
+	assert.NoError(t, err)
+	assert.Len(t, branches, 2)
+}
+
+func TestGetDeletedBranch(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	firstBranch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{ID: 1})
+
+	assert.NotNil(t, getDeletedBranch(t, firstBranch))
+}
+
+func TestFindRecentlyPushedNewBranchesUsesPushTime(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 10})
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 12})
+	branch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo.ID, Name: "outdated-new-branch"})
+
+	commitUnix := time.Now().Add(-3 * time.Hour).Unix()
+	pushUnix := time.Now().Add(-30 * time.Minute).Unix()
+	_, err := db.GetEngine(t.Context()).Exec(
+		"UPDATE branch SET commit_time = ?, updated_unix = ? WHERE id = ?",
+		commitUnix,
+		pushUnix,
+		branch.ID,
+	)
+	assert.NoError(t, err)
+
+	branches, err := git_model.FindRecentlyPushedNewBranches(t.Context(), doer, git_model.FindRecentlyPushedNewBranchesOptions{
+		Repo:            repo,
+		BaseRepo:        repo,
+		PushedAfterUnix: time.Now().Add(-time.Hour).Unix(),
+		MaxCount:        1,
+	})
+	assert.NoError(t, err)
+	if assert.Len(t, branches, 1) {
+		assert.Equal(t, branch.Name, branches[0].BranchName)
+		assert.Equal(t, timeutil.TimeStamp(pushUnix), branches[0].PushedTime)
+	}
+}
+
+func TestDeletedBranchLoadUser(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	firstBranch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{ID: 1})
+	secondBranch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{ID: 2})
+
+	branch := getDeletedBranch(t, firstBranch)
+	assert.Nil(t, branch.DeletedBy)
+	branch.LoadDeletedBy(t.Context())
+	assert.NotNil(t, branch.DeletedBy)
+	assert.Equal(t, "user1", branch.DeletedBy.Name)
+
+	branch = getDeletedBranch(t, secondBranch)
+	assert.Nil(t, branch.DeletedBy)
+	branch.LoadDeletedBy(t.Context())
+	assert.NotNil(t, branch.DeletedBy)
+	assert.Equal(t, "Ghost", branch.DeletedBy.Name)
+}
+
+func TestRemoveDeletedBranch(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	firstBranch := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{ID: 1})
+
+	err := git_model.RemoveDeletedBranchByID(t.Context(), repo.ID, 1)
+	assert.NoError(t, err)
+	unittest.AssertNotExistsBean(t, firstBranch)
+	unittest.AssertExistsAndLoadBean(t, &git_model.Branch{ID: 2})
+}
+
+func getDeletedBranch(t *testing.T, branch *git_model.Branch) *git_model.Branch {
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	deletedBranch, err := git_model.GetDeletedBranchByID(t.Context(), repo.ID, branch.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, branch.ID, deletedBranch.ID)
+	assert.Equal(t, branch.Name, deletedBranch.Name)
+	assert.Equal(t, branch.CommitID, deletedBranch.CommitID)
+	assert.Equal(t, branch.DeletedByID, deletedBranch.DeletedByID)
+
+	return deletedBranch
+}
+
+func TestFindRenamedBranch(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	branch, exist, err := git_model.FindRenamedBranch(t.Context(), 1, "dev")
+	assert.NoError(t, err)
+	assert.True(t, exist)
+	assert.Equal(t, "master", branch.To)
+
+	_, exist, err = git_model.FindRenamedBranch(t.Context(), 1, "unknown")
+	assert.NoError(t, err)
+	assert.False(t, exist)
+}
+
+func TestRenameBranch(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	_isDefault := false
+
+	ctx, committer, err := db.TxContext(t.Context())
+	defer committer.Close()
+	assert.NoError(t, err)
+	assert.NoError(t, git_model.UpdateProtectBranch(ctx, repo1, &git_model.ProtectedBranch{
+		RepoID:   repo1.ID,
+		RuleName: "master",
+	}, git_model.WhitelistOptions{}))
+	assert.NoError(t, committer.Commit())
+
+	assert.NoError(t, git_model.RenameBranch(t.Context(), repo1, "master", "main", func(ctx context.Context, isDefault bool) error {
+		_isDefault = isDefault
+		return nil
+	}))
+
+	assert.True(t, _isDefault)
+	repo1 = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	assert.Equal(t, "main", repo1.DefaultBranch)
+
+	pull := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 1}) // merged
+	assert.Equal(t, "master", pull.BaseBranch)
+
+	pull = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2}) // open
+	assert.Equal(t, "main", pull.BaseBranch)
+
+	renamedBranch := unittest.AssertExistsAndLoadBean(t, &git_model.RenamedBranch{ID: 2})
+	assert.Equal(t, "master", renamedBranch.From)
+	assert.Equal(t, "main", renamedBranch.To)
+	assert.Equal(t, int64(1), renamedBranch.RepoID)
+
+	unittest.AssertExistsAndLoadBean(t, &git_model.ProtectedBranch{
+		RepoID:   repo1.ID,
+		RuleName: "main",
+	})
+}
+
+func TestRenameBranchProtectedRuleConflict(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	master := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo1.ID, Name: "master"})
+
+	devBranch := &git_model.Branch{
+		RepoID:        repo1.ID,
+		Name:          "dev",
+		CommitID:      master.CommitID,
+		CommitMessage: master.CommitMessage,
+		CommitTime:    master.CommitTime,
+		PusherID:      master.PusherID,
+	}
+	assert.NoError(t, db.Insert(t.Context(), devBranch))
+
+	pbDev := git_model.ProtectedBranch{
+		RepoID:   repo1.ID,
+		RuleName: "dev",
+		CanPush:  true,
+	}
+	assert.NoError(t, git_model.UpdateProtectBranch(t.Context(), repo1, &pbDev, git_model.WhitelistOptions{}))
+
+	pbMain := git_model.ProtectedBranch{
+		RepoID:   repo1.ID,
+		RuleName: "main",
+		CanPush:  true,
+	}
+	assert.NoError(t, git_model.UpdateProtectBranch(t.Context(), repo1, &pbMain, git_model.WhitelistOptions{}))
+
+	assert.NoError(t, git_model.RenameBranch(t.Context(), repo1, "dev", "main", func(ctx context.Context, isDefault bool) error {
+		return nil
+	}))
+
+	unittest.AssertNotExistsBean(t, &git_model.Branch{RepoID: repo1.ID, Name: "dev"})
+	unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo1.ID, Name: "main"})
+
+	protectedDev, err := git_model.GetProtectedBranchRuleByName(t.Context(), repo1.ID, "dev")
+	assert.NoError(t, err)
+	assert.NotNil(t, protectedDev)
+	assert.Equal(t, "dev", protectedDev.RuleName)
+
+	protectedMainByID, err := git_model.GetProtectedBranchRuleByID(t.Context(), repo1.ID, pbMain.ID)
+	assert.NoError(t, err)
+	assert.NotNil(t, protectedMainByID)
+	assert.Equal(t, "main", protectedMainByID.RuleName)
+}
+
+func TestOnlyGetDeletedBranchOnCorrectRepo(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	// Get deletedBranch with ID of 1 on repo with ID 2.
+	// This should return a nil branch as this deleted branch
+	// is actually on repo with ID 1.
+	repo2 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 2})
+
+	deletedBranch, err := git_model.GetDeletedBranchByID(t.Context(), repo2.ID, 1)
+
+	// Expect error, and the returned branch is nil.
+	assert.Error(t, err)
+	assert.Nil(t, deletedBranch)
+
+	// Now get the deletedBranch with ID of 1 on repo with ID 1.
+	// This should return the deletedBranch.
+	repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	deletedBranch, err = git_model.GetDeletedBranchByID(t.Context(), repo1.ID, 1)
+
+	// Expect no error, and the returned branch to be not nil.
+	assert.NoError(t, err)
+	assert.NotNil(t, deletedBranch)
+}
+
+func TestCountBranches(t *testing.T) {
+	// 1. Setup - Exactly like TestAddDeletedBranch
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+	// 2. Execution - Using t.Context() to match the rest of the file
+	initialCount, err := git_model.CountBranches(t.Context(), repo.ID, false)
+	assert.NoError(t, err)
+
+	// 3. Database Action - Using t.Context()
+	err = db.Insert(t.Context(), &git_model.Branch{
+		RepoID: repo.ID,
+		Name:   "test-branch-for-counting",
+	})
+	assert.NoError(t, err)
+
+	// 4. Verification
+	newCount, err := git_model.CountBranches(t.Context(), repo.ID, false)
+	assert.NoError(t, err)
+	assert.Equal(t, initialCount+1, newCount)
+}

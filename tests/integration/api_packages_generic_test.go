@@ -1,0 +1,292 @@
+// Copyright 2021 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	neturl "net/url"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestPackageGeneric(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	packageName := "te-st_pac.kage"
+	packageVersion := "1.0.3-te st"
+	filename := "fi-le_na.me"
+	content := []byte{1, 2, 3}
+
+	url := fmt.Sprintf("/api/packages/%s/generic/%s/%s", user.Name, packageName, packageVersion)
+
+	t.Run("Upload", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		req := NewRequestWithBody(t, "PUT", url+"/"+filename, bytes.NewReader(content)).
+			AddBasicAuth(user.Name)
+		MakeRequest(t, req, http.StatusCreated)
+
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeGeneric)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+		assert.NoError(t, err)
+		assert.Nil(t, pd.Metadata)
+		assert.Equal(t, packageName, pd.Package.Name)
+		assert.Equal(t, packageVersion, pd.Version.Version)
+
+		pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+		assert.NoError(t, err)
+		assert.Len(t, pfs, 1)
+		assert.Equal(t, filename, pfs[0].Name)
+		assert.True(t, pfs[0].IsLead)
+
+		pb, err := packages.GetBlobByID(t.Context(), pfs[0].BlobID)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(len(content)), pb.Size)
+
+		t.Run("Exists", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequestWithBody(t, "PUT", url+"/"+filename, bytes.NewReader(content)).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusConflict)
+		})
+
+		t.Run("Additional", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequestWithBody(t, "PUT", url+"/dummy.bin", bytes.NewReader(content)).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusCreated)
+
+			// Check deduplication
+			pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+			assert.NoError(t, err)
+			assert.Len(t, pfs, 2)
+			assert.Equal(t, pfs[0].BlobID, pfs[1].BlobID)
+		})
+
+		t.Run("InvalidParameter", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequestWithBody(t, "PUT", fmt.Sprintf("/api/packages/%s/generic/%s/%s/%s", user.Name, "invalid package name", packageVersion, filename), bytes.NewReader(content)).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusBadRequest)
+
+			req = NewRequestWithBody(t, "PUT", fmt.Sprintf("/api/packages/%s/generic/%s/%s/%s", user.Name, packageName, "%20test ", filename), bytes.NewReader(content)).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusBadRequest)
+
+			req = NewRequestWithBody(t, "PUT", fmt.Sprintf("/api/packages/%s/generic/%s/%s/%s", user.Name, packageName, packageVersion, "inva|id.name"), bytes.NewReader(content)).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusBadRequest)
+		})
+	})
+
+	t.Run("Download", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		checkDownloadCount := func(count int64) {
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeGeneric)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
+			assert.Equal(t, count, pvs[0].DownloadCount)
+		}
+
+		checkDownloadCount(0)
+
+		req := NewRequest(t, "GET", url+"/"+filename)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		assert.Equal(t, content, resp.Body.Bytes())
+
+		checkDownloadCount(1)
+
+		req = NewRequest(t, "GET", url+"/dummy.bin")
+		MakeRequest(t, req, http.StatusOK)
+
+		checkDownloadCount(2)
+
+		t.Run("NotExists", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequest(t, "GET", url+"/not.found")
+			MakeRequest(t, req, http.StatusNotFound)
+		})
+
+		t.Run("RequireSignInView", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+			defer test.MockVariableValue(&setting.Service.RequireSignInViewStrict, true)()
+
+			req = NewRequest(t, "GET", url+"/dummy.bin")
+			MakeRequest(t, req, http.StatusUnauthorized)
+		})
+
+		t.Run("ServeDirect", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			switch setting.Packages.Storage.Type {
+			case setting.MinioStorageType:
+				defer test.MockVariableValue(&setting.Packages.Storage.MinioConfig.ServeDirect, true)()
+			case setting.AzureBlobStorageType:
+				defer test.MockVariableValue(&setting.Packages.Storage.AzureBlobConfig.ServeDirect, true)()
+			default:
+				t.Skip("Test skipped for non-Minio-storage and non-AzureBlob-storage.")
+			}
+
+			req = NewRequest(t, "HEAD", url+"/"+filename)
+			resp = MakeRequest(t, req, http.StatusSeeOther)
+			location := resp.Header().Get("Location")
+			assert.NotEmpty(t, location)
+			checkDownloadCount(2)
+
+			req = NewRequest(t, "GET", url+"/"+filename)
+			resp = MakeRequest(t, req, http.StatusSeeOther)
+			checkDownloadCount(3)
+
+			location = resp.Header().Get("Location")
+			assert.NotEmpty(t, location)
+
+			resp2, err := (&http.Client{}).Get(location)
+			assert.NoError(t, err)
+			defer resp2.Body.Close()
+			assert.Equal(t, http.StatusOK, resp2.StatusCode, location)
+
+			body, err := io.ReadAll(resp2.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, content, body)
+
+			checkDownloadCount(3)
+		})
+
+		t.Run("WebAssetUsesFilename", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeGeneric)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
+
+			pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+			assert.NoError(t, err)
+			assert.NotEmpty(t, pfs)
+
+			req = NewRequest(t, "GET", fmt.Sprintf("/%s/-/packages/generic/%s/%s/files/%d", user.Name, neturl.PathEscape(packageName), neturl.PathEscape(packageVersion), pfs[0].ID))
+			resp = MakeRequest(t, req, http.StatusOK)
+			assert.Equal(t, content, resp.Body.Bytes())
+
+			disposition, params, err := mime.ParseMediaType(resp.Header().Get("Content-Disposition"))
+			assert.NoError(t, err)
+			assert.Equal(t, "attachment", disposition)
+			assert.Equal(t, pfs[0].Name, params["filename"])
+		})
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		t.Run("File", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequest(t, "DELETE", url+"/"+filename)
+			MakeRequest(t, req, http.StatusUnauthorized)
+
+			req = NewRequest(t, "DELETE", url+"/"+filename).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusNoContent)
+
+			req = NewRequest(t, "GET", url+"/"+filename)
+			MakeRequest(t, req, http.StatusNotFound)
+
+			req = NewRequest(t, "DELETE", url+"/"+filename).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusNotFound)
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeGeneric)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
+
+			t.Run("RemovesVersion", func(t *testing.T) {
+				defer tests.PrintCurrentTest(t)()
+
+				req = NewRequest(t, "DELETE", url+"/dummy.bin").
+					AddBasicAuth(user.Name)
+				MakeRequest(t, req, http.StatusNoContent)
+
+				pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeGeneric)
+				assert.NoError(t, err)
+				assert.Empty(t, pvs)
+			})
+		})
+
+		t.Run("Version", func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
+
+			req := NewRequestWithBody(t, "PUT", url+"/"+filename, bytes.NewReader(content)).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusCreated)
+
+			req = NewRequest(t, "DELETE", url)
+			MakeRequest(t, req, http.StatusUnauthorized)
+
+			req = NewRequest(t, "DELETE", url).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusNoContent)
+
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeGeneric)
+			assert.NoError(t, err)
+			assert.Empty(t, pvs)
+
+			req = NewRequest(t, "GET", url+"/"+filename)
+			MakeRequest(t, req, http.StatusNotFound)
+
+			req = NewRequest(t, "DELETE", url).
+				AddBasicAuth(user.Name)
+			MakeRequest(t, req, http.StatusNotFound)
+		})
+	})
+}
+
+// TestPackageGenericPublicOnlyTokenLimitedOwner ensures a public-only token cannot
+// access packages owned by a limited-visibility owner (only genuinely public owners).
+func TestPackageGenericPublicOnlyTokenLimitedOwner(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	// user33 has limited visibility (visible only to authenticated users, not public)
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 33})
+	base := fmt.Sprintf("/api/packages/%s/generic/pkg/1.0.0", owner.Name)
+
+	// upload a package into the limited owner's namespace
+	req := NewRequestWithBody(t, "PUT", base+"/file.bin", bytes.NewReader([]byte{1, 2, 3})).
+		AddBasicAuth(owner.Name)
+	MakeRequest(t, req, http.StatusCreated)
+
+	// a public-only read:package token (even the owner's own) must be refused
+	publicOnlyToken := getUserToken(t, owner.Name, auth_model.AccessTokenScopeReadPackage, auth_model.AccessTokenScopePublicOnly)
+	req = NewRequest(t, "GET", base+"/file.bin").AddTokenAuth(publicOnlyToken)
+	MakeRequest(t, req, http.StatusNotFound)
+	req = NewRequest(t, "GET", fmt.Sprintf("/api/v1/packages/%s/generic/pkg/1.0.0", owner.Name)).AddTokenAuth(publicOnlyToken)
+	MakeRequest(t, req, http.StatusNotFound)
+
+	// a normal read:package token still works, proving only public-only is restricted
+	token := getUserToken(t, owner.Name, auth_model.AccessTokenScopeReadPackage)
+	req = NewRequest(t, "GET", base+"/file.bin").AddTokenAuth(token)
+	MakeRequest(t, req, http.StatusOK)
+}

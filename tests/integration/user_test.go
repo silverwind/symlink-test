@@ -1,0 +1,411 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	asymkey_model "gitea.dev/models/asymkey"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/translation"
+	"gitea.dev/tests"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestUser(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	t.Run("ViewUser", testViewUser)
+	t.Run("FollowUser", testUserFollow)
+	t.Run("RenameInvalidUsername", testRenameInvalidUsername)
+	t.Run("RenameReservedUsername", testRenameReservedUsername)
+	t.Run("ViewLimitedAndPrivateUserAndRename", testViewLimitedAndPrivateUserAndRename)
+	t.Run("ExportUserGPGKeys", testExportUserGPGKeys)
+	t.Run("GetUserRss", testGetUserRss)
+	t.Run("ListStopWatches", testUserListStopWatches)
+	t.Run("LocationMapLink", testUserLocationMapLink)
+	t.Run("RenameUsername", testRenameUsername)
+}
+
+func testViewUser(t *testing.T) {
+	req := NewRequest(t, "GET", "/user2")
+	MakeRequest(t, req, http.StatusOK)
+
+	req = NewRequest(t, "GET", "/user2/-/repositories")
+	MakeRequest(t, req, http.StatusNotFound)
+
+	req = NewRequest(t, "GET", "/user2.keys")
+	resp := MakeRequest(t, req, http.StatusOK)
+	assert.Equal(t, `# Gitea isn't a key server. The keys are exported as the user uploaded and might not have been fully verified.
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDWVj0fQ5N8wNc0LVNA41wDLYJ89ZIbejrPfg/avyj3u/ZohAKsQclxG4Ju0VirduBFF9EOiuxoiFBRr3xRpqzpsZtnMPkWVWb+akZwBFAx8p+jKdy4QXR/SZqbVobrGwip2UjSrri1CtBxpJikojRIZfCnDaMOyd9Jp6KkujvniFzUWdLmCPxUE9zhTaPu0JsEP7MW0m6yx7ZUhHyfss+NtqmFTaDO+QlMR7L2QkDliN2Jl3Xa3PhuWnKJfWhdAq1Cw4oraKUOmIgXLkuiuxVQ6mD3AiFupkmfqdHq6h+uHHmyQqv3gU+/sD8GbGAhf6ftqhTsXjnv1Aj4R8NoDf9BS6KRkzkeun5UisSzgtfQzjOMEiJtmrep2ZQrMGahrXa+q4VKr0aKJfm+KlLfwm/JztfsBcqQWNcTURiCFqz+fgZw0Ey/de0eyMzldYTdXXNRYCKjs9bvBK+6SSXRM7AhftfQ0ZuoW5+gtinPrnmoOaSCEJbAiEiTO/BzOHgowiM=
+`, resp.Body.String())
+
+	_ = db.TruncateBeans(t.Context(), &asymkey_model.PublicKey{})
+	_ = db.Insert(t.Context(), &asymkey_model.PublicKey{
+		OwnerID: 2,
+		Name:    "key-1",
+		Content: "ssh-rsa AAAA",
+		Type:    asymkey_model.KeyTypeUser,
+	}, &asymkey_model.PublicKey{
+		OwnerID: 2,
+		Name:    "key-2",
+		Content: "principal",
+		Type:    asymkey_model.KeyTypePrincipal,
+	})
+	req = NewRequest(t, "GET", "/user2.keys")
+	resp = MakeRequest(t, req, http.StatusOK)
+	assert.Equal(t, `# Gitea isn't a key server. The keys are exported as the user uploaded and might not have been fully verified.
+ssh-rsa AAAA
+`, resp.Body.String())
+}
+
+func testRenameUsername(t *testing.T) {
+	session := loginUser(t, "user2")
+	req := NewRequestWithValues(t, "POST", "/user/settings", map[string]string{
+		"name":     "newUsername",
+		"email":    "user2@example.com",
+		"language": "en-US",
+	})
+	session.MakeRequest(t, req, http.StatusSeeOther)
+
+	unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "newUsername"})
+	unittest.AssertNotExistsBean(t, &user_model.User{Name: "user2"})
+}
+
+func testViewLimitedAndPrivateUserAndRename(t *testing.T) {
+	// user 22 is a limited visibility org
+	org22 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 22})
+	req := NewRequest(t, "GET", "/"+org22.Name)
+	MakeRequest(t, req, http.StatusNotFound)
+	MakeRequest(t, NewRequest(t, "GET", "/"+org22.Name).SetHeader("Accept", "application/rss+xml"), http.StatusNotFound)
+
+	session := loginUser(t, "user1")
+	oldName := org22.Name
+	newName := "org22_renamed"
+	req = NewRequestWithValues(t, "POST", "/org/"+oldName+"/settings/rename", map[string]string{
+		"org_name":     oldName,
+		"new_org_name": newName,
+	})
+	session.MakeRequest(t, req, http.StatusOK)
+
+	unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: newName})
+	unittest.AssertNotExistsBean(t, &user_model.User{Name: oldName})
+
+	req = NewRequest(t, "GET", "/"+oldName)
+	MakeRequest(t, req, http.StatusNotFound) // anonymous user cannot visit limited visibility org via old name
+	req = NewRequest(t, "GET", "/"+oldName)
+	session.MakeRequest(t, req, http.StatusTemporaryRedirect) // login user can visit limited visibility org via old name
+
+	// org 23 is a private visibility org
+	org23 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 23})
+	req = NewRequest(t, "GET", "/"+org23.Name)
+	MakeRequest(t, req, http.StatusNotFound)
+	strangerSession := loginUser(t, "user4")
+	strangerSession.MakeRequest(t, NewRequest(t, "POST", "/"+org23.Name+"?action=follow"), http.StatusNotFound)
+
+	oldName = org23.Name
+	newName = "org23_renamed"
+	req = NewRequestWithValues(t, "POST", "/org/"+oldName+"/settings/rename", map[string]string{
+		"org_name":     oldName,
+		"new_org_name": newName,
+	})
+	session.MakeRequest(t, req, http.StatusOK)
+
+	unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: newName})
+	unittest.AssertNotExistsBean(t, &user_model.User{Name: oldName})
+
+	req = NewRequest(t, "GET", "/"+oldName)
+	MakeRequest(t, req, http.StatusNotFound) // anonymous user cannot visit limited visibility org via old name
+	req = NewRequest(t, "GET", "/"+oldName)
+	session.MakeRequest(t, req, http.StatusTemporaryRedirect) // login user can visit limited visibility org via old name
+
+	// user 31 is a private visibility user
+	user31 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 31})
+	req = NewRequest(t, "GET", "/"+user31.Name)
+	MakeRequest(t, req, http.StatusNotFound)
+	MakeRequest(t, NewRequest(t, "GET", "/"+user31.Name).SetHeader("Accept", "application/rss+xml"), http.StatusNotFound)
+	MakeRequest(t, NewRequest(t, "GET", "/"+user31.Name+".keys"), http.StatusNotFound)
+	strangerSession.MakeRequest(t, NewRequest(t, "POST", "/"+user31.Name+"?action=follow"), http.StatusNotFound)
+
+	oldName = user31.Name
+	newName = "user31_renamed"
+	session2 := loginUser(t, oldName)
+	req = NewRequestWithValues(t, "POST", "/user/settings", map[string]string{
+		"name":       newName,
+		"visibility": "2", // private
+	})
+	session2.MakeRequest(t, req, http.StatusSeeOther)
+
+	unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: newName})
+	unittest.AssertNotExistsBean(t, &user_model.User{Name: oldName})
+
+	req = NewRequest(t, "GET", "/"+oldName)
+	MakeRequest(t, req, http.StatusNotFound) // anonymous user cannot visit private visibility user via old name
+	req = NewRequest(t, "GET", "/"+oldName)
+	session.MakeRequest(t, req, http.StatusTemporaryRedirect) // login user2 can visit private visibility user via old name
+}
+
+func testRenameInvalidUsername(t *testing.T) {
+	invalidUsernames := []string{
+		"%2f*",
+		"%2f.",
+		"%2f..",
+		"%00",
+		"thisHas ASpace",
+		"p<A>tho>lo<gical",
+		".",
+		"..",
+		".well-known",
+		".abc",
+		"abc.",
+		"a..bc",
+		"a...bc",
+		"a.-bc",
+		"a._bc",
+		"a_-bc",
+		"a/bc",
+		"☁️",
+		"-",
+		"--diff",
+		"-im-here",
+		"a space",
+	}
+
+	session := loginUser(t, "user2")
+	for _, invalidUsername := range invalidUsernames {
+		t.Logf("Testing username %s", invalidUsername)
+
+		req := NewRequestWithValues(t, "POST", "/user/settings", map[string]string{
+			"name":  invalidUsername,
+			"email": "user2@example.com",
+		})
+		resp := session.MakeRequest(t, req, http.StatusOK)
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		assert.Contains(t,
+			htmlDoc.doc.Find(".ui.negative.message").Text(),
+			translation.NewLocale("en-US").TrString("form.username_error", "Name"),
+		)
+
+		unittest.AssertNotExistsBean(t, &user_model.User{Name: invalidUsername})
+	}
+}
+
+func testRenameReservedUsername(t *testing.T) {
+	// ".", "..", ".well-known" are also reserved but invalid as form input.
+	reservedNames := []string{
+		"api",
+		"openapi3.v1.json",
+		"swagger.v1.json",
+	}
+	patternNotAllowedNames := []string{
+		"name.keys",
+	}
+
+	session := loginUser(t, "user2")
+	locale := translation.NewLocale("en-US")
+	check := func(name, msgKey string) {
+		req := NewRequestWithValues(t, "POST", "/user/settings", map[string]string{
+			"name":     name,
+			"email":    "user2@example.com",
+			"language": "en-US",
+		})
+		resp := session.MakeRequest(t, req, http.StatusSeeOther)
+
+		req = NewRequest(t, "GET", test.RedirectURL(resp))
+		resp = session.MakeRequest(t, req, http.StatusOK)
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		actualMsg := strings.TrimSpace(htmlDoc.doc.Find(".ui.negative.message").Text())
+		assert.Equal(t, locale.TrString(msgKey, name), actualMsg)
+		unittest.AssertNotExistsBean(t, &user_model.User{Name: name})
+	}
+	for _, name := range reservedNames {
+		check(name, "user.form.name_reserved")
+	}
+	for _, name := range patternNotAllowedNames {
+		check(name, "user.form.name_pattern_not_allowed")
+	}
+}
+
+func testExportUserGPGKeys(t *testing.T) {
+	testExportUserGPGKeys := func(t *testing.T, user, expected string) {
+		t.Helper()
+		session := loginUser(t, user)
+		t.Logf("Testing username %s export gpg keys", user)
+		req := NewRequest(t, "GET", "/"+user+".gpg")
+		resp := session.MakeRequest(t, req, http.StatusOK)
+		assert.Equal(t, expected, resp.Body.String())
+	}
+
+	// Export empty key list
+	testExportUserGPGKeys(t, "user1", `-----BEGIN PGP PUBLIC KEY BLOCK-----
+Comment: Gitea isn't a key server. The keys are exported as the user uploaded and might not have been fully verified.
+Note: This user hasn't uploaded any GPG keys.
+
+
+=twTO
+-----END PGP PUBLIC KEY BLOCK-----`)
+	// Import key
+	// User1 <user1@example.com>
+	session := loginUser(t, "user1")
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteUser)
+	testCreateGPGKey(t, session.MakeRequest, token, http.StatusCreated, `-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQENBFyy/VUBCADJ7zbM20Z1RWmFoVgp5WkQfI2rU1Vj9cQHes9i42wVLLtcbPeo
+QzubgzvMPITDy7nfWxgSf83E23DoHQ1ACFbQh/6eFSRrjsusp3YQ/08NSfPPbcu8
+0M5G+VGwSfzS5uEcwBVQmHyKdcOZIERTNMtYZx1C3bjLD1XVJHvWz9D72Uq4qeO3
+8SR+lzp5n6ppUakcmRnxt3nGRBj1+hEGkdgzyPo93iy+WioegY2lwCA9xMEo5dah
+BmYxWx51zyiXYlReTaxlyb3/nuSUt8IcW3Q8zjdtJj4Nu8U1SpV8EdaA1I9IPbHW
+510OSLmD3XhqHH5m6mIxL1YoWxk3V7gpDROtABEBAAG0GVVzZXIxIDx1c2VyMUBl
+eGFtcGxlLmNvbT6JAU4EEwEIADgWIQTQEbrYxmXsp1z3j7z9+v0I6RSEHwUCXLL9
+VQIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIXgAAKCRD9+v0I6RSEH22YCACFqL5+
+6M0m18AMC/pumcpnnmvAS1GrrKTF8nOROA1augZwp1WCNuKw2R6uOJIHANrYECSn
+u7+j6GBP2gbIW8mSAzS6HWCs7GGiPpVtT4wcu8wljUI6BxjpyZtoEkriyBjt6HfK
+rkegbkuySoJvjq4IcO5D1LB1JWgsUjMYQJj/ZpBIzVtjG9QtFSOiT1Hct4PoZHdC
+nsdSgyCkwRZXG+u3kT/wP9F663ba4o16vYlz3dCGo66lF2tyoG3qcyZ1OUzUrnuv
+96ytAzT6XIhrE0nVoBprMxFF5zExotJD3bHjcGBFNLf944bhjKee3U6t9+OsfJVC
+l7N5xxIawCuTQdbfuQENBFyy/VUBCADe61yGEoTwKfsOKIhxLaNoRmD883O0tiWt
+soO/HPj9dPQLTOiwXgSgSCd8C+LNxGKct87wgFozpah4tDLC6c0nALuHJ0SLbkfz
+55aRhLeOOcrAydatDp72GroXzqpZ0xZBk5wjIWdgEol2GmVRM8QGbeuakU/HVz5y
+lPzxUUocgdbSi3GE3zbzijQzVJdyL/kw/KP7pKT/PPKKJ2C5NQDLy0XGKEHddXGR
+EWKkVlRalxq/TjfaMR0bi3MpezBsQmp99ATPO/d7trayZUxQHRtXzGFiOXfDHATr
+qN730sODjqvU+mpc/SHCRwh9qWDjZRHSuKU5YDBjb5jIQJivZsQ/ABEBAAGJATYE
+GAEIACAWIQTQEbrYxmXsp1z3j7z9+v0I6RSEHwUCXLL9VQIbDAAKCRD9+v0I6RSE
+H7WoB/4tXl+97rQ6owPCGSVp1Xbwt2521V7COgsOFRVTRTryEWxRW8mm0S7wQvax
+C0TLXKur6NVYQMn01iyL+FZzRpEWNuYF3f9QeeLJ/+l2DafESNhNTy17+RPmacK6
+21dccpqchByVw/UMDeHSyjQLiG2lxzt8Gfx2gHmSbrq3aWovTGyz6JTffZvfy/n2
+0Hm437OBPazO0gZyXhdV2PE5RSUfvAgm44235tcV5EV0d32TJDfv61+Vr2GUbah6
+7XhJ1v6JYuh8kaYaEz8OpZDeh7f6Ho6PzJrsy/TKTKhGgZNINj1iaPFyOkQgKR5M
+GrE0MHOxUbc9tbtyk0F1SuzREUBH
+=DDXw
+-----END PGP PUBLIC KEY BLOCK-----`)
+	// Export new key
+	testExportUserGPGKeys(t, "user1", `-----BEGIN PGP PUBLIC KEY BLOCK-----
+Comment: Gitea isn't a key server. The keys are exported as the user uploaded and might not have been fully verified.
+
+xsBNBFyy/VUBCADJ7zbM20Z1RWmFoVgp5WkQfI2rU1Vj9cQHes9i42wVLLtcbPeo
+QzubgzvMPITDy7nfWxgSf83E23DoHQ1ACFbQh/6eFSRrjsusp3YQ/08NSfPPbcu8
+0M5G+VGwSfzS5uEcwBVQmHyKdcOZIERTNMtYZx1C3bjLD1XVJHvWz9D72Uq4qeO3
+8SR+lzp5n6ppUakcmRnxt3nGRBj1+hEGkdgzyPo93iy+WioegY2lwCA9xMEo5dah
+BmYxWx51zyiXYlReTaxlyb3/nuSUt8IcW3Q8zjdtJj4Nu8U1SpV8EdaA1I9IPbHW
+510OSLmD3XhqHH5m6mIxL1YoWxk3V7gpDROtABEBAAHNGVVzZXIxIDx1c2VyMUBl
+eGFtcGxlLmNvbT7CwI4EEwEIADgWIQTQEbrYxmXsp1z3j7z9+v0I6RSEHwUCXLL9
+VQIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIXgAAKCRD9+v0I6RSEH22YCACFqL5+
+6M0m18AMC/pumcpnnmvAS1GrrKTF8nOROA1augZwp1WCNuKw2R6uOJIHANrYECSn
+u7+j6GBP2gbIW8mSAzS6HWCs7GGiPpVtT4wcu8wljUI6BxjpyZtoEkriyBjt6HfK
+rkegbkuySoJvjq4IcO5D1LB1JWgsUjMYQJj/ZpBIzVtjG9QtFSOiT1Hct4PoZHdC
+nsdSgyCkwRZXG+u3kT/wP9F663ba4o16vYlz3dCGo66lF2tyoG3qcyZ1OUzUrnuv
+96ytAzT6XIhrE0nVoBprMxFF5zExotJD3bHjcGBFNLf944bhjKee3U6t9+OsfJVC
+l7N5xxIawCuTQdbfzsBNBFyy/VUBCADe61yGEoTwKfsOKIhxLaNoRmD883O0tiWt
+soO/HPj9dPQLTOiwXgSgSCd8C+LNxGKct87wgFozpah4tDLC6c0nALuHJ0SLbkfz
+55aRhLeOOcrAydatDp72GroXzqpZ0xZBk5wjIWdgEol2GmVRM8QGbeuakU/HVz5y
+lPzxUUocgdbSi3GE3zbzijQzVJdyL/kw/KP7pKT/PPKKJ2C5NQDLy0XGKEHddXGR
+EWKkVlRalxq/TjfaMR0bi3MpezBsQmp99ATPO/d7trayZUxQHRtXzGFiOXfDHATr
+qN730sODjqvU+mpc/SHCRwh9qWDjZRHSuKU5YDBjb5jIQJivZsQ/ABEBAAHCwHYE
+GAEIACAWIQTQEbrYxmXsp1z3j7z9+v0I6RSEHwUCXLL9VQIbDAAKCRD9+v0I6RSE
+H7WoB/4tXl+97rQ6owPCGSVp1Xbwt2521V7COgsOFRVTRTryEWxRW8mm0S7wQvax
+C0TLXKur6NVYQMn01iyL+FZzRpEWNuYF3f9QeeLJ/+l2DafESNhNTy17+RPmacK6
+21dccpqchByVw/UMDeHSyjQLiG2lxzt8Gfx2gHmSbrq3aWovTGyz6JTffZvfy/n2
+0Hm437OBPazO0gZyXhdV2PE5RSUfvAgm44235tcV5EV0d32TJDfv61+Vr2GUbah6
+7XhJ1v6JYuh8kaYaEz8OpZDeh7f6Ho6PzJrsy/TKTKhGgZNINj1iaPFyOkQgKR5M
+GrE0MHOxUbc9tbtyk0F1SuzREUBH
+=WFf5
+-----END PGP PUBLIC KEY BLOCK-----`)
+}
+
+func testGetUserRss(t *testing.T) {
+	user34 := "the_34-user.with.all.allowedChars"
+	req := NewRequestf(t, "GET", "/%s.rss", user34)
+	resp := MakeRequest(t, req, http.StatusOK)
+	if assert.Equal(t, "application/rss+xml; charset=utf-8", resp.Header().Get("Content-Type")) {
+		rssDoc := NewHTMLParser(t, resp.Body).Find("channel")
+		title, _ := rssDoc.ChildrenFiltered("title").Html()
+		assert.Equal(t, "Feed of &#34;the_1-user.with.all.allowedChars&#34;", title)
+		description, _ := rssDoc.ChildrenFiltered("description").Html()
+		assert.Equal(t, "&lt;p dir=&#34;auto&#34;&gt;some &lt;a href=&#34;https://commonmark.org/&#34; rel=&#34;nofollow&#34;&gt;commonmark&lt;/a&gt;!&lt;/p&gt;\n", description)
+	}
+
+	req = NewRequestf(t, "GET", "/non-existent-user.rss")
+	MakeRequest(t, req, http.StatusNotFound)
+
+	session := loginUser(t, "user2")
+	req = NewRequestf(t, "GET", "/non-existent-user.rss")
+	session.MakeRequest(t, req, http.StatusNotFound)
+
+	MakeRequest(t, NewRequest(t, "GET", "/").SetHeader("Accept", "application/rss+xml"), http.StatusUnsupportedMediaType)
+
+	defer test.MockVariableValue(&setting.Other.EnableFeed, false)()
+	MakeRequest(t, NewRequestf(t, "GET", "/%s.rss", user34), http.StatusNotFound)
+	MakeRequest(t, NewRequestf(t, "GET", "/%s", user34).SetHeader("Accept", "application/rss+xml"), http.StatusNotFound)
+}
+
+func testUserListStopWatches(t *testing.T) {
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	session := loginUser(t, owner.Name)
+	req := NewRequest(t, "GET", "/user/stopwatches")
+	resp := session.MakeRequest(t, req, http.StatusOK)
+	apiWatches := DecodeJSON(t, resp, []*api.StopWatch{})
+	stopwatch := unittest.AssertExistsAndLoadBean(t, &issues_model.Stopwatch{UserID: owner.ID})
+	issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: stopwatch.IssueID})
+	if assert.Len(t, apiWatches, 1) {
+		assert.Equal(t, stopwatch.CreatedUnix.AsTime().Unix(), apiWatches[0].Created.Unix())
+		assert.Equal(t, issue.Index, apiWatches[0].IssueIndex)
+		assert.Equal(t, issue.Title, apiWatches[0].IssueTitle)
+		assert.Equal(t, repo.Name, apiWatches[0].RepoName)
+		assert.Equal(t, repo.OwnerName, apiWatches[0].RepoOwnerName)
+		assert.Positive(t, apiWatches[0].Seconds)
+	}
+}
+
+func testUserLocationMapLink(t *testing.T) {
+	defer test.MockVariableValue(&setting.Service.UserLocationMapURL, "https://example/foo/")()
+
+	session := loginUser(t, "user2")
+	req := NewRequestWithValues(t, "POST", "/user/settings", map[string]string{
+		"name":     "user2",
+		"email":    "user@example.com",
+		"language": "en-US",
+		"location": "A/b",
+	})
+	session.MakeRequest(t, req, http.StatusSeeOther)
+
+	req = NewRequest(t, "GET", "/user2/")
+	resp := session.MakeRequest(t, req, http.StatusOK)
+	htmlDoc := NewHTMLParser(t, resp.Body)
+	AssertHTMLElement(t, htmlDoc, `a[href="https://example/foo/A%2Fb"]`, true)
+}
+
+func testUserFollow(t *testing.T) {
+	bot := &user_model.User{
+		Name:  "follow-bot",
+		Email: "follow-bot@example.com",
+		Type:  user_model.UserTypeBot,
+	}
+	require.NoError(t, user_model.CreateUser(t.Context(), bot, &user_model.Meta{}))
+
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user2"})
+	session := loginUser(t, doer.Name)
+
+	req := NewRequestWithValues(t, "POST", "/"+bot.Name, map[string]string{"action": "follow"})
+	resp := session.MakeRequest(t, req, http.StatusOK)
+	assert.Contains(t, resp.Body.String(), `id="profile-avatar-card"`)
+	assert.True(t, user_model.IsFollowing(t.Context(), doer.ID, bot.ID))
+
+	req = NewRequestWithValues(t, "POST", "/"+bot.Name, map[string]string{"action": "unfollow"})
+	resp = session.MakeRequest(t, req, http.StatusOK)
+	assert.Contains(t, resp.Body.String(), `id="profile-avatar-card"`)
+	assert.False(t, user_model.IsFollowing(t.Context(), doer.ID, bot.ID))
+}

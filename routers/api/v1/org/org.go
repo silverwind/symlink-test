@@ -1,0 +1,571 @@
+// Copyright 2015 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package org
+
+import (
+	gocontext "context"
+	"errors"
+	"fmt"
+	"net/http"
+
+	activities_model "gitea.dev/models/activities"
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	repo_model "gitea.dev/models/repo"
+	system_model "gitea.dev/models/system"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/user"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	feed_service "gitea.dev/services/feed"
+	"gitea.dev/services/org"
+	repo_service "gitea.dev/services/repository"
+	user_service "gitea.dev/services/user"
+)
+
+func listUserOrgs(ctx *context.APIContext, u *user_model.User) {
+	listOptions := utils.GetListOptions(ctx)
+	opts := organization.FindOrgOptions{
+		ListOptions:       listOptions,
+		UserID:            u.ID,
+		IncludeVisibility: organization.DoerViewOtherVisibility(ctx.Doer, u),
+	}
+	orgs, maxResults, err := db.FindAndCount[organization.Organization](ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	apiOrgs := make([]*api.Organization, len(orgs))
+	for i := range orgs {
+		apiOrgs[i] = convert.ToOrganization(ctx, orgs[i])
+	}
+
+	ctx.SetLinkHeader(maxResults, listOptions.PageSize)
+	ctx.SetTotalCountHeader(maxResults)
+	ctx.JSON(http.StatusOK, &apiOrgs)
+}
+
+// ListMyOrgs list all my orgs
+func ListMyOrgs(ctx *context.APIContext) {
+	// swagger:operation GET /user/orgs organization orgListCurrentUserOrgs
+	// ---
+	// summary: List the current user's organizations
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/OrganizationList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	listUserOrgs(ctx, ctx.Doer)
+}
+
+// ListUserOrgs list user's orgs
+func ListUserOrgs(ctx *context.APIContext) {
+	// swagger:operation GET /users/{username}/orgs organization orgListUserOrgs
+	// ---
+	// summary: List a user's organizations
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: username
+	//   in: path
+	//   description: username of the user whose organizations are to be listed
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/OrganizationList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	listUserOrgs(ctx, ctx.ContextUser)
+}
+
+// GetUserOrgsPermissions get user permissions in organization
+func GetUserOrgsPermissions(ctx *context.APIContext) {
+	// swagger:operation GET /users/{username}/orgs/{org}/permissions organization orgGetUserPermissions
+	// ---
+	// summary: Get user permissions in organization
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: username
+	//   in: path
+	//   description: username of the user whose permissions are to be obtained
+	//   type: string
+	//   required: true
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/OrganizationPermissions"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	var o *user_model.User
+	if o = user.GetUserByPathParam(ctx, "org"); o == nil {
+		return
+	}
+
+	op := api.OrganizationPermissions{}
+
+	if !organization.HasOrgOrUserVisible(ctx, o, ctx.Doer) {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	org := organization.OrgFromUser(o)
+	authorizeLevel, err := org.GetOrgUserMaxAuthorizeLevel(ctx, ctx.ContextUser.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if authorizeLevel > perm.AccessModeNone {
+		op.CanRead = true
+	}
+	if authorizeLevel > perm.AccessModeRead {
+		op.CanWrite = true
+	}
+	if authorizeLevel > perm.AccessModeWrite {
+		op.IsAdmin = true
+	}
+	if authorizeLevel > perm.AccessModeAdmin {
+		op.IsOwner = true
+	}
+
+	op.CanCreateRepository, err = org.CanCreateOrgRepo(ctx, ctx.ContextUser.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, op)
+}
+
+// GetAll return list of all public organizations
+func GetAll(ctx *context.APIContext) {
+	// swagger:operation Get /orgs organization orgGetAll
+	// ---
+	// summary: Get list of organizations
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/OrganizationList"
+
+	vMode := []api.VisibleType{api.VisibleTypePublic}
+	if ctx.IsSigned {
+		vMode = append(vMode, api.VisibleTypeLimited)
+		if ctx.Doer.IsAdmin {
+			vMode = append(vMode, api.VisibleTypePrivate)
+		}
+	}
+
+	listOptions := utils.GetListOptions(ctx)
+
+	searchOpts := user_model.SearchUserOptions{
+		Actor:       ctx.Doer,
+		ListOptions: listOptions,
+		Types:       []user_model.UserType{user_model.UserTypeOrganization},
+		OrderBy:     db.SearchOrderByAlphabetically,
+		Visible:     vMode,
+	}
+
+	publicOrgs, maxResults, err := user_model.SearchUsers(ctx, searchOpts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	orgs := make([]*api.Organization, len(publicOrgs))
+	for i := range publicOrgs {
+		orgs[i] = convert.ToOrganization(ctx, organization.OrgFromUser(publicOrgs[i]))
+	}
+
+	ctx.SetLinkHeader(maxResults, listOptions.PageSize)
+	ctx.SetTotalCountHeader(maxResults)
+	ctx.JSON(http.StatusOK, &orgs)
+}
+
+// Create api for create organization
+func Create(ctx *context.APIContext) {
+	// swagger:operation POST /orgs organization orgCreate
+	// ---
+	// summary: Create an organization
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: organization
+	//   in: body
+	//   required: true
+	//   schema: { "$ref": "#/definitions/CreateOrgOption" }
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Organization"
+	//   default:
+	//     "$ref": "#/responses/error"
+	form := web.GetForm[*api.CreateOrgOption](ctx)
+	if !ctx.Doer.CanCreateOrganization() {
+		ctx.APIError(http.StatusForbidden, "not allowed to create org")
+		return
+	}
+
+	visibility := api.VisibleTypePublic
+	if form.Visibility != "" {
+		visibility = api.VisibilityModes[form.Visibility]
+	}
+
+	org := &organization.Organization{
+		Name:                      form.UserName,
+		FullName:                  form.FullName,
+		Email:                     form.Email,
+		Description:               form.Description,
+		Website:                   form.Website,
+		Location:                  form.Location,
+		IsActive:                  true,
+		Type:                      user_model.UserTypeOrganization,
+		Visibility:                visibility,
+		RepoAdminChangeTeamAccess: form.RepoAdminChangeTeamAccess,
+	}
+	if err := organization.CreateOrganization(ctx, org, ctx.Doer); err != nil {
+		if user_model.IsErrUserAlreadyExist(err) ||
+			db.IsErrNameReserved(err) ||
+			db.IsErrNameCharsNotAllowed(err) ||
+			db.IsErrNamePatternNotAllowed(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+
+	audit.Record(ctx, audit_model.OrganizationCreate, org.AsUser())
+
+	ctx.JSON(http.StatusCreated, convert.ToOrganization(ctx, org))
+}
+
+// Get get an organization
+func Get(ctx *context.APIContext) {
+	// swagger:operation GET /orgs/{org} organization orgGet
+	// ---
+	// summary: Get an organization
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization to get
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Organization"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if !organization.HasOrgOrUserVisible(ctx, ctx.Org.Organization.AsUser(), ctx.Doer) {
+		ctx.APIErrorNotFound()
+		return
+	}
+
+	org := convert.ToOrganization(ctx, ctx.Org.Organization)
+
+	// Don't show Mail, when User is not logged in
+	if ctx.Doer == nil {
+		org.Email = ""
+	}
+
+	ctx.JSON(http.StatusOK, org)
+}
+
+func Rename(ctx *context.APIContext) {
+	// swagger:operation POST /orgs/{org}/rename organization renameOrg
+	// ---
+	// summary: Rename an organization
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: existing org name
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   required: true
+	//   schema:
+	//     "$ref": "#/definitions/RenameOrgOption"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.RenameOrgOption](ctx)
+	orgUser := ctx.Org.Organization.AsUser()
+	if err := user_service.RenameUser(ctx, orgUser, form.NewName, ctx.Doer); err != nil {
+		if user_model.IsErrUserAlreadyExist(err) || db.IsErrNameReserved(err) || db.IsErrNamePatternNotAllowed(err) || db.IsErrNameCharsNotAllowed(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+// Edit change an organization's information
+func Edit(ctx *context.APIContext) {
+	// swagger:operation PATCH /orgs/{org} organization orgEdit
+	// ---
+	// summary: Edit an organization
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization to edit
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   required: true
+	//   schema:
+	//     "$ref": "#/definitions/EditOrgOption"
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/Organization"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	form := web.GetForm[*api.EditOrgOption](ctx)
+
+	if err := org.UpdateOrgEmailAddress(ctx, ctx.Org.Organization, form.Email); err != nil {
+		if errors.Is(err, util.ErrInvalidArgument) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	opts := &user_service.UpdateOptions{
+		FullName:                  optional.FromPtr(form.FullName),
+		Description:               optional.FromPtr(form.Description),
+		Website:                   optional.FromPtr(form.Website),
+		Location:                  optional.FromPtr(form.Location),
+		Visibility:                optional.FromMapLookup(api.VisibilityModes, optional.FromPtr(form.Visibility).Value()),
+		RepoAdminChangeTeamAccess: optional.FromPtr(form.RepoAdminChangeTeamAccess),
+	}
+	if err := user_service.UpdateUser(ctx, ctx.Org.Organization.AsUser(), opts); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, convert.ToOrganization(ctx, ctx.Org.Organization))
+}
+
+// Delete an organization
+func Delete(ctx *context.APIContext) {
+	// swagger:operation DELETE /orgs/{org} organization orgDelete
+	// ---
+	// summary: Delete an organization
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: organization that is to be deleted
+	//   type: string
+	//   required: true
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	if err := org.DeleteOrganization(ctx, ctx.Org.Organization, false); err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.Status(http.StatusNoContent)
+}
+
+func ListOrgActivityFeeds(ctx *context.APIContext) {
+	// swagger:operation GET /orgs/{org}/activities/feeds organization orgListActivityFeeds
+	// ---
+	// summary: List an organization's activity feeds
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the org
+	//   type: string
+	//   required: true
+	// - name: date
+	//   in: query
+	//   description: the date of the activities to be found
+	//   type: string
+	//   format: date
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/ActivityFeedsList"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	includePrivate := false
+	if ctx.IsSigned {
+		if ctx.Doer.IsAdmin {
+			includePrivate = true
+		} else {
+			org := organization.OrgFromUser(ctx.ContextUser)
+			isMember, err := org.IsOrgMember(ctx, ctx.Doer.ID)
+			if err != nil {
+				ctx.APIErrorInternal(err)
+				return
+			}
+			includePrivate = isMember
+		}
+	}
+
+	listOptions := utils.GetListOptions(ctx)
+
+	opts := activities_model.GetFeedsOptions{
+		RequestedUser:  ctx.ContextUser,
+		Actor:          ctx.Doer,
+		IncludePrivate: includePrivate,
+		Date:           ctx.FormString("date"),
+		ListOptions:    listOptions,
+	}
+
+	feeds, count, err := feed_service.GetFeeds(ctx, opts)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	ctx.SetTotalCountHeader(count)
+
+	ctx.JSON(http.StatusOK, convert.ToActivities(ctx, feeds, ctx.Doer))
+}
+
+func deleteOrgReposBackground(ctx gocontext.Context, org *organization.Organization, repoIDs []int64, doer *user_model.User) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("panic during org repo deletion: %v, stack: %v", r, log.Stack(2))
+		}
+	}()
+
+	for _, repoID := range repoIDs {
+		repo, err := repo_model.GetRepositoryByID(ctx, repoID)
+		if err != nil {
+			desc := fmt.Sprintf("Failed to get repository ID %d in org %s: %v", repoID, org.Name, err)
+			_ = system_model.CreateNotice(ctx, system_model.NoticeRepository, desc)
+			log.Error("GetRepositoryByID failed: %v", desc)
+			continue
+		}
+		if err := repo_service.DeleteRepository(ctx, doer, repo, true); err != nil {
+			desc := fmt.Sprintf("Failed to delete repository %s (ID: %d) in org %s: %v", repo.Name, repo.ID, org.Name, err)
+			_ = system_model.CreateNotice(ctx, system_model.NoticeRepository, desc)
+			log.Error("DeleteRepository failed: %v", desc)
+			continue
+		}
+		log.Info("Successfully deleted repository %s (ID: %d) in org %s", repo.Name, repo.ID, org.Name)
+	}
+	log.Info("Completed deletion of repositories in org %s", org.Name)
+}
+
+func DeleteOrgRepos(ctx *context.APIContext) {
+	// swagger:operation DELETE /orgs/{org}/repos organization orgDeleteRepos
+	// ---
+	// summary: Delete all repositories in an organization
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// responses:
+	//   "202":
+	//     "$ref": "#/responses/empty"
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
+
+	// Intentionally it only loads repository IDs to avoid loading too much data into memory
+	// There is no need to do pagination here as the number of repositories is expected to be manageable
+	repoIDs, err := repo_model.GetOrgRepositoryIDs(ctx, ctx.Org.Organization.ID)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+
+	if len(repoIDs) == 0 {
+		ctx.Status(http.StatusNoContent)
+		return
+	}
+
+	// Start deletion (slow) in background with detached context, so it can continue even if the request is canceled
+	go deleteOrgReposBackground(graceful.GetManager().ShutdownContext(), ctx.Org.Organization, repoIDs, ctx.Doer)
+
+	ctx.Status(http.StatusAccepted)
+}

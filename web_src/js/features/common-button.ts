@@ -1,0 +1,146 @@
+import {addDelegatedEventListener, hideElem, isElemVisible, showElem, toggleElem} from '../utils/dom.ts';
+import {showModal} from '../modules/modal.ts';
+import {camelize} from 'vue';
+import {applyAutoFocus} from './common-page.ts';
+
+export function initGlobalButtonClickOnEnter(): void {
+  addDelegatedEventListener(document, 'keypress', 'div.ui.button, span.ui.button', (el, e: KeyboardEvent) => {
+    if (e.code === 'Space' || e.code === 'Enter') {
+      e.preventDefault();
+      el.click();
+    }
+  });
+}
+
+function onShowPanelClick(el: HTMLElement, e: MouseEvent) {
+  // a '.show-panel' element can show a panel, by `data-panel="selector"`
+  // if it has "toggle" class, it toggles the panel
+  e.preventDefault();
+  const sel = el.getAttribute('data-panel')!;
+  const selHide = el.getAttribute('data-panel-hide');
+  if (selHide) hideElem(selHide);
+  const elems = el.classList.contains('toggle') ? toggleElem(sel) : showElem(sel);
+  for (const elem of elems) {
+    if (isElemVisible(elem as HTMLElement)) {
+      applyAutoFocus(elem);
+    }
+  }
+}
+
+function onHidePanelClick(el: HTMLElement, e: MouseEvent) {
+  // a `.hide-panel` element can hide a panel, by `data-panel="selector"` or `data-panel-closest="selector"`
+  e.preventDefault();
+  let sel = el.getAttribute('data-panel');
+  if (sel) {
+    hideElem(sel);
+    return;
+  }
+  sel = el.getAttribute('data-panel-closest');
+  if (sel) {
+    hideElem((el.parentNode as HTMLElement).closest(sel)!);
+    return;
+  }
+  throw new Error('no panel to hide'); // should never happen, otherwise there is a bug in code
+}
+
+export type ElementWithAssignableProperties = {
+  nodeName: string;
+  getAttribute: (name: string) => string | null;
+  setAttribute: (name: string, value: string) => void;
+};
+
+export function assignElementProperty(el: ElementWithAssignableProperties, kebabName: string, val: string) {
+  if (el.nodeName === 'FORM') {
+    // HINT: GOLANG-HTML-TEMPLATE-URL-ESCAPING: a special case for Golang HTML template escaping.
+    // Golang HTML template only handles some "known" attribute names as URL (e.g.: when the name is "action" or contains "url")
+    // To prevent template developers from making mistakes like `data-modal-form.action="?k={{ValueWithSpecialChars}}" (no escaping),
+    // here we use `data-modal-form.url="?k={{ValueWithSpecialChars}}", then the value gets correctly escaped by Golang HTML template.
+    if (kebabName === 'action') throw new Error(`don't assign element property "action" by value, use "data-modal-form.url" instead`);
+    if (kebabName === 'url') kebabName = 'action';
+  }
+  const camelizedName = camelize(kebabName);
+  const properties: Record<string, unknown> = el;
+  const old = properties[camelizedName];
+  if (typeof old === 'boolean') {
+    properties[camelizedName] = val === 'true';
+  } else if (typeof old === 'number') {
+    properties[camelizedName] = parseFloat(val);
+  } else if (typeof old === 'string') {
+    properties[camelizedName] = val;
+  } else if (old && typeof old === 'object' && 'nodeName' in old) {
+    // "form" has an edge case: its "<input name=action>" element overwrites the "action" property, we can only set attribute
+    el.setAttribute(kebabName, val);
+  } else {
+    // in the future, maybe we could introduce a better typing system if it is really needed
+    throw new Error(`cannot assign element property "${camelizedName}" by value "${val}"`);
+  }
+}
+
+function onShowModalClick(el: HTMLElement, e: MouseEvent) {
+  // A ".show-modal" button will show a modal dialog defined by its "data-modal" attribute.
+  // Each "data-modal-{target}" attribute will be filled to target element's value or text-content.
+  // * First, try to query '#target'
+  // * Then, try to query '[name=target]'
+  // * Then, try to query '.target'
+  // * Then, try to query 'target' as HTML tag
+  // If there's a ".{prop-name}" part like "data-modal-input.value", the "input" element's "value" property will be set,
+  // the "prop-name" will be camel-cased to "propName" (e.g.: "data-modal-input.read-only" for "readOnly" property).
+  //
+  // HINT: GOLANG-HTML-TEMPLATE-URL-ESCAPING: Form element's "action" property must be set by "data-modal-form.url"
+  // to make the template variables get correctly escaped in the URL.
+  e.preventDefault();
+  const modalSelector = el.getAttribute('data-modal')!;
+  const elModal = document.querySelector<HTMLDialogElement>(modalSelector);
+  if (!elModal) throw new Error('no modal for this action');
+
+  const modalAttrPrefix = 'data-modal-';
+  for (const attrib of el.attributes) {
+    if (!attrib.name.startsWith(modalAttrPrefix)) {
+      continue;
+    }
+
+    const attrTargetCombo = attrib.name.substring(modalAttrPrefix.length);
+    const [attrTargetName, attrTargetProp] = attrTargetCombo.split('.');
+    // try to find target by: "#target" -> "[name=target]" -> ".target" -> "<target> tag", and then try the modal itself
+    const attrTarget = elModal.querySelector(`#${attrTargetName}`) ||
+      elModal.querySelector(`[name=${CSS.escape(attrTargetName)}]`) ||
+      elModal.querySelector(`.${attrTargetName}`) ||
+      elModal.querySelector(attrTargetName) ||
+      (elModal.matches(attrTargetName) || elModal.matches(`#${attrTargetName}`) || elModal.matches(`.${attrTargetName}`) ? elModal : null);
+    if (!attrTarget) {
+      if (!window.config.runModeIsProd) throw new Error(`attr target "${attrTargetCombo}" not found for modal`);
+      continue;
+    }
+
+    if (attrTargetProp) {
+      assignElementProperty(attrTarget, attrTargetProp, attrib.value);
+    } else if (attrTarget.matches('input[type=checkbox], input[type=radio]')) {
+      (attrTarget as HTMLInputElement).checked = attrib.value === 'true';
+    } else if (attrTarget.matches('input, textarea')) {
+      (attrTarget as HTMLInputElement | HTMLTextAreaElement).value = attrib.value;
+    } else {
+      attrTarget.textContent = attrib.value; // FIXME: it should be more strict here, only handle div/span/p
+    }
+  }
+
+  showModal(elModal);
+}
+
+export function initGlobalButtons(): void {
+  // There are many "cancel button" elements in modal dialogs, they are expected to be button-like elements but never submit a form.
+  // However, Gitea misuses the modal dialog and put the cancel buttons inside forms, so we must prevent the form submission.
+  // There are a few cancel buttons in non-modal forms, and there are some dynamically created forms (eg: the "Edit Issue Content")
+  addDelegatedEventListener(document, 'click', 'form button.ui.cancel.button', (_ /* el */, e) => e.preventDefault());
+
+  // Ideally these "button" events should be handled by registerGlobalEventFunc
+  // Refactoring would involve too many changes, so at the moment, just use the global event listener.
+  addDelegatedEventListener(document, 'click', '.show-panel, .hide-panel, .show-modal', (el, e: MouseEvent) => {
+    if (el.classList.contains('show-panel')) {
+      onShowPanelClick(el, e);
+    } else if (el.classList.contains('hide-panel')) {
+      onHidePanelClick(el, e);
+    } else if (el.classList.contains('show-modal')) {
+      onShowModalClick(el, e);
+    }
+  });
+}

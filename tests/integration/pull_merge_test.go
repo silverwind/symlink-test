@@ -1,0 +1,1384 @@
+// Copyright 2017 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/perm"
+	pull_model "gitea.dev/models/pull"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/models/webhook"
+	"gitea.dev/modules/commitstatus"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	issue_indexer "gitea.dev/modules/indexer/issues"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/translation"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/automerge"
+	"gitea.dev/services/automergequeue"
+	"gitea.dev/services/forms"
+	pull_service "gitea.dev/services/pull"
+	repo_service "gitea.dev/services/repository"
+	commitstatus_service "gitea.dev/services/repository/commitstatus"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type MergeOptions struct {
+	Style        repo_model.MergeStyle
+	HeadCommitID string
+	DeleteBranch bool
+	Message      string
+}
+
+func testPullMerge(t *testing.T, session *TestSession, user, repo, pullNum string, mergeOptions MergeOptions) *httptest.ResponseRecorder {
+	options := map[string]string{
+		"do":                        string(mergeOptions.Style),
+		"head_commit_id":            mergeOptions.HeadCommitID,
+		"delete_branch_after_merge": util.Iif(mergeOptions.DeleteBranch, "on", ""),
+		"merge_message_field":       mergeOptions.Message,
+	}
+	var resp *httptest.ResponseRecorder
+	require.Eventually(t, func() bool {
+		req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/pulls/%s/merge", user, repo, pullNum), options)
+		resp = session.MakeRequest(t, req, NoExpectedStatus)
+		return resp.Code == http.StatusOK
+	}, 5*time.Second, 50*time.Millisecond, "Timed out waiting for pull merge to succeed")
+
+	redirect := test.RedirectURL(resp)
+	assert.Equal(t, fmt.Sprintf("/%s/%s/pulls/%s", user, repo, pullNum), redirect)
+
+	pullNumInt, err := strconv.ParseInt(pullNum, 10, 64)
+	assert.NoError(t, err)
+	repository, err := repo_model.GetRepositoryByOwnerAndName(t.Context(), user, repo)
+	assert.NoError(t, err)
+	pull, err := issues_model.GetPullRequestByIndex(t.Context(), repository.ID, pullNumInt)
+	assert.NoError(t, err)
+	assert.True(t, pull.HasMerged)
+
+	if mergeOptions.Message != "" {
+		gitRepo, err := git.OpenRepository(t.Context(), repository)
+		require.NoError(t, err)
+		defer gitRepo.Close()
+		commit, err := gitRepo.GetCommit(t.Context(), pull.MergedCommitID)
+		require.NoError(t, err)
+		assert.Contains(t, commit.CommitMessage.MessageRaw, mergeOptions.Message)
+	}
+
+	return resp
+}
+
+func preparePullMergeWebhook(t *testing.T, repoID int64) {
+	require.NoError(t, db.TruncateBeans(t.Context(), &webhook.Webhook{}, &webhook.HookTask{}))
+	require.NoError(t, db.Insert(t.Context(), &webhook.Webhook{
+		RepoID:      repoID,
+		URL:         "http://localhost/gitea-test-webhook-pull-merge",
+		ContentType: webhook.ContentTypeJSON,
+		Events:      `{"push_only":true,"send_everything":false,"choose_events":false,"events":{"create":false,"push":true,"pull_request":false}}`,
+		IsActive:    true,
+	}))
+}
+
+func assertPullMergeWebhookTask(t *testing.T, repoID int64) {
+	hook := unittest.AssertExistsAndLoadBean(t, &webhook.Webhook{RepoID: repoID})
+	unittest.AssertExistsAndLoadBean(t, &webhook.HookTask{HookID: hook.ID})
+}
+
+func TestPullMerge(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		preparePullMergeWebhook(t, 1)
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		assert.Equal(t, 3, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "This is a pull title")
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 4, repo.NumOpenPulls)
+
+		elem := strings.Split(test.RedirectURL(resp), "/")
+		assert.Equal(t, "pulls", elem[3])
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:   repo_model.MergeStyleMerge,
+			Message: strings.Repeat("x", 200*1024),
+		})
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		assertPullMergeWebhookTask(t, 1)
+	})
+}
+
+func TestPullRebase(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		preparePullMergeWebhook(t, 1)
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		assert.Equal(t, 3, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "This is a pull title")
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 4, repo.NumOpenPulls)
+
+		elem := strings.Split(test.RedirectURL(resp), "/")
+		assert.Equal(t, "pulls", elem[3])
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleRebase,
+			DeleteBranch: false,
+		})
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		assertPullMergeWebhookTask(t, 1)
+	})
+}
+
+func TestPullRebaseMerge(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		preparePullMergeWebhook(t, 1)
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		assert.Equal(t, 3, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "This is a pull title")
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 4, repo.NumOpenPulls)
+
+		elem := strings.Split(test.RedirectURL(resp), "/")
+		assert.Equal(t, "pulls", elem[3])
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleRebaseMerge,
+			DeleteBranch: false,
+		})
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		assertPullMergeWebhookTask(t, 1)
+	})
+}
+
+func TestPullSquash(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		preparePullMergeWebhook(t, 1)
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited!)\n")
+
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "This is a pull title")
+
+		elem := strings.Split(test.RedirectURL(resp), "/")
+		assert.Equal(t, "pulls", elem[3])
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleSquash,
+			DeleteBranch: false,
+		})
+
+		assertPullMergeWebhookTask(t, 1)
+	})
+}
+
+func TestPullSquashWithHeadCommitID(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		preparePullMergeWebhook(t, 1)
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited!)\n")
+
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		assert.Equal(t, 3, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "This is a pull title")
+
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user1", Name: "repo1"})
+		headBranch, err := git_model.GetBranchExisting(t.Context(), repo1.ID, "master")
+		assert.NoError(t, err)
+		assert.NotNil(t, headBranch)
+
+		elem := strings.Split(test.RedirectURL(resp), "/")
+		assert.Equal(t, "pulls", elem[3])
+
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 4, repo.NumOpenPulls)
+
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleSquash,
+			DeleteBranch: false,
+			HeadCommitID: headBranch.CommitID,
+		})
+		repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+		assert.Equal(t, 4, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		assertPullMergeWebhookTask(t, 1)
+	})
+}
+
+func TestPullCleanUpAfterClose(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "feature/test", "README.md", "Hello, World (Edited - TestPullCleanUpAfterMerge)\n")
+
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		assert.Equal(t, 3, repo.NumPulls)
+		assert.Equal(t, 3, repo.NumOpenPulls)
+
+		getDeleteBranchLink := func(t *testing.T, session *TestSession, user, repo, pullnum string) string {
+			req := NewRequest(t, "GET", "/"+path.Join(user, repo, "pulls", pullnum))
+			resp := session.MakeRequest(t, req, http.StatusOK)
+			htmlDoc := NewHTMLParser(t, resp.Body)
+			return htmlDoc.doc.Find(".timeline-item .delete-branch-after-merge").AttrOr("data-url", "")
+		}
+
+		var closedPullNumStr string
+		t.Run("CreateAndClosePR", func(t *testing.T) {
+			resp := testPullCreate(t, session, "user1", "repo1", false, "master", "feature/test", "This is a pull title")
+			_, pullNumStr, _ := strings.CutLast(test.RedirectURL(resp), "/")
+
+			testIssueClose(t, session, "user2", "repo1", pullNumStr)
+
+			repo = unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: repo.ID})
+			assert.Equal(t, 4, repo.NumPulls)
+			assert.Equal(t, 3, repo.NumOpenPulls)
+
+			closedPullNumStr = pullNumStr
+
+			// the closed but unmerged PR should have the "delete branch" button
+			link := getDeleteBranchLink(t, session, "user2", "repo1", closedPullNumStr)
+			assert.NotEmpty(t, link)
+		})
+
+		t.Run("CreateAndMergePR", func(t *testing.T) {
+			resp := testPullCreate(t, session, "user1", "repo1", false, "master", "feature/test", "This is a pull title")
+			_, pullNumStr, _ := strings.CutLast(test.RedirectURL(resp), "/")
+
+			// the closed but unmerged PR should not have the "delete branch" button because there is a new PR for the same branch
+			link := getDeleteBranchLink(t, session, "user2", "repo1", closedPullNumStr)
+			assert.Empty(t, link)
+
+			testPullMerge(t, session, "user2", "repo1", pullNumStr, MergeOptions{
+				Style:        repo_model.MergeStyleMerge,
+				DeleteBranch: false,
+			})
+
+			// Check PR branch deletion
+			link = getDeleteBranchLink(t, session, "user2", "repo1", pullNumStr)
+			assert.NotEmpty(t, link)
+			resp = session.MakeRequest(t, NewRequest(t, "POST", link), http.StatusOK)
+
+			// Check branch deletion result
+			req := NewRequest(t, "GET", test.RedirectURL(resp))
+			resp = session.MakeRequest(t, req, http.StatusOK)
+			htmlDoc := NewHTMLParser(t, resp.Body)
+			resultMsg := strings.TrimSpace(htmlDoc.doc.Find(".ui.message.flash-message").Text())
+			assert.Equal(t, `Branch "user1/repo1:feature/test" has been deleted.`, resultMsg)
+
+			// the "delete branch" button should be gone since the PR has been merged
+			link = getDeleteBranchLink(t, session, "user2", "repo1", pullNumStr)
+			assert.Empty(t, link)
+		})
+	})
+}
+
+func TestCantMergeWorkInProgress(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "[wip] This is a pull title")
+
+		req := NewRequest(t, "GET", test.RedirectURL(resp))
+		resp = session.MakeRequest(t, req, http.StatusOK)
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		wipToggleButtonCount := htmlDoc.Find(`.merge-section > .item button[data-global-init="initPullRequestWipToggle"]`).Length()
+		assert.Equal(t, 1, wipToggleButtonCount)
+	})
+}
+
+func TestCantMergeConflict(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "conflict", "README.md", "Hello, World (Edited Once)\n")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "base", "README.md", "Hello, World (Edited Twice)\n")
+
+		// Use API to create a conflicting pr
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+		req := NewRequestWithJSON(t, http.MethodPost, fmt.Sprintf("/api/v1/repos/%s/%s/pulls", "user1", "repo1"), &api.CreatePullRequestOption{
+			Head:  "conflict",
+			Base:  "base",
+			Title: "create a conflicting pr",
+		}).AddTokenAuth(token)
+		session.MakeRequest(t, req, http.StatusCreated)
+
+		// Now this PR will be marked conflict - or at least a race will do - so drop down to pure code at this point...
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{
+			Name: "user1",
+		})
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
+			OwnerID: user1.ID,
+			Name:    "repo1",
+		})
+
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			HeadRepoID: repo1.ID,
+			BaseRepoID: repo1.ID,
+			HeadBranch: "conflict",
+			BaseBranch: "base",
+		})
+
+		err := pull_service.Merge(t.Context(), pr.ID, user1, repo_model.MergeStyleMerge, "", "CONFLICT", false)
+		assert.Error(t, err, "Merge should return an error due to conflict")
+		assert.True(t, pull_service.IsErrMergeConflicts(err), "Merge error is not a conflict error")
+
+		err = pull_service.Merge(t.Context(), pr.ID, user1, repo_model.MergeStyleRebase, "", "CONFLICT", false)
+		assert.Error(t, err, "Merge should return an error due to conflict")
+		assert.True(t, pull_service.IsErrRebaseConflicts(err), "Merge error is not a conflict error")
+	})
+}
+
+func TestCantMergeUnrelated(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "base", "README.md", "Hello, World (Edited Twice)\n")
+
+		// Now we want to create a commit on a branch that is totally unrelated to our current head
+		// Drop down to pure code at this point
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{
+			Name: "user1",
+		})
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
+			OwnerID: user1.ID,
+			Name:    "repo1",
+		})
+
+		err := gitcmd.NewCommand("read-tree", "--empty").WithRepo(repo1).Run(t.Context())
+		assert.NoError(t, err)
+
+		stdout, _, err := gitcmd.NewCommand("hash-object", "-w", "--stdin").
+			WithRepo(repo1).
+			WithStdinBytes([]byte("Unrelated File")).
+			RunStdString(t.Context())
+
+		assert.NoError(t, err)
+		sha := strings.TrimSpace(stdout)
+
+		_, _, err = gitcmd.NewCommand("update-index", "--add", "--replace", "--cacheinfo").
+			AddDynamicArguments("100644", sha, "somewhere-over-the-rainbow").
+			WithRepo(repo1).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+
+		treeSha, _, err := gitcmd.NewCommand("write-tree").WithRepo(repo1).RunStdString(t.Context())
+		assert.NoError(t, err)
+		treeSha = strings.TrimSpace(treeSha)
+
+		commitTimeStr := time.Now().Format(time.RFC3339)
+		doerSig := user1.NewGitSig()
+		env := append(os.Environ(),
+			"GIT_AUTHOR_NAME="+doerSig.Name,
+			"GIT_AUTHOR_EMAIL="+doerSig.Email,
+			"GIT_AUTHOR_DATE="+commitTimeStr,
+			"GIT_COMMITTER_NAME="+doerSig.Name,
+			"GIT_COMMITTER_EMAIL="+doerSig.Email,
+			"GIT_COMMITTER_DATE="+commitTimeStr,
+		)
+
+		messageBytes := new(bytes.Buffer)
+		_, _ = messageBytes.WriteString("Unrelated")
+		_, _ = messageBytes.WriteString("\n")
+
+		stdout, _, err = gitcmd.NewCommand("commit-tree").AddDynamicArguments(treeSha).
+			WithEnv(env).
+			WithRepo(repo1).
+			WithStdinBytes(messageBytes.Bytes()).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+		commitSha := strings.TrimSpace(stdout)
+
+		_, _, err = gitcmd.NewCommand("branch", "unrelated").
+			AddDynamicArguments(commitSha).
+			WithRepo(repo1).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "conflict", "README.md", "Hello, World (Edited Once)\n")
+
+		// Use API to create a conflicting pr
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+		req := NewRequestWithJSON(t, http.MethodPost, fmt.Sprintf("/api/v1/repos/%s/%s/pulls", "user1", "repo1"), &api.CreatePullRequestOption{
+			Head:  "unrelated",
+			Base:  "base",
+			Title: "create an unrelated pr",
+		}).AddTokenAuth(token)
+		session.MakeRequest(t, req, http.StatusCreated)
+
+		// Now this PR could be marked conflict - or at least a race may occur - so drop down to pure code at this point...
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			HeadRepoID: repo1.ID,
+			BaseRepoID: repo1.ID,
+			HeadBranch: "unrelated",
+			BaseBranch: "base",
+		})
+
+		err = pull_service.Merge(t.Context(), pr.ID, user1, repo_model.MergeStyleMerge, "", "UNRELATED", false)
+		assert.Error(t, err, "Merge should return an error due to unrelated")
+		assert.True(t, pull_service.IsErrMergeUnrelatedHistories(err), "Merge error is not a unrelated histories error")
+	})
+}
+
+func TestFastForwardOnlyMerge(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "update", "README.md", "Hello, World 2\n")
+
+		// Use API to create a pr from update to master
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+		req := NewRequestWithJSON(t, http.MethodPost, fmt.Sprintf("/api/v1/repos/%s/%s/pulls", "user1", "repo1"), &api.CreatePullRequestOption{
+			Head:  "update",
+			Base:  "master",
+			Title: "create a pr that can be fast-forward-only merged",
+		}).AddTokenAuth(token)
+		session.MakeRequest(t, req, http.StatusCreated)
+
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{
+			Name: "user1",
+		})
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
+			OwnerID: user1.ID,
+			Name:    "repo1",
+		})
+
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			HeadRepoID: repo1.ID,
+			BaseRepoID: repo1.ID,
+			HeadBranch: "update",
+			BaseBranch: "master",
+		})
+
+		err := pull_service.Merge(t.Context(), pr.ID, user1, repo_model.MergeStyleFastForwardOnly, "", "FAST-FORWARD-ONLY", false)
+		assert.NoError(t, err)
+	})
+}
+
+func TestFastForwardOnlyMergeWithRequiredSignedCommits(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1")
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "update", "README.md", "Hello, signed\n")
+
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+		createPRReq := NewRequestWithJSON(t, http.MethodPost, "/api/v1/repos/user1/repo1/pulls", &api.CreatePullRequestOption{
+			Head:  "update",
+			Base:  "master",
+			Title: "ff-only merge under require-signed-commits",
+		}).AddTokenAuth(token)
+		session.MakeRequest(t, createPRReq, http.StatusCreated)
+
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user1"})
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerID: user1.ID, Name: "repo1"})
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			HeadRepoID: repo1.ID,
+			BaseRepoID: repo1.ID,
+			HeadBranch: "update",
+			BaseBranch: "master",
+		})
+
+		// Enable require-signed-commits on master.
+		require.NoError(t, git_model.UpdateProtectBranch(t.Context(), repo1, &git_model.ProtectedBranch{
+			RepoID:               repo1.ID,
+			RuleName:             "master",
+			RequireSignedCommits: true,
+		}, git_model.WhitelistOptions{}))
+
+		prIndex := strconv.FormatInt(pr.Index, 10)
+		mergeURL := "/user1/repo1/pulls/" + prIndex + "/merge"
+
+		notVerifiedMsg := translation.NewLocale("en-US").TrString("repo.pulls.require_signed_head_commits_unverified")
+		apiNotVerifiedMsg := pull_service.ErrHeadCommitsNotAllVerified.Error()
+		// Matches the unexported "wont sign: %s" format and nokey signingMode in
+		// services/asymkey/sign.go; the test config uses SIGNING_KEY = none.
+		const wontSignMsg = "wont sign: nokey"
+
+		for _, style := range []repo_model.MergeStyle{repo_model.MergeStyleFastForwardOnly, repo_model.MergeStyleMerge} {
+			t.Run(string(style)+"/head-commits-unverified", func(t *testing.T) {
+				mergeReq := NewRequestWithValues(t, http.MethodPost, mergeURL, map[string]string{"do": string(style)})
+				resp := session.MakeRequest(t, mergeReq, http.StatusBadRequest)
+				assert.Equal(t, notVerifiedMsg, test.ParseJSONError(resp.Body.Bytes()).ErrorMessage)
+			})
+		}
+
+		for _, style := range []repo_model.MergeStyle{repo_model.MergeStyleRebase, repo_model.MergeStyleRebaseMerge, repo_model.MergeStyleSquash} {
+			t.Run(string(style)+"/wont-sign", func(t *testing.T) {
+				mergeReq := NewRequestWithValues(t, http.MethodPost, mergeURL, map[string]string{"do": string(style)})
+				resp := session.MakeRequest(t, mergeReq, http.StatusBadRequest)
+				assert.Equal(t, wontSignMsg, test.ParseJSONError(resp.Body.Bytes()).ErrorMessage)
+			})
+		}
+
+		// Admin force-merge must not bypass the unverified-head-commits check, since
+		// the pre-receive hook would reject the push regardless.
+		t.Run("fast-forward-only/admin-force-merge-does-not-bypass", func(t *testing.T) {
+			mergeReq := NewRequestWithValues(t, http.MethodPost, mergeURL, map[string]string{
+				"do":          string(repo_model.MergeStyleFastForwardOnly),
+				"force_merge": "true",
+			})
+			resp := session.MakeRequest(t, mergeReq, http.StatusBadRequest)
+			assert.Equal(t, notVerifiedMsg, test.ParseJSONError(resp.Body.Bytes()).ErrorMessage)
+		})
+
+		t.Run("api/fast-forward-only/head-commits-unverified", func(t *testing.T) {
+			apiReq := NewRequestWithJSON(t, http.MethodPost,
+				fmt.Sprintf("/api/v1/repos/user1/repo1/pulls/%s/merge", prIndex),
+				&forms.MergePullRequestForm{Do: string(repo_model.MergeStyleFastForwardOnly)},
+			).AddTokenAuth(token)
+			resp := session.MakeRequest(t, apiReq, http.StatusMethodNotAllowed)
+			apiBody := DecodeJSON(t, resp, &api.APIError{})
+			assert.Equal(t, apiNotVerifiedMsg, apiBody.Message)
+		})
+
+		pb, err := git_model.GetFirstMatchProtectedBranchRule(t.Context(), repo1.ID, "master")
+		require.NoError(t, err)
+		require.NotNil(t, pb)
+		pb.RequireSignedCommits = false
+		require.NoError(t, git_model.UpdateProtectBranch(t.Context(), repo1, pb, git_model.WhitelistOptions{}))
+
+		require.NoError(t, pull_service.Merge(t.Context(), pr.ID, user1, repo_model.MergeStyleFastForwardOnly, "", "FAST-FORWARD-ONLY", false))
+	})
+}
+
+func TestCantFastForwardOnlyMergeDiverging(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "diverging", "README.md", "Hello, World diverged\n")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World 2\n")
+
+		// Use API to create a pr from diverging to update
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+		req := NewRequestWithJSON(t, http.MethodPost, fmt.Sprintf("/api/v1/repos/%s/%s/pulls", "user1", "repo1"), &api.CreatePullRequestOption{
+			Head:  "diverging",
+			Base:  "master",
+			Title: "create a pr from a diverging branch",
+		}).AddTokenAuth(token)
+		session.MakeRequest(t, req, http.StatusCreated)
+
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{
+			Name: "user1",
+		})
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
+			OwnerID: user1.ID,
+			Name:    "repo1",
+		})
+
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			HeadRepoID: repo1.ID,
+			BaseRepoID: repo1.ID,
+			HeadBranch: "diverging",
+			BaseBranch: "master",
+		})
+
+		err := pull_service.Merge(t.Context(), pr.ID, user1, repo_model.MergeStyleFastForwardOnly, "", "DIVERGING", false)
+		assert.Error(t, err, "Merge should return an error due to being for a diverging branch")
+		assert.True(t, pull_service.IsErrMergeDivergingFastForwardOnly(err), "Merge error is not a diverging fast-forward-only error")
+	})
+}
+
+func TestPullRetargetChildOnBranchDelete(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testEditFileToNewBranch(t, session, "user2", "repo1", "master", "base-pr", "README.md", "Hello, World\n(Edited - TestPullRetargetOnCleanup - base PR)\n")
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "base-pr", "child-pr", "README.md", "Hello, World\n(Edited - TestPullRetargetOnCleanup - base PR)\n(Edited - TestPullRetargetOnCleanup - child PR)")
+
+		respBasePR := testPullCreate(t, session, "user2", "repo1", true, "master", "base-pr", "Base Pull Request")
+		elemBasePR := strings.Split(test.RedirectURL(respBasePR), "/")
+		assert.Equal(t, "pulls", elemBasePR[3])
+
+		respChildPR := testPullCreate(t, session, "user1", "repo1", false, "base-pr", "child-pr", "Child Pull Request")
+		elemChildPR := strings.Split(test.RedirectURL(respChildPR), "/")
+		assert.Equal(t, "pulls", elemChildPR[3])
+
+		testPullMerge(t, session, elemBasePR[1], elemBasePR[2], elemBasePR[4], MergeOptions{
+			Style:        repo_model.MergeStyleMerge,
+			DeleteBranch: true,
+		})
+
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		branchBasePR := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo1.ID, Name: "base-pr"})
+		assert.True(t, branchBasePR.IsDeleted)
+
+		// Check child PR
+		req := NewRequest(t, "GET", test.RedirectURL(respChildPR))
+		resp := session.MakeRequest(t, req, http.StatusOK)
+
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		targetBranch := htmlDoc.doc.Find("#branch_target>a").Text()
+		prStatus := strings.TrimSpace(htmlDoc.doc.Find(".issue-title-meta>.issue-state-label").Text())
+
+		assert.Equal(t, "master", targetBranch)
+		assert.Equal(t, "Open", prStatus)
+	})
+}
+
+func TestPullDontRetargetChildOnWrongRepo(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "base-pr", "README.md", "Hello, World\n(Edited - TestPullDontRetargetChildOnWrongRepo - base PR)\n")
+		testEditFileToNewBranch(t, session, "user1", "repo1", "base-pr", "child-pr", "README.md", "Hello, World\n(Edited - TestPullDontRetargetChildOnWrongRepo - base PR)\n(Edited - TestPullDontRetargetChildOnWrongRepo - child PR)")
+
+		respBasePR := testPullCreate(t, session, "user1", "repo1", false, "master", "base-pr", "Base Pull Request")
+		elemBasePR := strings.Split(test.RedirectURL(respBasePR), "/")
+		assert.Equal(t, "pulls", elemBasePR[3])
+
+		respChildPR := testPullCreate(t, session, "user1", "repo1", true, "base-pr", "child-pr", "Child Pull Request")
+		elemChildPR := strings.Split(test.RedirectURL(respChildPR), "/")
+		assert.Equal(t, "pulls", elemChildPR[3])
+
+		defer test.MockVariableValue(&setting.Repository.PullRequest.RetargetChildrenOnMerge, false)()
+
+		testPullMerge(t, session, elemBasePR[1], elemBasePR[2], elemBasePR[4], MergeOptions{
+			Style:        repo_model.MergeStyleMerge,
+			DeleteBranch: true,
+		})
+
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user1", Name: "repo1"})
+		branchBasePR := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo1.ID, Name: "base-pr"})
+		assert.True(t, branchBasePR.IsDeleted)
+
+		// Check child PR
+		req := NewRequest(t, "GET", test.RedirectURL(respChildPR))
+		resp := session.MakeRequest(t, req, http.StatusOK)
+
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		// the branch has been deleted, so there is no a html tag instead of span
+		targetBranch := htmlDoc.doc.Find("#branch_target>span").Text()
+		prStatus := strings.TrimSpace(htmlDoc.doc.Find(".issue-title-meta>.issue-state-label").Text())
+
+		assert.Equal(t, "base-pr", targetBranch)
+		assert.Equal(t, "Closed", prStatus)
+	})
+}
+
+func TestPullRequestMergedWithNoPermissionDeleteBranch(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		session := loginUser(t, "user4")
+		testRepoFork(t, session, "user2", "repo1", "user4", "repo1", "")
+		testEditFileToNewBranch(t, session, "user4", "repo1", "master", "base-pr", "README.md", "Hello, World\n(Edited - TestPullDontRetargetChildOnWrongRepo - base PR)\n")
+
+		respBasePR := testPullCreate(t, session, "user4", "repo1", false, "master", "base-pr", "Base Pull Request")
+		elemBasePR := strings.Split(test.RedirectURL(respBasePR), "/")
+		assert.Equal(t, "pulls", elemBasePR[3])
+
+		// user2 has no permission to delete branch of repo user1/repo1
+		session2 := loginUser(t, "user2")
+		testPullMerge(t, session2, elemBasePR[1], elemBasePR[2], elemBasePR[4], MergeOptions{
+			Style:        repo_model.MergeStyleMerge,
+			DeleteBranch: true,
+		})
+
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user4", Name: "repo1"})
+		branchBasePR := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: repo1.ID, Name: "base-pr"})
+		// branch has not been deleted
+		assert.False(t, branchBasePR.IsDeleted)
+	})
+}
+
+func TestPullMergeIndexerNotifier(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		// create a pull request
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
+		createPullResp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "Indexer notifier test pull")
+
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
+			OwnerName: "user2",
+			Name:      "repo1",
+		})
+		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{
+			RepoID:   repo1.ID,
+			Title:    "Indexer notifier test pull",
+			IsPull:   true,
+			IsClosed: false,
+		})
+		waitIndexed := func(isClosed bool) { // elasticsearch makes documents searchable asynchronously
+			require.Eventually(t, func() bool {
+				ids, _, err := issue_indexer.SearchIssues(t.Context(), &issue_indexer.SearchOptions{Keyword: "notifier", RepoIDs: []int64{repo1.ID}, IsClosed: optional.Some(isClosed)})
+				return err == nil && slices.Contains(ids, issue.ID)
+			}, 10*time.Second, 10*time.Millisecond)
+		}
+		waitIndexed(false)
+
+		// build the request for searching issues
+		link, _ := url.Parse("/api/v1/repos/issues/search")
+		query := url.Values{}
+		query.Add("state", "closed")
+		query.Add("type", "pulls")
+		query.Add("q", "notifier")
+		link.RawQuery = query.Encode()
+
+		// search issues
+		searchIssuesResp := session.MakeRequest(t, NewRequest(t, "GET", link.String()), http.StatusOK)
+		apiIssuesBefore := DecodeJSON(t, searchIssuesResp, []*api.Issue{})
+		assert.Empty(t, apiIssuesBefore)
+
+		// merge the pull request
+		elem := strings.Split(test.RedirectURL(createPullResp), "/")
+		assert.Equal(t, "pulls", elem[3])
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleMerge,
+			DeleteBranch: false,
+		})
+
+		// check if the issue is closed
+		issue = unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{
+			ID: issue.ID,
+		})
+		assert.True(t, issue.IsClosed)
+		waitIndexed(true)
+
+		// search issues again
+		searchIssuesResp = session.MakeRequest(t, NewRequest(t, "GET", link.String()), http.StatusOK)
+		apiIssuesAfter := DecodeJSON(t, searchIssuesResp, []*api.Issue{})
+		require.Len(t, apiIssuesAfter, 1)
+		assert.Equal(t, issue.ID, apiIssuesAfter[0].ID)
+	})
+}
+
+func TestPullAutoMergeAfterCommitStatusSucceed(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		// create a pull request
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+		forkedName := "repo1-1"
+		testRepoFork(t, session, "user2", "repo1", "user1", forkedName, "")
+		testEditFile(t, session, "user1", forkedName, "master", "README.md", "Hello, World (Edited)\n")
+		testPullCreate(t, session, "user1", forkedName, false, "master", "master", "Indexer notifier test pull")
+
+		baseRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		forkedRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user1", Name: forkedName})
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			BaseRepoID: baseRepo.ID,
+			BaseBranch: "master",
+			HeadRepoID: forkedRepo.ID,
+			HeadBranch: "master",
+		})
+
+		// Change the "master" branch to "protected"
+		req := NewRequestWithValues(t, "POST", "/user2/repo1/settings/branches/edit", map[string]string{
+			"rule_name":             "master",
+			"enable_push":           "true",
+			"enable_status_check":   "true",
+			"status_check_contexts": "gitea/actions",
+		})
+		session.MakeRequest(t, req, http.StatusSeeOther)
+
+		addToQueuePullChan := make(chan automergequeue.AutoMergeItem, 1)
+		resetAutoMergeQueueMock := test.MockVariableValue(&automergequeue.AddToQueue, func(item automergequeue.AutoMergeItem) { addToQueuePullChan <- item })
+
+		// first time insert automerge record, return true
+		scheduled, err := automerge.ScheduleAutoMerge(t.Context(), user1, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+		assert.NoError(t, err)
+		assert.True(t, scheduled)
+		// and the pr should be added to automergequeue, in case it is already "mergeable"
+		select {
+		case <-addToQueuePullChan:
+		case <-time.After(time.Second):
+			assert.FailNow(t, "Timeout: nothing was added to automergequeue")
+		}
+		resetAutoMergeQueueMock()
+
+		// second time insert automerge record, return false because it does exist
+		scheduled, err = automerge.ScheduleAutoMerge(t.Context(), user1, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+		assert.Error(t, err)
+		assert.False(t, scheduled)
+
+		// reload pr again
+		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+		assert.False(t, pr.HasMerged)
+		assert.Empty(t, pr.MergedCommitID)
+
+		// update commit status to success, then it should be merged automatically
+		baseGitRepo, err := git.OpenRepository(t.Context(), baseRepo)
+		assert.NoError(t, err)
+		sha, err := baseGitRepo.GetRefCommitID(t.Context(), pr.GetGitHeadRefName())
+		assert.NoError(t, err)
+		branches, _, err := baseGitRepo.GetBranchNames(t.Context(), 0, 100)
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, []string{"sub-home-md-img-check", "home-md-img-check", "pr-to-update", "branch2", "DefaultBranch", "develop", "feature/1", "master"}, branches)
+		baseGitRepo.Close()
+
+		err = commitstatus_service.CreateCommitStatus(t.Context(), baseRepo, user1, sha, &git_model.CommitStatus{
+			State:     commitstatus.CommitStatusSuccess,
+			TargetURL: "https://gitea.com",
+			Context:   "gitea/actions",
+		})
+		assert.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+			return pr.HasMerged
+		}, 2*time.Second, 100*time.Millisecond)
+		assert.NotEmpty(t, pr.MergedCommitID)
+		unittest.AssertNotExistsBean(t, &pull_model.AutoMerge{PullID: pr.ID})
+	})
+}
+
+func TestPullAutoMergeAfterCommitStatusSucceedAndApproval(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		// create a pull request
+		baseUser := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+		baseSession := loginUser(t, "user2")
+		forkUser := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 5})
+		forkSession := loginUser(t, "user5")
+		forkedName := "repo1-fork"
+		testRepoFork(t, forkSession, "user2", "repo1", forkUser.Name, forkedName, "")
+		testEditFile(t, forkSession, forkUser.Name, forkedName, "master", "README.md", "Hello, World (Edited)\n")
+		testPullCreate(t, forkSession, forkUser.Name, forkedName, false, "master", "master", "Indexer notifier test pull")
+
+		baseRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		forkedRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: forkUser.Name, Name: forkedName})
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			BaseRepoID: baseRepo.ID,
+			BaseBranch: "master",
+			HeadRepoID: forkedRepo.ID,
+			HeadBranch: "master",
+		})
+
+		// Change master branch to protected
+		req := NewRequestWithValues(t, "POST", "/user2/repo1/settings/branches/edit", map[string]string{
+			"rule_name":             "master",
+			"enable_push":           "true",
+			"enable_status_check":   "true",
+			"status_check_contexts": "gitea/actions",
+			"required_approvals":    "1",
+		})
+		baseSession.MakeRequest(t, req, http.StatusSeeOther)
+
+		// first time insert automerge record, return true
+		scheduled, err := automerge.ScheduleAutoMerge(t.Context(), baseUser, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+		assert.NoError(t, err)
+		assert.True(t, scheduled)
+
+		// second time insert automerge record, return false because it does exist
+		scheduled, err = automerge.ScheduleAutoMerge(t.Context(), baseUser, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+		assert.Error(t, err)
+		assert.False(t, scheduled)
+
+		// reload pr again
+		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+		assert.False(t, pr.HasMerged)
+		assert.Empty(t, pr.MergedCommitID)
+
+		// update commit status to success, then it should be merged automatically
+		baseGitRepo, err := git.OpenRepository(t.Context(), baseRepo)
+		assert.NoError(t, err)
+		sha, err := baseGitRepo.GetRefCommitID(t.Context(), pr.GetGitHeadRefName())
+		assert.NoError(t, err)
+		baseGitRepo.Close()
+
+		err = commitstatus_service.CreateCommitStatus(t.Context(), baseRepo, baseUser, sha, &git_model.CommitStatus{
+			State:     commitstatus.CommitStatusSuccess,
+			TargetURL: "https://gitea.com",
+			Context:   "gitea/actions",
+		})
+		assert.NoError(t, err)
+
+		require.NoError(t, automergequeue.AutoMergeQueue.FlushWithContext(t.Context(), 5*time.Second))
+
+		// reload pr again
+		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+		assert.False(t, pr.HasMerged)
+		assert.Empty(t, pr.MergedCommitID)
+
+		// approve the PR from non-author
+		testSubmitReview(t, baseSession, "user2", "repo1", strconv.Itoa(int(pr.Index)), sha, "approve", http.StatusOK)
+
+		assert.Eventually(t, func() bool {
+			pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+			return pr.HasMerged
+		}, 2*time.Second, 100*time.Millisecond)
+		assert.NotEmpty(t, pr.MergedCommitID)
+		unittest.AssertNotExistsBean(t, &pull_model.AutoMerge{PullID: pr.ID})
+	})
+}
+
+func TestPullAutoMergeAfterCommitStatusSucceedAndApprovalForAgitFlow(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, u *url.URL) {
+		// create a pull request
+		baseAPITestContext := NewAPITestContext(t, "user2", "repo1", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
+
+		dstPath := t.TempDir()
+
+		u.Path = baseAPITestContext.GitPath()
+		u.User = url.UserPassword("user2", userPassword)
+
+		t.Run("Clone", doGitClone(dstPath, u))
+
+		err := os.WriteFile(path.Join(dstPath, "test_file"), []byte("## test content"), 0o666)
+		assert.NoError(t, err)
+
+		err = gitAddChangesDeprecated(t.Context(), dstPath, true)
+		assert.NoError(t, err)
+
+		err = gitCommitChangesDeprecated(t.Context(), dstPath, gitCommitChangesOptions{
+			Committer: &git.Signature{
+				Email: "user2@example.com",
+				Name:  "user2",
+				When:  time.Now(),
+			},
+			Author: &git.Signature{
+				Email: "user2@example.com",
+				Name:  "user2",
+				When:  time.Now(),
+			},
+			Message: "Testing commit 1",
+		})
+		assert.NoError(t, err)
+
+		_, stderr, err := gitcmd.NewCommand("push", "origin", "HEAD:refs/for/master", "-o").
+			AddDynamicArguments(`topic=test/head2`).
+			AddArguments("-o").
+			AddDynamicArguments(`title="create a test pull request with agit"`).
+			AddArguments("-o").
+			AddDynamicArguments(`description="This PR is a test pull request which created with agit"`).
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+		assert.Contains(t, stderr, setting.AppURL+"user2/repo1/pulls/6")
+
+		baseRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			Flow:       issues_model.PullRequestFlowAGit,
+			BaseRepoID: baseRepo.ID,
+			BaseBranch: "master",
+			HeadRepoID: baseRepo.ID,
+			HeadBranch: "user2/test/head2",
+		})
+
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		// Change master branch to protected
+		req := NewRequestWithValues(t, "POST", "/user2/repo1/settings/branches/edit", map[string]string{
+			"rule_name":             "master",
+			"enable_push":           "true",
+			"enable_status_check":   "true",
+			"status_check_contexts": "gitea/actions",
+			"required_approvals":    "1",
+		})
+		session.MakeRequest(t, req, http.StatusSeeOther)
+
+		user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+		// first time insert automerge record, return true
+		scheduled, err := automerge.ScheduleAutoMerge(t.Context(), user1, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+		assert.NoError(t, err)
+		assert.True(t, scheduled)
+
+		// second time insert automerge record, return false because it does exist
+		scheduled, err = automerge.ScheduleAutoMerge(t.Context(), user1, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+		assert.Error(t, err)
+		assert.False(t, scheduled)
+
+		// reload pr again
+		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+		assert.False(t, pr.HasMerged)
+		assert.Empty(t, pr.MergedCommitID)
+
+		// update commit status to success, then it should be merged automatically
+		baseGitRepo, err := git.OpenRepository(t.Context(), baseRepo)
+		assert.NoError(t, err)
+		sha, err := baseGitRepo.GetRefCommitID(t.Context(), pr.GetGitHeadRefName())
+		assert.NoError(t, err)
+		baseGitRepo.Close()
+		err = commitstatus_service.CreateCommitStatus(t.Context(), baseRepo, user1, sha, &git_model.CommitStatus{
+			State:     commitstatus.CommitStatusSuccess,
+			TargetURL: "https://gitea.com",
+			Context:   "gitea/actions",
+		})
+		assert.NoError(t, err)
+
+		// reload pr again
+		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+		assert.False(t, pr.HasMerged)
+		assert.Empty(t, pr.MergedCommitID)
+
+		// approve the PR from non-author
+		approveSession := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testSubmitReview(t, approveSession, "user2", "repo1", strconv.Itoa(int(pr.Index)), sha, "approve", http.StatusOK)
+
+		// reload pr again
+		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+		assert.True(t, pr.HasMerged)
+		assert.NotEmpty(t, pr.MergedCommitID)
+
+		unittest.AssertNotExistsBean(t, &pull_model.AutoMerge{PullID: pr.ID})
+	})
+}
+
+func TestPullNonMergeForAdminWithBranchProtection(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, u *url.URL) {
+		// create a pull request
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		forkedName := "repo1-1"
+		testRepoFork(t, session, "user2", "repo1", "user1", forkedName, "")
+		testEditFile(t, session, "user1", forkedName, "master", "README.md", "Hello, World (Edited)\n")
+		testPullCreate(t, session, "user1", forkedName, false, "master", "master", "Indexer notifier test pull")
+
+		baseRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		forkedRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user1", Name: forkedName})
+		unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+			BaseRepoID: baseRepo.ID,
+			BaseBranch: "master",
+			HeadRepoID: forkedRepo.ID,
+			HeadBranch: "master",
+		})
+
+		// Change master branch to protected
+		pbCreateReq := NewRequestWithValues(t, "POST", "/user2/repo1/settings/branches/edit", map[string]string{
+			"rule_name":                  "master",
+			"enable_push":                "true",
+			"enable_status_check":        "true",
+			"status_check_contexts":      "gitea/actions",
+			"block_admin_merge_override": "true",
+		})
+		session.MakeRequest(t, pbCreateReq, http.StatusSeeOther)
+
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+
+		mergeReq := NewRequestWithValues(t, "POST", "/api/v1/repos/user2/repo1/pulls/6/merge", map[string]string{
+			"head_commit_id":            "",
+			"merge_when_checks_succeed": "false",
+			"force_merge":               "true",
+			"do":                        "rebase",
+		}).AddTokenAuth(token)
+
+		session.MakeRequest(t, mergeReq, http.StatusMethodNotAllowed)
+	})
+}
+
+func TestPullForceMergeForBypassAllowlistUser(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, u *url.URL) {
+		ownerSession := loginUser(t, "user2")
+		ownerCtx := NewAPITestContext(t, "user2", "repo1", auth_model.AccessTokenScopeWriteRepository)
+
+		bypassUser := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user4"})
+		doAPIAddCollaborator(ownerCtx, bypassUser.Name, perm.AccessModeWrite)(t)
+
+		bypassSession := loginUser(t, bypassUser.Name)
+		forkedName := "repo1-bypass-allowlist"
+		testRepoFork(t, bypassSession, "user2", "repo1", bypassUser.Name, forkedName, "")
+		defer testDeleteRepository(t, bypassSession, bypassUser.Name, forkedName)
+
+		testEditFile(t, bypassSession, bypassUser.Name, forkedName, "master", "README.md", "Hello, World (Bypass Allowlist)\n")
+		resp := testPullCreate(t, bypassSession, bypassUser.Name, forkedName, false, "master", "master", "Bypass allowlist merge test pull")
+		pullURL := test.RedirectURL(resp)
+		elem := strings.Split(pullURL, "/")
+		assert.Equal(t, "pulls", elem[3])
+
+		prIndex, err := strconv.ParseInt(elem[4], 10, 64)
+		assert.NoError(t, err)
+
+		pbCreateReq := NewRequestWithValues(t, "POST", "/user2/repo1/settings/branches/edit", map[string]string{
+			"rule_name":                  "master",
+			"enable_push":                "all",
+			"enable_status_check":        "true",
+			"status_check_contexts":      "gitea/actions",
+			"block_admin_merge_override": "true",
+			"enable_bypass_allowlist":    "on",
+			"bypass_allowlist_users":     strconv.FormatInt(bypassUser.ID, 10),
+		})
+		ownerSession.MakeRequest(t, pbCreateReq, http.StatusSeeOther)
+		defer testAPIDeleteBranchProtection(t, "master", http.StatusNoContent)
+
+		token := getTokenForLoggedInUser(t, bypassSession, auth_model.AccessTokenScopeWriteRepository)
+
+		resp = bypassSession.MakeRequest(t, NewRequest(t, "GET", pullURL), http.StatusOK)
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		assert.Contains(t, htmlDoc.doc.Find(".merge-section").Text(), "You are allowed to bypass branch protection rules for this merge.")
+		mergeFormProps, exists := htmlDoc.doc.Find("#pull-request-merge-form").Attr("data-merge-form-props")
+		require.True(t, exists)
+		var mergeForm map[string]any
+		require.NoError(t, json.Unmarshal([]byte(mergeFormProps), &mergeForm))
+		assert.Equal(t, true, mergeForm["canMergeNow"])
+		assert.Equal(t, false, mergeForm["allOverridableChecksOk"])
+
+		mergeReq := func(forceMerge bool) *RequestWrapper {
+			return NewRequestWithValues(t, "POST", fmt.Sprintf("/api/v1/repos/user2/repo1/pulls/%d/merge", prIndex), map[string]string{
+				"head_commit_id":            "",
+				"merge_when_checks_succeed": "false",
+				"force_merge":               strconv.FormatBool(forceMerge),
+				"do":                        "rebase",
+			}).AddTokenAuth(token)
+		}
+
+		bypassSession.MakeRequest(t, mergeReq(false), http.StatusMethodNotAllowed)
+		bypassSession.MakeRequest(t, mergeReq(true), http.StatusOK)
+
+		baseRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: "user2", Name: "repo1"})
+		pr, err := issues_model.GetPullRequestByIndex(t.Context(), baseRepo.ID, prIndex)
+		assert.NoError(t, err)
+		assert.True(t, pr.HasMerged)
+	})
+}
+
+func TestPullSquashMergeEmpty(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, u *url.URL) {
+		session := loginUser(t, "user1") // FIXME: don't use admin user for testing
+		testEditFileToNewBranch(t, session, "user2", "repo1", "master", "pr-squash-empty", "README.md", "Hello, World (Edited)\n")
+		resp := testPullCreate(t, session, "user2", "repo1", false, "master", "pr-squash-empty", "This is a pull title")
+
+		elem := strings.Split(test.RedirectURL(resp), "/")
+		assert.Equal(t, "pulls", elem[3])
+
+		httpContext := NewAPITestContext(t, "user2", "repo1", auth_model.AccessTokenScopeWriteRepository)
+		dstPath := t.TempDir()
+
+		u.Path = httpContext.GitPath()
+		u.User = url.UserPassword("user2", userPassword)
+
+		t.Run("Clone", doGitClone(dstPath, u))
+		doGitCheckoutBranch(dstPath, "-b", "pr-squash-empty", "remotes/origin/pr-squash-empty")(t)
+		doGitCheckoutBranch(dstPath, "master")(t)
+		_, _, err := gitcmd.NewCommand("cherry-pick").AddArguments("pr-squash-empty").
+			WithDir(dstPath).
+			RunStdString(t.Context())
+		assert.NoError(t, err)
+
+		doGitPushTestRepository(dstPath)(t)
+
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleSquash,
+			DeleteBranch: false,
+		})
+	})
+}
+
+func TestPullSquashMessage(t *testing.T) {
+	onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) {
+		user2 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+		user2Session := loginUser(t, user2.Name)
+
+		defer test.MockVariableValue(&setting.Repository.PullRequest.DefaultSquashMergeMessage, "COMMIT_MESSAGES")()
+		defer test.MockVariableValue(&setting.Repository.PullRequest.DefaultMergeMessageSize, 80)()
+
+		repo, err := repo_service.CreateRepository(t.Context(), user2, user2, repo_service.CreateRepoOptions{
+			Name:          "squash-message-test",
+			Description:   "Test squash message",
+			AutoInit:      true,
+			Readme:        "Default",
+			DefaultBranch: "main",
+		})
+		require.NoError(t, err)
+
+		type commitInfo struct {
+			userName      string
+			commitMessage string
+		}
+
+		testCases := []struct {
+			name            string
+			commitInfos     []*commitInfo
+			expectedMessage string
+		}{
+			{
+				name: "Single-line messages",
+				commitInfos: []*commitInfo{
+					{
+						userName:      user2.Name,
+						commitMessage: "commit msg 1",
+					},
+					{
+						userName:      user2.Name,
+						commitMessage: "commit msg 2",
+					},
+				},
+				expectedMessage: `* commit msg 1
+
+* commit msg 2
+
+`,
+			},
+			{
+				name: "Multiple-line messages",
+				commitInfos: []*commitInfo{
+					{
+						userName: user2.Name,
+						commitMessage: `commit msg 1
+
+Commit description.`,
+					},
+					{
+						userName: user2.Name,
+						commitMessage: `commit msg 2
+
+- Detail 1
+- Detail 2`,
+					},
+				},
+				expectedMessage: `* commit msg 1
+
+Commit description.
+
+* commit msg 2
+
+- Detail 1
+- Detail 2
+
+`,
+			},
+			{
+				name: "Too long message",
+				commitInfos: []*commitInfo{
+					{
+						userName:      user2.Name,
+						commitMessage: `loooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong message`,
+					},
+				},
+				expectedMessage: "* looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo...\n\n",
+			},
+			{
+				name: "Test Co-authored-by",
+				commitInfos: []*commitInfo{
+					{
+						userName:      user2.Name,
+						commitMessage: "commit msg 1",
+					},
+					{
+						userName:      "user4",
+						commitMessage: "commit msg 2",
+					},
+				},
+				expectedMessage: `* commit msg 1
+
+* commit msg 2
+
+---------
+
+Co-authored-by: user4 <user4@example.com>
+`,
+			},
+		}
+
+		for tcNum, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				branchName := "test-branch-" + strconv.Itoa(tcNum)
+				for infoIdx, info := range tc.commitInfos {
+					createFileOpts := createFileInBranchOptions{
+						CommitMessage:  info.commitMessage,
+						CommitterName:  info.userName,
+						CommitterEmail: util.Iif(info.userName != "", info.userName+"@example.com", ""),
+						OldBranch:      util.Iif(infoIdx == 0, "main", branchName),
+						NewBranch:      branchName,
+					}
+					testCreateFileInBranch(t, user2, repo, createFileOpts, map[string]string{"dummy-file-" + strconv.Itoa(infoIdx): "dummy content"})
+				}
+				resp := testPullCreateDirectly(t, user2Session, createPullRequestOptions{
+					BaseRepoOwner: user2.Name,
+					BaseRepoName:  repo.Name,
+					BaseBranch:    repo.DefaultBranch,
+					HeadBranch:    branchName,
+					Title:         "Pull for " + branchName,
+				})
+				elems := strings.Split(test.RedirectURL(resp), "/")
+				pullIndex, err := strconv.ParseInt(elems[4], 10, 64)
+				assert.NoError(t, err)
+				pullRequest := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{BaseRepoID: repo.ID, Index: pullIndex})
+				squashMergeCommitMessage, err := pull_service.GetSquashMergeCommitMessages(t.Context(), pullRequest)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedMessage, squashMergeCommitMessage)
+			})
+		}
+
+		t.Run("Repository default squash merge message", func(t *testing.T) {
+			pullRequest := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{BaseRepoID: repo.ID, Index: 1})
+			require.NoError(t, pullRequest.LoadIssue(t.Context()))
+			pullRequest.Issue.Content = "PR description"
+			pullRequest.BaseRepo = repo
+
+			prUnit, err := repo.GetUnit(t.Context(), unit_model.TypePullRequests)
+			require.NoError(t, err)
+			for style, expected := range map[repo_model.SquashMergeMessage]string{
+				repo_model.SquashMergeMessageBlank:  "",
+				repo_model.SquashMergeMessagePRBody: "PR description",
+			} {
+				prUnit.PullRequestsConfig().DefaultSquashMergeMessage = style
+				msg, err := pull_service.GetSquashMergeCommitMessages(t.Context(), pullRequest)
+				require.NoError(t, err)
+				assert.Equal(t, expected, msg, style)
+			}
+		})
+
+		t.Run("API squash merge without message uses repository default", func(t *testing.T) {
+			defer test.MockVariableValue(&setting.Repository.PullRequest.DefaultSquashMergeMessage, "PR_BODY")()
+			token := getTokenForLoggedInUser(t, user2Session, auth_model.AccessTokenScopeWriteRepository)
+			req := NewRequestWithJSON(t, "POST", fmt.Sprintf("/api/v1/repos/%s/%s/pulls/1/merge", user2.Name, repo.Name), map[string]string{"do": "squash"}).AddTokenAuth(token)
+			MakeRequest(t, req, http.StatusOK)
+
+			pullRequest := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{BaseRepoID: repo.ID, Index: 1})
+			gitRepo, err := git.OpenRepository(t.Context(), repo)
+			require.NoError(t, err)
+			defer gitRepo.Close()
+			commit, err := gitRepo.GetCommit(t.Context(), pullRequest.MergedCommitID)
+			require.NoError(t, err)
+			assert.Contains(t, commit.CommitMessage.MessageRaw, "Pull for test-branch-0 (#1)\n\n* commit msg 1\n\n* commit msg 2\n")
+			assert.Contains(t, commit.CommitMessage.MessageRaw, "\nReviewed-on: ")
+		})
+	})
+}

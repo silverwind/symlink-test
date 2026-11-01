@@ -1,0 +1,195 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package container
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+
+	"gitea.dev/models/db"
+	packages_model "gitea.dev/models/packages"
+	container_model "gitea.dev/models/packages/container"
+	"gitea.dev/modules/globallock"
+	"gitea.dev/modules/log"
+	packages_module "gitea.dev/modules/packages"
+	container_module "gitea.dev/modules/packages/container"
+	packages_service "gitea.dev/services/packages"
+
+	"github.com/opencontainers/go-digest"
+)
+
+// saveAsPackageBlob creates a package blob from an upload
+// The uploaded blob gets stored in a special upload version to link them to the package/image
+// There will be concurrent uploading for the same blob, so it needs a global lock per blob hash
+func saveAsPackageBlob(ctx context.Context, hsr packages_module.HashedSizeReader, pci *packages_service.PackageCreationInfo) (*packages_model.PackageBlob, error) { //nolint:unparam //returned PackageBlob is never used
+	pb := packages_service.NewPackageBlob(hsr)
+	err := globallock.LockAndDo(ctx, "container-blob:"+pb.HashSHA256, func(ctx context.Context) error {
+		var err error
+		pb, err = saveAsPackageBlobInternal(ctx, hsr, pci, pb)
+		return err
+	})
+	return pb, err
+}
+
+func saveAsPackageBlobInternal(ctx context.Context, hsr packages_module.HashedSizeReader, pci *packages_service.PackageCreationInfo, pb *packages_model.PackageBlob) (*packages_model.PackageBlob, error) {
+	exists := false
+
+	contentStore := packages_module.NewContentStore()
+
+	uploadVersion, err := getOrCreateUploadVersion(ctx, &pci.PackageInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	err = db.WithTx(ctx, func(ctx context.Context) error {
+		if err := packages_service.CheckSizeQuotaExceeded(ctx, pci.Creator, pci.Owner, packages_model.TypeContainer, hsr.Size()); err != nil {
+			return err
+		}
+		pb, exists, err = packages_service.GetOrSavePackageBlob(ctx, contentStore, pb, hsr)
+		if err != nil {
+			return err
+		}
+		return createFileForBlob(ctx, uploadVersion, pb)
+	})
+	if err != nil {
+		if !exists && pb != nil { // pb can be nil if GetOrInsertBlob failed
+			if err := contentStore.Delete(packages_module.BlobHash256Key(pb.HashSHA256)); err != nil {
+				log.Error("Error deleting package blob from content store: %v", err)
+			}
+		}
+		return nil, err
+	}
+
+	return pb, nil
+}
+
+// mountBlob mounts the specific blob to a different package
+func mountBlob(ctx context.Context, pi *packages_service.PackageInfo, pb *packages_model.PackageBlob) error {
+	uploadVersion, err := getOrCreateUploadVersion(ctx, pi)
+	if err != nil {
+		return err
+	}
+
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		return createFileForBlob(ctx, uploadVersion, pb)
+	})
+}
+
+func containerGlobalLockKey(piOwnerID int64, piName, usage string) string {
+	return fmt.Sprintf("pkg_%d_container_%s_%s", piOwnerID, strings.ToLower(piName), usage)
+}
+
+func getOrCreateUploadVersion(ctx context.Context, pi *packages_service.PackageInfo) (*packages_model.PackageVersion, error) {
+	releaser, err := globallock.Lock(ctx, containerGlobalLockKey(pi.Owner.ID, pi.Name, "package"))
+	if err != nil {
+		return nil, err
+	}
+	defer releaser()
+
+	return db.WithTx2(ctx, func(ctx context.Context) (*packages_model.PackageVersion, error) {
+		created := true
+		p := &packages_model.Package{
+			OwnerID:   pi.Owner.ID,
+			Type:      packages_model.TypeContainer,
+			Name:      strings.ToLower(pi.Name),
+			LowerName: strings.ToLower(pi.Name),
+		}
+		var err error
+		if p, err = packages_model.TryInsertPackage(ctx, p); err != nil {
+			if !errors.Is(err, packages_model.ErrDuplicatePackage) {
+				log.Error("Error inserting package: %v", err)
+				return nil, err
+			}
+			created = false
+		}
+
+		if created {
+			if _, err := packages_model.InsertProperty(ctx, packages_model.PropertyTypePackage, p.ID, container_module.PropertyRepository, strings.ToLower(pi.Owner.LowerName+"/"+pi.Name)); err != nil {
+				log.Error("Error setting package property: %v", err)
+				return nil, err
+			}
+		}
+
+		pv := &packages_model.PackageVersion{
+			PackageID:    p.ID,
+			CreatorID:    pi.Owner.ID,
+			Version:      container_module.UploadVersion,
+			LowerVersion: container_module.UploadVersion,
+			IsInternal:   true,
+			MetadataJSON: "null",
+		}
+		if pv, err = packages_model.GetOrInsertVersion(ctx, pv); err != nil {
+			if !errors.Is(err, packages_model.ErrDuplicatePackageVersion) {
+				log.Error("Error inserting package: %v", err)
+				return nil, err
+			}
+		}
+		return pv, nil
+	})
+}
+
+func createFileForBlob(ctx context.Context, pv *packages_model.PackageVersion, pb *packages_model.PackageBlob) error {
+	filename := strings.ToLower("sha256_" + pb.HashSHA256)
+
+	pf := &packages_model.PackageFile{
+		VersionID:    pv.ID,
+		BlobID:       pb.ID,
+		Name:         filename,
+		LowerName:    filename,
+		CompositeKey: packages_model.EmptyFileKey,
+	}
+	var err error
+	if pf, err = packages_model.TryInsertFile(ctx, pf); err != nil {
+		if errors.Is(err, packages_model.ErrDuplicatePackageFile) {
+			return nil
+		}
+		log.Error("Error inserting package file: %v", err)
+		return err
+	}
+
+	if _, err := packages_model.InsertProperty(ctx, packages_model.PropertyTypeFile, pf.ID, container_module.PropertyDigest, digestFromPackageBlob(pb)); err != nil {
+		log.Error("Error setting package file property: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func deleteBlob(ctx context.Context, ownerID int64, image string, digest digest.Digest) error {
+	releaser, err := globallock.Lock(ctx, containerGlobalLockKey(ownerID, image, "blob"))
+	if err != nil {
+		return err
+	}
+	defer releaser()
+
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		pfds, err := container_model.GetContainerBlobs(ctx, &container_model.BlobSearchOptions{
+			OwnerID: ownerID,
+			Image:   image,
+			Digest:  string(digest),
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, file := range pfds {
+			if err := packages_service.DeletePackageFile(ctx, file.File); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func digestFromHashSummer(h packages_module.HashSummer) string {
+	_, _, hashSHA256, _ := h.Sums()
+	return "sha256:" + hex.EncodeToString(hashSHA256)
+}
+
+func digestFromPackageBlob(pb *packages_model.PackageBlob) string {
+	return "sha256:" + pb.HashSHA256
+}

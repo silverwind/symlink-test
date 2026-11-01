@@ -1,0 +1,11 @@
+{{template "user/settings/layout_head" (dict "pageClass" "user settings applications")}}
+	<div class="user-setting-content">
+		{{template "shared/user/access_tokens" .AccessTokens}}
+
+		{{if .EnableOAuth2}}
+			{{template "user/settings/grants_oauth2" .}}
+			{{template "user/settings/applications_oauth2" .}}
+		{{end}}
+	</div>
+
+{{template "user/settings/layout_footer" .}}

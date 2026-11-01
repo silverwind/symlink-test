@@ -1,0 +1,290 @@
+// Copyright 2018 The Gitea Authors. All rights reserved.
+// Copyright 2016 The Gogs Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package organization
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"gitea.dev/models/db"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+
+	"xorm.io/builder"
+)
+
+// ___________
+// \__    ___/___ _____    _____
+//   |    |_/ __ \\__  \  /     \
+//   |    |\  ___/ / __ \|  Y Y  \
+//   |____| \___  >____  /__|_|  /
+//              \/     \/      \/
+
+// ErrTeamAlreadyExist represents a "TeamAlreadyExist" kind of error.
+type ErrTeamAlreadyExist struct {
+	OrgID int64
+	Name  string
+}
+
+// IsErrTeamAlreadyExist checks if an error is a ErrTeamAlreadyExist.
+func IsErrTeamAlreadyExist(err error) bool {
+	_, ok := err.(ErrTeamAlreadyExist)
+	return ok
+}
+
+func (err ErrTeamAlreadyExist) Error() string {
+	return fmt.Sprintf("team already exists [org_id: %d, name: %s]", err.OrgID, err.Name)
+}
+
+func (err ErrTeamAlreadyExist) Unwrap() error {
+	return util.ErrAlreadyExist
+}
+
+// ErrTeamNotExist represents a "TeamNotExist" error
+type ErrTeamNotExist struct {
+	OrgID  int64
+	TeamID int64
+	Name   string
+}
+
+// IsErrTeamNotExist checks if an error is a ErrTeamNotExist.
+func IsErrTeamNotExist(err error) bool {
+	_, ok := err.(ErrTeamNotExist)
+	return ok
+}
+
+func (err ErrTeamNotExist) Error() string {
+	return fmt.Sprintf("team does not exist [org_id %d, team_id %d, name: %s]", err.OrgID, err.TeamID, err.Name)
+}
+
+func (err ErrTeamNotExist) Unwrap() error {
+	return util.ErrNotExist
+}
+
+// OwnerTeamName return the owner team name
+const OwnerTeamName = "Owners"
+
+// Team represents a organization team.
+type Team struct {
+	ID          int64 `xorm:"pk autoincr"`
+	OrgID       int64 `xorm:"INDEX"`
+	LowerName   string
+	Name        string
+	Description string
+	AccessMode  perm.AccessMode    `xorm:"'authorize'"`
+	Members     []*user_model.User `xorm:"-"`
+	NumRepos    int
+	NumMembers  int
+	Units       []*TeamUnit `xorm:"-"`
+
+	// All repos in the org are included in this team automatically
+	IncludesAllRepositories bool `xorm:"NOT NULL DEFAULT false"`
+
+	// Any user with CanCreateOrgRepo permission can create a repository in the organization, regardless of team membership.
+	// And the user will become the repo's admin (via collaborator) after the creation.
+	CanCreateOrgRepo bool `xorm:"NOT NULL DEFAULT false"`
+
+	Visibility structs.VisibleType `xorm:"NOT NULL DEFAULT 2"`
+}
+
+func (t *Team) IsPublic() bool  { return t.Visibility.IsPublic() }
+func (t *Team) IsLimited() bool { return t.Visibility.IsLimited() }
+func (t *Team) IsPrivate() bool { return t.Visibility.IsPrivate() }
+
+const (
+	ghostTeamID   = -1
+	ghostTeamName = "(deleted team)"
+)
+
+func newGhostTeam() *Team {
+	return &Team{ID: ghostTeamID, Name: ghostTeamName, LowerName: ghostTeamName}
+}
+
+// CanNonMemberReadMeta reports whether a non-member, non-owner doer may read
+// the team's metadata, based on the team's visibility tier and the parent org's
+// visibility. Privileged callers (site admins, org owners, team members) are
+// decided by the caller before reaching here.
+func (t *Team) CanNonMemberReadMeta(ctx context.Context, org, doer *user_model.User) (bool, error) {
+	switch t.Visibility {
+	case structs.VisibleTypePublic:
+		return HasOrgOrUserVisible(ctx, org, doer), nil
+	case structs.VisibleTypeLimited:
+		return IsOrganizationMember(ctx, t.OrgID, doer.ID)
+	default:
+		return false, nil
+	}
+}
+
+func NormalizeTeamVisibility[T ~string](v T) structs.VisibleType {
+	if vt, ok := structs.VisibilityModes[structs.VisibilityString(v)]; ok {
+		return vt
+	}
+	return structs.VisibleTypePrivate
+}
+
+func init() {
+	db.RegisterModel(new(Team))
+	db.RegisterModel(new(TeamUser))
+	db.RegisterModel(new(TeamRepo))
+	db.RegisterModel(new(TeamUnit))
+	db.RegisterModel(new(TeamInvite))
+}
+
+func (t *Team) LogString() string {
+	if t == nil {
+		return "<Team nil>"
+	}
+	return fmt.Sprintf("<Team %d:%s OrgID=%d AccessMode=%s>", t.ID, t.Name, t.OrgID, t.AccessMode.LogString())
+}
+
+// LoadUnits load a list of available units for a team
+func (t *Team) LoadUnits(ctx context.Context) (err error) {
+	if t.Units != nil {
+		return nil
+	}
+
+	t.Units, err = getUnitsByTeamID(ctx, t.ID)
+	return err
+}
+
+// GetUnitsMap returns the team units permissions
+func (t *Team) GetUnitsMap() map[string]string {
+	if len(t.Units) == 0 {
+		return nil
+	}
+	m := make(map[string]string)
+	for _, u := range t.Units {
+		m[u.Unit().NameKey] = u.AccessMode.ToString()
+	}
+	return m
+}
+
+// IsOwnerTeam returns true if team is owner team.
+func (t *Team) IsOwnerTeam() bool {
+	return t.Name == OwnerTeamName
+}
+
+// IsMember returns true if given user is a member of team.
+func (t *Team) IsMember(ctx context.Context, userID int64) bool {
+	isMember, err := IsTeamMember(ctx, t.OrgID, t.ID, userID)
+	if err != nil {
+		log.Error("IsMember: %v", err)
+		return false
+	}
+	return isMember
+}
+
+// LoadMembers returns paginated members in team of organization.
+func (t *Team) LoadMembers(ctx context.Context) (err error) {
+	t.Members, err = GetTeamMembers(ctx, &SearchMembersOptions{
+		TeamID: t.ID,
+	})
+	return err
+}
+
+// UnitEnabled returns true if the team has the given unit type enabled
+func (t *Team) UnitEnabled(ctx context.Context, tp unit.Type) bool {
+	return t.UnitAccessMode(ctx, tp) > perm.AccessModeNone
+}
+
+// UnitAccessMode returns the access mode for the given unit type, "none" for non-existent units
+func (t *Team) UnitAccessMode(ctx context.Context, tp unit.Type) perm.AccessMode {
+	accessMode, _ := t.UnitAccessModeEx(ctx, tp)
+	return accessMode
+}
+
+func (t *Team) UnitAccessModeEx(ctx context.Context, tp unit.Type) (mode perm.AccessMode, exist bool) {
+	if err := t.LoadUnits(ctx); err != nil {
+		log.Error("Error loading team (ID: %d) units: %v", t.ID, err)
+	}
+	for _, u := range t.Units {
+		if u.Type == tp {
+			mode, exist = u.AccessMode, true
+			break
+		}
+	}
+	mode = max(mode, t.AccessMode)
+	if unitDef, ok := unit.Units[tp]; ok {
+		mode = min(mode, unitDef.MaxPerm())
+	}
+	return mode, exist || t.AccessMode > perm.AccessModeNone
+}
+
+// IsUsableTeamName tests if a name could be as team name
+func IsUsableTeamName(name string) error {
+	switch name {
+	case "new":
+		return db.ErrNameReserved{Name: name}
+	default:
+		return nil
+	}
+}
+
+// GetTeam returns team by given team name and organization.
+func GetTeam(ctx context.Context, orgID int64, name string) (*Team, error) {
+	t, exist, err := db.Get[Team](ctx, builder.Eq{"org_id": orgID, "lower_name": strings.ToLower(name)})
+	if err != nil {
+		return nil, err
+	} else if !exist {
+		return nil, ErrTeamNotExist{orgID, 0, name}
+	}
+	return t, nil
+}
+
+// GetTeamIDsByNames returns a slice of team ids corresponds to names.
+func GetTeamIDsByNames(ctx context.Context, orgID int64, names []string, ignoreNonExistent bool) ([]int64, error) {
+	ids := make([]int64, 0, len(names))
+	for _, name := range names {
+		u, err := GetTeam(ctx, orgID, name)
+		if err != nil {
+			if ignoreNonExistent {
+				continue
+			}
+			return nil, err
+		}
+		ids = append(ids, u.ID)
+	}
+	return ids, nil
+}
+
+// GetOwnerTeam returns team by given team name and organization.
+func GetOwnerTeam(ctx context.Context, orgID int64) (*Team, error) {
+	return GetTeam(ctx, orgID, OwnerTeamName)
+}
+
+// GetTeamByID returns team by given ID.
+func GetTeamByID(ctx context.Context, teamID int64) (*Team, error) {
+	t := new(Team)
+	has, err := db.GetEngine(ctx).ID(teamID).Get(t)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, ErrTeamNotExist{0, teamID, ""}
+	}
+	return t, nil
+}
+
+func GetPossibleTeamByID(ctx context.Context, teamID int64) (int64, *Team, error) {
+	t, err := GetTeamByID(ctx, teamID)
+	if errors.Is(err, util.ErrNotExist) {
+		t = newGhostTeam()
+		return t.ID, t, nil
+	} else if err != nil {
+		return 0, nil, err
+	}
+	return t.ID, t, nil
+}
+
+// IncrTeamRepoNum increases the number of repos for the given team by 1
+func IncrTeamRepoNum(ctx context.Context, teamID int64) error {
+	_, err := db.GetEngine(ctx).Incr("num_repos").ID(teamID).Update(new(Team))
+	return err
+}

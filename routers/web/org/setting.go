@@ -1,0 +1,266 @@
+// Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package org
+
+import (
+	"errors"
+	"net/http"
+	"net/url"
+
+	"gitea.dev/models/db"
+	packages_model "gitea.dev/models/packages"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/models/webhook"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	shared_user "gitea.dev/routers/web/shared/user"
+	user_setting "gitea.dev/routers/web/user/setting"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
+	org_service "gitea.dev/services/org"
+	user_service "gitea.dev/services/user"
+)
+
+const (
+	// tplSettingsOptions template path for render settings
+	tplSettingsOptions templates.TplName = "org/settings/options"
+	// tplSettingsHooks template path for render hook settings
+	tplSettingsHooks templates.TplName = "org/settings/hooks"
+	// tplSettingsLabels template path for render labels settings
+	tplSettingsLabels templates.TplName = "org/settings/labels"
+)
+
+// Settings render the main settings page
+func Settings(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("org.settings")
+	ctx.Data["PageIsOrgSettings"] = true
+	ctx.Data["PageIsSettingsOptions"] = true
+	ctx.Data["CurrentVisibility"] = ctx.Org.Organization.Visibility
+	ctx.Data["RepoAdminChangeTeamAccess"] = ctx.Org.Organization.RepoAdminChangeTeamAccess
+	ctx.Data["ContextUser"] = ctx.ContextUser
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	ctx.HTML(http.StatusOK, tplSettingsOptions)
+}
+
+// SettingsPost response for settings change submitted
+func SettingsPost(ctx *context.Context) {
+	form := web.GetForm[*forms.UpdateOrgSettingForm](ctx)
+	ctx.Data["Title"] = ctx.Tr("org.settings")
+	ctx.Data["PageIsOrgSettings"] = true
+	ctx.Data["PageIsSettingsOptions"] = true
+	ctx.Data["CurrentVisibility"] = ctx.Org.Organization.Visibility
+
+	if ctx.HasError() {
+		ctx.HTML(http.StatusOK, tplSettingsOptions)
+		return
+	}
+
+	org := ctx.Org.Organization
+	if err := org_service.UpdateOrgEmailAddress(ctx, org, form.Email); err != nil {
+		if errors.Is(err, util.ErrInvalidArgument) {
+			ctx.Data["Err_Email"] = true
+			ctx.RenderWithErrDeprecated(ctx.Tr("form.email_invalid"), tplSettingsOptions, &form)
+			return
+		}
+		ctx.ServerError("UpdateOrgEmailAddress", err)
+		return
+	}
+
+	opts := &user_service.UpdateOptions{
+		FullName:                  optional.FromPtr(form.FullName),
+		Description:               optional.FromPtr(form.Description),
+		Website:                   optional.FromPtr(form.Website),
+		Location:                  optional.FromPtr(form.Location),
+		RepoAdminChangeTeamAccess: optional.FromPtr(form.RepoAdminChangeTeamAccess),
+	}
+	if ctx.Doer.IsAdmin {
+		opts.MaxRepoCreation = optional.FromPtr(form.MaxRepoCreation)
+	}
+
+	if err := user_service.UpdateUser(ctx, org.AsUser(), opts); err != nil {
+		ctx.ServerError("UpdateUser", err)
+		return
+	}
+
+	log.Trace("Organization setting updated: %s", org.Name)
+	ctx.Flash.Success(ctx.Tr("org.settings.update_setting_success"))
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+// SettingsAvatar response for change avatar on settings page
+func SettingsAvatar(ctx *context.Context) {
+	form := web.GetForm[*forms.AvatarForm](ctx)
+	form.Source = forms.AvatarLocal
+	if err := user_setting.UpdateAvatarSetting(ctx, form, ctx.Org.Organization.AsUser()); err != nil {
+		ctx.Flash.Error(err.Error())
+	} else {
+		ctx.Flash.Success(ctx.Tr("org.settings.update_avatar_success"))
+	}
+
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+// SettingsDeleteAvatar response for delete avatar on settings page
+func SettingsDeleteAvatar(ctx *context.Context) {
+	if err := user_service.DeleteAvatar(ctx, ctx.Org.Organization.AsUser()); err != nil {
+		ctx.Flash.Error(err.Error())
+	}
+
+	ctx.JSONRedirect(ctx.Org.OrgLink + "/settings")
+}
+
+// SettingsDeleteOrgPost response for deleting an organization
+func SettingsDeleteOrgPost(ctx *context.Context) {
+	if ctx.Org.Organization.Name != ctx.FormString("org_name") {
+		ctx.JSONError(ctx.Tr("form.enterred_invalid_org_name"))
+		return
+	}
+
+	if err := org_service.DeleteOrganization(ctx, ctx.Org.Organization, false /* no purge */); err != nil {
+		if repo_model.IsErrUserOwnRepos(err) {
+			ctx.JSONError(ctx.Tr("form.org_still_own_repo"))
+		} else if packages_model.IsErrUserOwnPackages(err) {
+			ctx.JSONError(ctx.Tr("form.org_still_own_packages"))
+		} else {
+			log.Error("DeleteOrganization: %v", err)
+			ctx.JSONError(util.Iif(ctx.Doer.IsAdmin, err.Error(), string(ctx.Tr("org.settings.delete_failed"))))
+		}
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("org.settings.delete_successful", ctx.Org.Organization.Name))
+	ctx.JSONRedirect(setting.AppSubURL + "/")
+}
+
+// Webhooks render webhook list page
+func Webhooks(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("org.settings")
+	ctx.Data["PageIsOrgSettings"] = true
+	ctx.Data["PageIsSettingsHooks"] = true
+	ctx.Data["BaseLink"] = ctx.Org.OrgLink + "/settings/hooks"
+	ctx.Data["BaseLinkNew"] = ctx.Org.OrgLink + "/settings/hooks"
+	ctx.Data["Description"] = ctx.Tr("org.settings.hooks_desc")
+
+	ws, err := db.Find[webhook.Webhook](ctx, webhook.ListWebhookOptions{OwnerID: ctx.Org.Organization.ID})
+	if err != nil {
+		ctx.ServerError("ListWebhooksByOpts", err)
+		return
+	}
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	ctx.Data["Webhooks"] = ws
+	ctx.HTML(http.StatusOK, tplSettingsHooks)
+}
+
+// DeleteWebhook response for delete webhook
+func DeleteWebhook(ctx *context.Context) {
+	hook, err := webhook.GetWebhookByOwnerID(ctx, ctx.Org.Organization.ID, ctx.FormInt64("id"))
+	if err != nil {
+		ctx.Flash.Error("GetWebhookByOwnerID: " + err.Error())
+	} else if err := webhook.DeleteWebhookByOwnerID(ctx, ctx.Org.Organization.ID, hook.ID); err != nil {
+		ctx.Flash.Error("DeleteWebhookByOwnerID: " + err.Error())
+	} else {
+		audit.RecordScoped(ctx, ctx.Org.Organization.AsUser(), nil, audit.WebhookRemove, "webhook", hook.URL)
+
+		ctx.Flash.Success(ctx.Tr("repo.settings.webhook_deletion_success"))
+	}
+
+	ctx.JSONRedirect(ctx.Org.OrgLink + "/settings/hooks")
+}
+
+// Labels render organization labels page
+func Labels(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("repo.labels")
+	ctx.Data["PageIsOrgSettings"] = true
+	ctx.Data["PageIsOrgSettingsLabels"] = true
+	ctx.Data["LabelTemplateFiles"] = repo_module.LabelTemplateFiles
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
+
+	ctx.HTML(http.StatusOK, tplSettingsLabels)
+}
+
+// SettingsRenamePost response for renaming organization
+func SettingsRenamePost(ctx *context.Context) {
+	form := web.GetForm[*forms.RenameOrgForm](ctx)
+	if ctx.HasError() {
+		ctx.JSONError(ctx.GetErrMsg())
+		return
+	}
+
+	oldOrgName, newOrgName := ctx.Org.Organization.Name, form.NewOrgName
+
+	if form.OrgName != oldOrgName {
+		ctx.JSONError(ctx.Tr("form.enterred_invalid_org_name"))
+		return
+	}
+	if newOrgName == oldOrgName {
+		ctx.JSONError(ctx.Tr("org.settings.rename_no_change"))
+		return
+	}
+
+	if err := user_service.RenameUser(ctx, ctx.Org.Organization.AsUser(), newOrgName, ctx.Doer); err != nil {
+		if user_model.IsErrUserAlreadyExist(err) {
+			ctx.JSONError(ctx.Tr("org.form.name_been_taken", newOrgName))
+		} else if db.IsErrNameReserved(err) {
+			ctx.JSONError(ctx.Tr("org.form.name_reserved", newOrgName))
+		} else if db.IsErrNamePatternNotAllowed(err) {
+			ctx.JSONError(ctx.Tr("org.form.name_pattern_not_allowed", newOrgName))
+		} else {
+			log.Error("RenameOrganization: %v", err)
+			ctx.JSONError(util.Iif(ctx.Doer.IsAdmin, err.Error(), string(ctx.Tr("org.settings.rename_failed"))))
+		}
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("org.settings.rename_success", oldOrgName, newOrgName))
+	ctx.JSONRedirect(setting.AppSubURL + "/org/" + url.PathEscape(newOrgName) + "/settings")
+}
+
+// SettingsChangeVisibilityPost response for change organization visibility
+func SettingsChangeVisibilityPost(ctx *context.Context) {
+	visibilityStr := ctx.FormString("visibility")
+	visibility, ok := structs.VisibilityModes[structs.VisibilityString(visibilityStr)]
+	if !ok {
+		ctx.Flash.Error(ctx.Tr("invalid_data", visibilityStr))
+		ctx.JSONRedirect(setting.AppSubURL + "/org/" + url.PathEscape(ctx.Org.Organization.Name) + "/settings")
+		return
+	}
+
+	if ctx.Org.Organization.Visibility == visibility {
+		ctx.Flash.Info(ctx.Tr("nothing_has_been_changed"))
+		ctx.JSONRedirect(setting.AppSubURL + "/org/" + url.PathEscape(ctx.Org.Organization.Name) + "/settings")
+		return
+	}
+
+	if err := org_service.ChangeOrganizationVisibility(ctx, ctx.Org.Organization, visibility); err != nil {
+		log.Error("ChangeOrganizationVisibility: %v", err)
+		ctx.JSONError(ctx.Tr("error.occurred"))
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("org.settings.change_visibility_success", ctx.Org.Organization.Name))
+	ctx.JSONRedirect(setting.AppSubURL + "/org/" + url.PathEscape(ctx.Org.Organization.Name) + "/settings")
+}

@@ -1,0 +1,359 @@
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package runner
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"slices"
+	"uuid"
+
+	runnerv1 "gitea.dev/actionslib/runner/v1"
+	"gitea.dev/actionslib/runner/v1/runnerv1connect"
+	actions_model "gitea.dev/models/actions"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/actions"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/util"
+	actions_service "gitea.dev/services/actions"
+
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+func NewRunnerServiceHandler() (string, http.Handler) {
+	server := connect.NewServer(withErrorMessages, withRunner)
+	runnerv1connect.RegisterRunnerServiceHandler(server, &Service{})
+	mux := http.NewServeMux()
+	// runners send all pending log rows in one UpdateLog, so keep v1's unlimited message size
+	connecthttp.Mount(mux, server, connecthttp.WithCompressMinBytes(1024), connecthttp.WithReadMaxBytes(0))
+	return "/" + runnerv1connect.RunnerServiceName + "/", mux
+}
+
+var _ runnerv1connect.RunnerServiceClient = (*Service)(nil)
+
+type Service struct{}
+
+// Register for new runner.
+func (s *Service) Register(
+	ctx context.Context,
+	req *runnerv1.RegisterRequest,
+) (*runnerv1.RegisterResponse, error) {
+	if req.Token == "" || req.Name == "" {
+		return nil, errors.New("missing runner token, name")
+	}
+
+	runnerToken, err := actions_model.GetRunnerToken(ctx, req.Token)
+	if err != nil {
+		return nil, errors.New("runner registration token not found")
+	}
+
+	if !runnerToken.IsActive {
+		return nil, errors.New("runner registration token has been invalidated, please use the latest one")
+	}
+
+	if runnerToken.OwnerID > 0 {
+		if _, err := user_model.GetUserByID(ctx, runnerToken.OwnerID); err != nil {
+			return nil, errors.New("owner of the token not found")
+		}
+	}
+
+	if runnerToken.RepoID > 0 {
+		if _, err := repo_model.GetRepositoryByID(ctx, runnerToken.RepoID); err != nil {
+			return nil, errors.New("repository of the token not found")
+		}
+	}
+
+	labels := req.Labels
+	hasCancellingSupport := slices.Contains(req.GetCapabilities(), runnerCapabilityCancelling)
+
+	// create new runner
+	name := util.EllipsisDisplayString(req.Name, 255)
+	runner := &actions_model.ActionRunner{
+		UUID:                 uuid.New().String(),
+		Name:                 name,
+		OwnerID:              runnerToken.OwnerID,
+		RepoID:               runnerToken.RepoID,
+		Version:              req.Version,
+		AgentLabels:          labels,
+		Ephemeral:            req.Ephemeral,
+		HasCancellingSupport: hasCancellingSupport,
+	}
+	runner.GenerateAndFillToken()
+
+	// create new runner
+	if err := actions_model.CreateRunner(ctx, runner); err != nil {
+		return nil, errors.New("can't create new runner")
+	}
+
+	// update token status
+	runnerToken.IsActive = true
+	if err := actions_model.UpdateRunnerToken(ctx, runnerToken, "is_active"); err != nil {
+		return nil, errors.New("can't update runner token status")
+	}
+
+	res := &runnerv1.RegisterResponse{
+		Runner: &runnerv1.Runner{
+			Id:        runner.ID,
+			Uuid:      runner.UUID,
+			Token:     runner.Token,
+			Name:      runner.Name,
+			Version:   runner.Version,
+			Labels:    runner.AgentLabels,
+			Ephemeral: runner.Ephemeral,
+		},
+	}
+
+	return res, nil
+}
+
+// runnerCapabilityCancelling is the wire string the runner advertises in its
+// capabilities list to indicate it understands the transitional cancelling
+// state and will run post-step cleanup before finalizing the task.
+const runnerCapabilityCancelling = "cancelling"
+
+type declareRequest interface {
+	proto.Message
+	GetVersion() string
+	GetLabels() []string
+	GetCapabilities() []string
+}
+
+func applyDeclareRequestToRunner(runner *actions_model.ActionRunner, req declareRequest) []string {
+	runner.AgentLabels = req.GetLabels()
+	runner.Version = req.GetVersion()
+
+	cols := []string{"agent_labels", "version"}
+	hasCancellingSupport := slices.Contains(req.GetCapabilities(), runnerCapabilityCancelling)
+	if runner.HasCancellingSupport != hasCancellingSupport {
+		runner.HasCancellingSupport = hasCancellingSupport
+		cols = append(cols, "has_cancelling_support")
+	}
+
+	return cols
+}
+
+func (s *Service) Declare(
+	ctx context.Context,
+	req *runnerv1.DeclareRequest,
+) (*runnerv1.DeclareResponse, error) {
+	runner := GetRunner(ctx)
+	if err := actions_model.UpdateRunner(ctx, runner, applyDeclareRequestToRunner(runner, req)...); err != nil {
+		return nil, status.Errorf(codes.Internal, "update runner: %v", err)
+	}
+
+	// Capabilities are communicated via headers to avoid a hard dependency on a proto bump.
+	// Older runners ignore unknown headers; newer runners can use this for feature negotiation.
+	info, _ := connect.CallInfoForServerContext(ctx)
+	info.ResponseHeader().Set("X-Gitea-Actions-Capabilities", actions_model.RunnerCapabilities())
+	return &runnerv1.DeclareResponse{
+		Runner: &runnerv1.Runner{
+			Id:      runner.ID,
+			Uuid:    runner.UUID,
+			Token:   runner.Token,
+			Name:    runner.Name,
+			Version: runner.Version,
+			Labels:  runner.AgentLabels,
+		},
+	}, nil
+}
+
+// FetchTask assigns a task to the runner
+func (s *Service) FetchTask(
+	ctx context.Context,
+	req *runnerv1.FetchTaskRequest,
+) (*runnerv1.FetchTaskResponse, error) {
+	runner := GetRunner(ctx)
+
+	var task *runnerv1.Task
+	tasksVersion := req.TasksVersion // task version from runner
+	latestVersion, err := actions_model.GetTasksVersionByScope(ctx, runner.OwnerID, runner.RepoID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query tasks version failed: %v", err)
+	} else if latestVersion == 0 {
+		if err := actions_model.IncreaseTaskVersion(ctx, runner.OwnerID, runner.RepoID); err != nil {
+			return nil, status.Errorf(codes.Internal, "fail to increase task version: %v", err)
+		}
+		// if we don't increase the value of `latestVersion` here,
+		// the response of FetchTask will return tasksVersion as zero.
+		// and the runner will treat it as an old version of Gitea.
+		latestVersion++
+	}
+
+	if tasksVersion != latestVersion {
+		// Re-load runner from DB so task assignment uses current IsDisabled state
+		// (avoids race where disable commits while this request still has stale runner).
+		freshRunner, err := actions_model.GetRunnerByUUID(ctx, runner.UUID)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "get runner: %v", err)
+		}
+		// if the task version in request is not equal to the version in db,
+		// it means there may still be some tasks that haven't been assigned.
+		// try to pick a task for the runner that send the request.
+		if t, ok, throttled, err := actions_service.TryPickTask(ctx, freshRunner); err != nil {
+			log.Error("pick task failed: %v", err)
+			return nil, status.Errorf(codes.Internal, "pick task: %v", err)
+		} else if throttled {
+			// Concurrency limit reached: don't advance the runner's tasks version,
+			// so it retries on its next poll instead of sleeping until the next bump.
+			latestVersion = tasksVersion
+			//  A steady stream here means MAX_CONCURRENT_TASK_PICKS is too low for the fleet.
+			log.Debug("task pick throttled for runner %q (id %d); it will retry on its next poll", freshRunner.Name, freshRunner.ID)
+		} else if ok {
+			task = t
+		}
+	}
+	res := &runnerv1.FetchTaskResponse{
+		Task:         task,
+		TasksVersion: latestVersion,
+	}
+	return res, nil
+}
+
+// UpdateTask updates the task status.
+func (s *Service) UpdateTask(
+	ctx context.Context,
+	req *runnerv1.UpdateTaskRequest,
+) (*runnerv1.UpdateTaskResponse, error) {
+	runner := GetRunner(ctx)
+
+	task, err := actions_model.UpdateTaskByState(ctx, runner.ID, req.State)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "update task: %v", err)
+	}
+
+	for k, v := range req.Outputs {
+		if len(k) > 255 {
+			log.Warn("Ignore the output of task %d because the key is too long: %q", task.ID, k)
+			continue
+		}
+		// The value can be a maximum of 1 MB
+		if l := len(v); l > 1024*1024 {
+			log.Warn("Ignore the output %q of task %d because the value is too long: %v", k, task.ID, l)
+			continue
+		}
+		// There's another limitation on GitHub that the total of all outputs in a workflow run can be a maximum of 50 MB.
+		// We don't check the total size here because it's not easy to do, and it doesn't really worth it.
+		// See https://docs.github.com/en/actions/using-jobs/defining-outputs-for-jobs
+
+		if err := actions_model.InsertTaskOutputIfNotExist(ctx, task.ID, k, v); err != nil {
+			log.Warn("Failed to insert the output %q of task %d: %v", k, task.ID, err)
+			// It's ok not to return errors, the runner will resend the outputs.
+		}
+	}
+	sentOutputs, err := actions_model.FindTaskOutputKeyByTaskID(ctx, task.ID)
+	if err != nil {
+		log.Warn("Failed to find the sent outputs of task %d: %v", task.ID, err)
+		// It's not to return errors, it can be handled when the runner resends sent outputs.
+	}
+
+	if err := task.LoadJob(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "load job: %v", err)
+	}
+	if err := task.Job.LoadAttributes(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "load run: %v", err)
+	}
+
+	actions_service.CreateCommitStatusForRunJobs(ctx, task.Job.Run, task.Job)
+
+	if task.Status.IsDone() {
+		actions_service.NotifyWorkflowJobStatusUpdateWithTask(ctx, task.Job, task)
+	}
+
+	if req.State.Result != runnerv1.Result_RESULT_UNSPECIFIED {
+		if err := actions_service.EmitJobsIfReadyByRun(task.Job.RunID); err != nil {
+			log.Error("Emit ready jobs of run %d: %v", task.Job.RunID, err)
+		}
+		if task.Job.Run.Status.IsDone() {
+			actions_service.NotifyWorkflowRunStatusUpdateWithReload(ctx, task.Job.RepoID, task.Job.RunID)
+		}
+	}
+
+	return &runnerv1.UpdateTaskResponse{
+		State: &runnerv1.TaskState{
+			Id:     req.State.Id,
+			Result: task.Status.AsResult(),
+		},
+		SentOutputs: sentOutputs,
+	}, nil
+}
+
+// UpdateLog uploads log of the task.
+func (s *Service) UpdateLog(
+	ctx context.Context,
+	req *runnerv1.UpdateLogRequest,
+) (*runnerv1.UpdateLogResponse, error) {
+	runner := GetRunner(ctx)
+
+	res := &runnerv1.UpdateLogResponse{}
+
+	task, err := actions_model.GetTaskByID(ctx, req.TaskId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get task: %v", err)
+	} else if runner.ID != task.RunnerID {
+		return nil, status.Errorf(codes.Internal, "invalid runner for task")
+	}
+	ack := task.LogLength
+
+	// Trim rows the runner already had acked.
+	var rows []*runnerv1.LogRow
+	if req.Index <= ack && int64(len(req.Rows))+req.Index > ack {
+		rows = req.Rows[ack-req.Index:]
+	}
+
+	// Ack a re-sent finalize idempotently. Appending new rows past the seal errors.
+	if task.LogInStorage {
+		if len(rows) > 0 {
+			return nil, status.Errorf(codes.AlreadyExists, "log file has been archived")
+		}
+		res.AckIndex = ack
+		return res, nil
+	}
+
+	// Bail unless we have new rows or a NoMore to finalize. Even with
+	// NoMore, bail when the runner has outrun the server — archiving a
+	// log with a gap is worse than asking it to retry.
+	if len(rows) == 0 && (!req.NoMore || req.Index > ack) {
+		res.AckIndex = ack
+		return res, nil
+	}
+
+	// WriteLogs is called even with no rows: with offset==0 it bootstraps
+	// an empty DBFS file so TransferLogs below has something to read when
+	// the runner finalizes a task that produced no log output.
+	ns, err := actions.WriteLogs(ctx, task.LogFilename, task.LogSize, rows)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to append logs to dbfs file: %v", err)
+	}
+	task.LogLength += int64(len(rows))
+	for _, n := range ns {
+		task.LogIndexes = append(task.LogIndexes, task.LogSize)
+		task.LogSize += int64(n)
+	}
+
+	res.AckIndex = task.LogLength
+
+	var remove func()
+	if req.NoMore {
+		task.LogInStorage = true
+		remove, err = actions.TransferLogs(ctx, task.LogFilename)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "transfer logs: %v", err)
+		}
+	}
+
+	if err := actions_model.UpdateTask(ctx, task, "log_indexes", "log_length", "log_size", "log_in_storage"); err != nil {
+		return nil, status.Errorf(codes.Internal, "update task: %v", err)
+	}
+	if remove != nil {
+		remove()
+	}
+
+	return res, nil
+}
