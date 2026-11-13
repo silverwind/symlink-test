@@ -1,0 +1,21 @@
+name: appr-bump
+on:
+  push:
+    branches: [appr-trigger]
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: appr-head
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f fail
+          date > bump.txt
+          git add -A
+          git commit -m bump
+          git push origin HEAD:appr-head

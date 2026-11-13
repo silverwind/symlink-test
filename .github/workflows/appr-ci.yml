@@ -1,0 +1,10 @@
+name: appr-ci
+on:
+  pull_request:
+    branches: [appr-base]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: test ! -f fail
