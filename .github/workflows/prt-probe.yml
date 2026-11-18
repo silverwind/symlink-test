@@ -1,0 +1,14 @@
+on:
+  pull_request_target:
+    branches: [prt-base]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_DEFAULT: ${{ github.event.repository.default_branch }}
+        run: echo "PROBE source=base file=prt-probe.yml ref=$GITHUB_REF sha=$GITHUB_SHA base_ref=$GITHUB_BASE_REF head_ref=$GITHUB_HEAD_REF workflow_ref=$GITHUB_WORKFLOW_REF workflow_sha=$GITHUB_WORKFLOW_SHA base_sha=$BASE_SHA head_sha=$HEAD_SHA repo_default=$REPO_DEFAULT"
+  call:
+    uses: ./.github/workflows/prt-called.yml

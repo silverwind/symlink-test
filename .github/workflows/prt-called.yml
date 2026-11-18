@@ -1,0 +1,6 @@
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "CALLED source=base sha=$GITHUB_SHA workflow_sha=$GITHUB_WORKFLOW_SHA"
