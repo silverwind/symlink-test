@@ -146,3 +146,5 @@ NotoSans-Regular.ttf: "Noto Sans" "Regular"
 ۲. اگه توجه کنید، کانفیگ بالا فونت عربی رو هم تنظیم می‌کنه، چون وزیرمتن عربی رو هم پشتیبانی می‌کنه.
 
 ۳. [در این صفحه](https://wiki.archlinux.org/title/Font_configuration) و [این صفحه](https://wiki.archlinux.org/title/Font_configuration/Examples#Default_fonts) می‌تونید توضیحات بیشتر و مثال‌های بیشتری پیدا کنید.
+
+An extra line so this rename also carries content changes.
