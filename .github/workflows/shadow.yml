@@ -1,0 +1,9 @@
+name: shadow
+on:
+  pull_request:
+    types: [opened, edited]
+jobs:
+  gate:
+    runs-on: [self-hosted, shadow-test-none]
+    steps:
+      - run: echo
