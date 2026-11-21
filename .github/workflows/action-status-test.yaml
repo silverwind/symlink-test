@@ -1,0 +1,73 @@
+name: action-status-test
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # SUCCESS — completes quickly
+  quick-success:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "quick success done"
+
+  # RUNNING — long-running job, observable mid-run
+  long-running:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for i in $(seq 1 110); do
+            echo "tick $i / 110"
+            sleep 1
+          done
+
+  # WAITING / BLOCKED — needs a long upstream so it sits in waiting state
+  needs-upstream:
+    runs-on: ubuntu-latest
+    needs: long-running
+    steps:
+      - run: echo "ran after long-running finished"
+
+  # SKIPPED — condition is always false
+  always-skipped:
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: echo "this never runs"
+
+  # SUCCESS after multiple needs — different needs depth
+  fan-in:
+    runs-on: ubuntu-latest
+    needs: [quick-success, will-fail-later]
+    if: always()
+    steps:
+      - run: echo "fan-in done"
+
+  # FAILURE — fails partway through
+  will-fail-later:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for i in $(seq 1 30); do
+            echo "working $i / 30"
+            sleep 1
+          done
+      - run: |
+          echo "about to fail"
+          exit 1
+
+  # MATRIX — fan-out to give multiple simultaneous running rows
+  matrix-jobs:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - run: |
+          for i in $(seq 1 $((20 + ${{ matrix.shard }} * 10))); do
+            echo "shard ${{ matrix.shard }} step $i"
+            sleep 1
+          done
