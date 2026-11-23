@@ -1,0 +1,9 @@
+name: victim
+on:
+  push:
+    branches: ['ct-*']
+jobs:
+  victim:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 900

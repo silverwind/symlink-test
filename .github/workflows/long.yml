@@ -1,0 +1,9 @@
+name: long
+on:
+  push:
+    branches: [ct-run]
+jobs:
+  long:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 2400

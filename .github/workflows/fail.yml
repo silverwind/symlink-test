@@ -1,0 +1,9 @@
+name: fail
+on:
+  push:
+    branches: [ct-fail]
+jobs:
+  fail:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1

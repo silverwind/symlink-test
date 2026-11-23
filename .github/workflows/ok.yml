@@ -1,0 +1,9 @@
+name: ok
+on:
+  push:
+    branches: [ct-ok]
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
