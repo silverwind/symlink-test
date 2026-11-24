@@ -1,12 +1,12 @@
 line 1
-line 2
-line 3
+line 1 S8
+line 3 S6a
 line 4
 line 5 changed
 line 6 changed
 line 7
 line 8
-line 9
+line 9 S3
 line 11
 line 12
 line 13
