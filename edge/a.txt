@@ -2,7 +2,7 @@ line 1
 line 2
 line 3
 line 4
-line 5
+line 5 changed
 line 6
 line 7
 line 8
@@ -28,13 +28,11 @@ line 27
 line 28
 line 29
 dup
-line 31
+line 31 changed
 line 32
 line 33
 line 34
 line 35
-line 36
-line 37
 line 38
 line 39
 line 40
