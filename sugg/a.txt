@@ -1,3 +1,4 @@
+line 0 inserted
 line 1
 line 1 S8
 line 3 S6a
@@ -19,7 +20,7 @@ line 19
 line 20 changed
 line 21
 line 22
-line 23
+line 23 edited
 line 24
 line 25
 line 26
