@@ -1,3 +1,3 @@
 eol 1
 eol 2
-eol 3 no newline
+eol 3 no newline changed
