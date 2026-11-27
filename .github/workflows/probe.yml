@@ -1,0 +1,10 @@
+on: push
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+  slow:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 600
